@@ -1,0 +1,49 @@
+[package]
+name = "kedai-server"
+version = "0.2.0"
+edition = "2021"
+description = "Kedai 后端:Rust + axum + SQLite + SSE + Agent 引擎"
+license = "MIT"
+
+[[bin]]
+name = "kedai-server"
+path = "src/main.rs"
+
+[dependencies]
+axum = "0.8"
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rusqlite = { version = "0.32", features = ["bundled", "backup"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "native-tls"] }
+tiktoken-rs = "0.6"
+png = "0.17"
+tower-http = { version = "0.6", features = ["cors", "fs", "set-header"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+futures = "0.3"
+uuid = { version = "1", features = ["v4"] }
+chrono = "0.4"
+dotenvy = "0.15"
+base64 = "0.22"
+include_dir = "0.7"
+thiserror = "2"
+async-stream = "0.3"
+mime = "0.3"
+regex = "1.13"
+rquickjs = "0.12.2"
+
+# Windows DPAPI:API Key 静态加密(CryptProtectData / CryptUnprotectData)
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Security_Cryptography",
+    "Win32_Storage_FileSystem",
+] }
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
+
+[profile.release]
+lto = true
+strip = true

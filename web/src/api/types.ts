@@ -1,0 +1,566 @@
+// API 类型定义(与后端契约一致;各域 API 模块共用)
+
+export interface CharacterRecord {
+  id: string;
+  name: string;
+  chara_name: string;
+  description: string;
+  file_path: string;
+  avatar_path: string | null;
+  data_raw?: Record<string, unknown>;
+  /** 开场白(first_mes) */
+  first_mes?: string;
+  /** 备用开场列表(alternate_greetings;与 first_mes 组成多开场) */
+  alternate_greetings?: string[];
+  /** 角色卡正则脚本(用于消息 HTML 渲染) */
+  regex_scripts?: RegexScript[];
+  /** 角色卡内嵌插件检测结果(酒馆助手等;仅详情接口返回) */
+  card_plugins?: CardPluginInfo[];
+  created_at: string;
+}
+
+/** 角色卡内嵌插件能力点 */
+export interface PluginFeature {
+  id: string;
+  label: string;
+  detected: boolean;
+}
+
+/** 角色卡内嵌插件(如酒馆助手 SillyTavern-Assistant) */
+export interface CardPluginInfo {
+  id: string;
+  name: string;
+  name_en: string;
+  /** 检测到即视为启用(kedai 内置实现,无需安装) */
+  enabled: boolean;
+  /** 来源:character_card(角色卡内嵌) */
+  source: string;
+  description: string;
+  features: PluginFeature[];
+}
+
+/** 角色卡正则脚本(extensions.regex_scripts) */
+export interface RegexScript {
+  id: string;
+  script_name: string;
+  find_regex: string;
+  replace_string: string;
+  markdown_only: boolean;
+  enabled: boolean;
+}
+
+export interface SessionInfo {
+  id: string;
+  character_id: string;
+  title: string;
+  created_at: string;
+  updated_at: string;
+}
+
+/** 会话 + 角色名 + 消息数(聊天记录面板) */
+export interface SessionWithCharacter extends SessionInfo {
+  character_name?: string | null;
+  message_count?: number;
+}
+
+export interface ChatMessage {
+  id: number;
+  session_id: string;
+  role: 'user' | 'assistant' | 'system';
+  content: string;
+  /** 服务端宏展开后的显示文本({{char}}/{{getvar}} 等);缺省时前端回退 content */
+  content_display?: string;
+  extra: Record<string, unknown>;
+  created_at: string;
+}
+
+export type SseEvent =
+  | { type: 'token'; text: string }
+  | { type: 'step'; step: string; detail?: string; index?: number; total?: number }
+  | { type: 'tool_call'; name: string; input: unknown; call_id?: string; render_kind?: string }
+  | { type: 'tool_authorization_required'; name: string; risk: ToolRisk; reason: string; run_id: string; call_id: string }
+  | { type: 'tool_result'; name: string; output: unknown; call_id?: string; render_kind?: string }
+  | { type: 'vars'; stat_data: Record<string, unknown> }
+  | { type: 'interrupted' }
+  | { type: 'error'; code: string; message: string; retryable: boolean }
+  | { type: 'finish'; usage: TokenUsage; content: string };
+
+export type ToolRisk = 'safe' | 'sensitive' | 'dangerous';
+
+export interface ToolPermission {
+  name: string;
+  description: string;
+  risk: ToolRisk;
+  allowed: boolean;
+  reason: string;
+}
+
+export interface TokenUsage {
+  prompt_tokens: number;
+  completion_tokens: number;
+  total_tokens: number;
+  context_tokens: number;
+  /** prompt 缓存命中 token(DeepSeek 等提供商;无缓存字段时为 0),用于计算当前命中率 */
+  prompt_cache_hit_tokens: number;
+}
+
+export interface StMessage {
+  id?: number;
+  role: 'user' | 'assistant' | 'system';
+  content: string;
+  extra?: Record<string, unknown>;
+}
+
+/** mvu 变量快照(消息级) */
+export interface MvuSnapshot {
+  stat_data?: Record<string, unknown>;
+  display_data?: Record<string, unknown>;
+}
+
+/** 消息记录(含 extra,可含 mvu 快照) */
+export interface MessageRecord {
+  id: number;
+  session_id: string;
+  role: 'user' | 'assistant' | 'system';
+  content: string;
+  extra?: Record<string, unknown>;
+  created_at: string;
+}
+
+/** 世界书上传时的自动转换统计(后端返回;未发生转换时为 null/缺失) */
+export interface WorldBookConversion {
+  /** 处理的条目总数 */
+  total_count: number;
+  /** 实际发生转换的条目数 */
+  converted_count: number;
+  /** 缺失 constant 时自动判定为常态(常驻)的条数 */
+  constant_auto_count: number;
+  /** 关键词经字段变体/逗号拆分归一的条数 */
+  key_normalized_count: number;
+}
+
+/** 世界书记录(列表/详情) */
+export interface WorldBookRecord {
+  id: string;
+  name: string;
+  /** 绑定角色 id;缺省 = 全局 */
+  character_id?: string | null;
+  character_name?: string | null;
+  enabled: boolean;
+  /** upload=独立上传;character_card=角色卡内嵌 */
+  source: string;
+  entry_count: number;
+  data_raw?: Record<string, unknown>;
+  /** 上传时的自动转换统计(仅上传响应返回) */
+  conversion?: WorldBookConversion | null;
+  created_at: string;
+}
+
+/** 快速回复记录(阶段四 4b;后端 QuickReplyRecord 契约) */
+export interface QuickReplyRecord {
+  id: number;
+  name: string;
+  label: string;
+  content: string;
+  enabled: boolean;
+  /** 注入位置权重(0-4,对齐酒馆 injection position;当前仅用于排序) */
+  position: number;
+  /** 组内排序(升序) */
+  sort_order: number;
+  created_at?: string;
+  updated_at?: string;
+}
+
+/** slash 命令元信息(阶段四 4a;后端 GET /api/slash/commands) */
+export interface SlashCommandMeta {
+  name: string;
+  description: string;
+  params: string;
+}
+
+/** 世界书条目(预览/编辑;可与后端互写 data_raw) */
+export interface WorldBookEntry {
+  id: number;
+  comment: string;
+  /** 触发关键词(子串匹配) */
+  keys: string[];
+  /** 副关键词(酒馆 keysecondary) */
+  keys_secondary?: string[];
+  regex?: string | null;
+  /** 是否用正则匹配(优先于关键词) */
+  use_regex?: boolean;
+  /** 常驻注入(酒馆「全局」) */
+  constant: boolean;
+  /** 激活状态(总开关:激活才参与注入) */
+  enabled: boolean;
+  content: string;
+  /** 注入位置权重(0-4,酒馆 position) */
+  position?: number;
+  /** 扫描深度(酒馆 depth:从最新消息往前扫 N 条,0=全部) */
+  depth?: number;
+  /** 注入顺序(酒馆 order) */
+  order?: number;
+  /** 关键词大小写敏感 */
+  case_sensitive?: boolean;
+  /** 粘性(命中后接下来 N 条持续注入) */
+  sticky?: number;
+  /** 冷却(命中后 N 条内不再次触发) */
+  cooldown?: number;
+  /** 命中概率%(酒馆 probability) */
+  probability?: number;
+  /** 是否启用概率 */
+  use_probability?: boolean;
+  /** 注入消息角色(system / user / assistant;缺省:常驻→system,激发→user) */
+  role?: 'system' | 'user' | 'assistant' | null;
+}
+
+// ---- 用户脚本(ScriptTree,阶段三;对齐 JS-Slash-Runner「酒馆助手」存储格式) ----
+
+/** 脚本按钮(脚本侧可见的自定义按钮) */
+export interface ScriptButton {
+  name: string;
+  visible?: boolean;
+}
+
+/** 单个脚本:可执行体,存于角色卡 extensions.tavern_helper 或全局脚本表 */
+export interface ScriptNode {
+  type: 'script';
+  enabled: boolean;
+  name: string;
+  /** uuid */
+  id: string;
+  /** 脚本正文 */
+  content: string;
+  /** 脚本说明 */
+  info?: string;
+  button?: {
+    enabled: boolean;
+    buttons: ScriptButton[];
+  };
+  /** script 作用域变量(阶段三执行层读取) */
+  data?: Record<string, unknown>;
+  /** 随卡导出开关(酒馆 export_with) */
+  export_with?: {
+    data: boolean;
+    button: boolean;
+  };
+}
+
+/** 文件夹:可嵌套一层 script 节点 */
+export interface ScriptFolder {
+  type: 'folder';
+  enabled: boolean;
+  name: string;
+  /** uuid */
+  id: string;
+  icon?: string;
+  color?: string;
+  scripts: ScriptTreeNode[];
+}
+
+/** 脚本树节点(顶层数组元素) */
+export type ScriptTreeNode = ScriptNode | ScriptFolder;
+
+/** 脚本树:顶层数组(可含 script / folder,文件夹内可再含 script) */
+export type ScriptTree = ScriptTreeNode[];
+
+export interface ConnectorInfo {
+  connector: string;
+  model: string;
+  models: string[];
+  availableConnectors: Array<{ type: string; label: string }>;
+}
+
+/** 运行期设置(API 连接 + 生成参数);api_key 仅回传脱敏值 */
+export interface RuntimeSettings {
+  openai_base_url: string;
+  api_key_masked: string;
+  has_api_key: boolean;
+  model: string;
+  default_temperature: number;
+  default_top_p: number;
+  default_max_tokens: number;
+  max_context_tokens: number;
+  /** Agent 系统提示词(空 = 内置默认),支持 {{character_name}} 等占位符 */
+  agent_system_prompt: string;
+  /** 联网搜索端点(空 = 默认 DuckDuckGo HTML 接口) */
+  search_endpoint: string;
+  /** mvu 变量状态注入位置:system(默认,世界书并入 system)/ user_tail(追加到最新用户消息尾,前缀缓存友好) */
+  mvu_vars_position: string;
+  /** 反思提示词(空 = 机械规则检查;非空 = 反思步骤调用 LLM 判定) */
+  reflect_prompt: string;
+  /** 复杂模式预设尾部提示词(空 = 禁用;位置0 尾部) */
+  preset_tail_prompt: string;
+  /** 预设尾部提示词注入角色(user / assistant) */
+  preset_tail_role: string;
+  /** 反思失败建议的可选补充说明(主体建议由引擎自动生成 ≤200 token,注入位置0 内预设尾部之前;空 = 仅自动建议) */
+  reflect_advice_prompt: string;
+  /** 反思失败建议提示词注入角色(user / assistant) */
+  reflect_advice_role: string;
+  /** 放行模式:true = 除黑名单工具外自动放行 */
+  bypass_mode: boolean;
+  /** 放行模式黑名单 */
+  bypass_blacklist: string[];
+  /** AGENT/CUSTOM 模式工具循环轮次上限(默认 32) */
+  max_tool_rounds: number;
+  /** HTML 渲染开关(状态栏脚本执行前置条件):true = 开启安全 HTML 渲染 */
+  render_html: boolean;
+  /** 上下文压缩模式:off(不压缩)/ manual(手动触发)/ auto(token 超阈值自动压缩) */
+  compaction_mode: string;
+  /** 上下文压缩触发阈值(0.5..=0.95,默认 0.8):auto 模式下历史 token 占比达到该值即压缩 */
+  compaction_threshold: number;
+  /** LLM 请求快照开关(第四点·主题 A):true = 每次下发前把完整消息数组落库供回放调试 */
+  llm_request_log: boolean;
+}
+
+export interface PromptPreviewLayer {
+  source: string;
+  role: string;
+  layer: number;
+  order: number;
+  content: string;
+}
+
+export interface PromptPreview {
+  ok: boolean;
+  note: string;
+  layers: PromptPreviewLayer[];
+}
+
+export interface RuntimeSettingsPatch {
+  openai_base_url?: string;
+  openai_api_key?: string;
+  model?: string;
+  default_temperature?: number;
+  default_top_p?: number;
+  default_max_tokens?: number;
+  max_context_tokens?: number;
+  agent_system_prompt?: string;
+  search_endpoint?: string;
+  mvu_vars_position?: string;
+  reflect_prompt?: string;
+  preset_tail_prompt?: string;
+  preset_tail_role?: string;
+  reflect_advice_prompt?: string;
+  reflect_advice_role?: string;
+  bypass_mode?: boolean;
+  bypass_blacklist?: string[];
+  max_tool_rounds?: number;
+  render_html?: boolean;
+  compaction_mode?: string;
+  compaction_threshold?: number;
+  llm_request_log?: boolean;
+}
+
+// ===== 音频播放器(阶段五 5a;契约对齐酒馆助手 audio.d.ts) =====
+
+/** 音频曲目(仅 URL 播放,本地文件上传留扩展位) */
+export interface AudioTrack {
+  /** 标题 */
+  title: string;
+  /** 音频的网络链接 */
+  url: string;
+}
+
+/** 播放模式(与酒馆助手 AudioSettings.mode 对齐) */
+export type AudioMode = 'repeat_one' | 'repeat_all' | 'shuffle' | 'play_one_and_stop';
+
+/** 单通道设置(部分字段合并更新时全部可选) */
+export interface AudioChannelSettings {
+  /** 是否启用 */
+  enabled: boolean;
+  /** 当前播放模式 */
+  mode: AudioMode;
+  /** 是否静音 */
+  muted: boolean;
+  /** 当前音量 (0-100) */
+  volume: number;
+}
+
+/** 音频通道标识 */
+export type AudioChannelType = 'bgm' | 'ambient';
+
+/** 双通道全量状态 */
+export interface AudioState {
+  bgm: AudioChannelState;
+  ambient: AudioChannelState;
+}
+
+export interface AudioChannelState extends AudioChannelSettings {
+  playlist: AudioTrack[];
+}
+
+/** 沙箱内 getCurrentAudio 返回(当前选中/播放的曲目信息) */
+export interface CurrentAudio {
+  /** 当前选中/正在播放的音频链接,未选中曲目时为空字符串 */
+  src: string;
+  /** 当前选中音频的标题,未匹配到时为空字符串 */
+  title: string;
+  /** 是否正在播放 */
+  playing: boolean;
+  /** 播放进度 (0-100) */
+  progress: number;
+}
+
+/** 插件工具信息(自定义工具插件) */
+export interface ToolPluginInfo {
+  name: string;
+  description: string;
+  parameters: Record<string, unknown>;
+}
+
+export interface PluginToolsStatus {
+  tools: ToolPluginInfo[];
+  files: string[];
+}
+
+/** 提示词注入模式:简单模式 / 复杂模式(楼层系统) */
+export type InjectMode = 'simple' | 'complex';
+export type FloorPosition = 'system' | 'before' | 'after' | 'depth';
+export type FloorRole = 'system' | 'user' | 'assistant';
+
+/** 禁词条目:输出中出现 word 时注入自省提示词(所有模式),deep/agent/custom 另由引擎工具替换为 replacement */
+export interface BannedWordEntry {
+  /** 禁词(精确子串匹配) */
+  word: string;
+  /** 替换词(含义相近、更得体;空串 = 直接删除) */
+  replacement: string;
+}
+
+/** 简单模式:字数/转述/对话/视角 四项 + 禁词库 */
+export interface SimplePromptConfig {
+  word_count_enabled: boolean;
+  word_count: number;
+  paraphrase_enabled: boolean;
+  dialogue_enabled: boolean;
+  perspective_enabled: boolean;
+  perspective: string;
+  /** 注入顺序(合成文本按此顺序拼接;空 = 默认 字数→转述→对话→视角) */
+  order?: string[];
+  /** 禁词库总开关 */
+  banned_words_enabled?: boolean;
+  /** 禁词提示词(纯文本,发给 AI 的自省提示;新格式) */
+  banned_prompt?: string;
+  /** 禁词 → 替换词 映射表(旧格式兼容,仅保留字段不再用于注入) */
+  banned_words?: BannedWordEntry[];
+}
+
+/** 单条提示词楼层(仿 SillyTavern Prompt Manager) */
+export interface PromptFloor {
+  id: string;
+  name: string;
+  content: string;
+  role: FloorRole;
+  position: FloorPosition;
+  /** 深度:从历史末尾往前数第 N 条之后插入(0 = 最新消息后;仅 position=depth 生效) */
+  depth: number;
+  enabled: boolean;
+  order: number;
+}
+
+/** 提示词注入整体配置(全局,所有会话生效) */
+export interface PromptInjectConfig {
+  mode: InjectMode;
+  simple: SimplePromptConfig;
+  floors: PromptFloor[];
+}
+
+/** 导入结果(替换现有楼层) */
+export interface PromptPresetImportResult {
+  ok: boolean;
+  imported: number;
+  config: PromptInjectConfig;
+}
+
+/** 技能记录(提示词技能) */
+export interface SkillRecord {
+  id: string;
+  name: string;
+  description: string;
+  content: string;
+  enabled: boolean;
+  created_at: string;
+}
+
+export interface SkillImportItem {
+  name: string;
+  description?: string;
+  content?: string;
+}
+
+export interface AgentPlan {
+  plan: {
+    steps: Array<{ goal: string; action: string; generates?: boolean; name?: string }>;
+    summary: string;
+  };
+  summary: string;
+  tools: string[];
+  history: { state: string; plan: string[]; step_index: number } | null;
+}
+
+export type AgentMode = 'fast' | 'deep' | 'agent' | 'custom';
+
+/** 单步执行流程(与后端 PlanStep 对齐;tools:null=不使用,[]=全部,列表=白名单) */
+export interface AgentFlowStep {
+  id: string;
+  name: string;
+  enabled: boolean;
+  goal: string;
+  /** direct=执行/生成, reflect=反思(不生成) */
+  action: 'direct' | 'reflect';
+  /** 是否生成正文(direct 步骤必选;reflect 步骤必须缺省) */
+  generates?: boolean;
+  /** 步骤级系统提示词(支持酒馆宏),追加到 system 末尾,带 [本步指令] 标记 */
+  system_prompt?: string | null;
+  temperature?: number | null;
+  max_tokens?: number | null;
+  tools?: string[] | null;
+  /** 工具选择策略;function 时需同时填写 tool_choice_function */
+  tool_choice?: 'auto' | 'none' | 'required' | 'function' | null;
+  tool_choice_function?: string | null;
+  parallel_tool_calls?: boolean | null;
+}
+
+/** 自定义执行流程配置(单个流程,data/agent_flows.json 流程库中的一项) */
+export interface AgentFlowConfig {
+  /** 流程 id(库内唯一;空 = 新建,由后端分配) */
+  id?: string;
+  /** 流程名称(选择器展示) */
+  name?: string;
+  /** 流程说明 */
+  description?: string | null;
+  enabled: boolean;
+  steps: AgentFlowStep[];
+}
+
+/** 流程库(全局):当前选中的流程 + 全部流程 */
+export interface AgentFlowLibrary {
+  current_flow_id: string | null;
+  flows: AgentFlowConfig[];
+}
+
+// ===== 宏调试(阶段六 6b) =====
+
+/** 历史消息条目({{lastMessage}}/{{firstMessage}} 等宏读取) */
+export interface MacroHistoryItem {
+  role: string;
+  content: string;
+}
+
+/** 宏展开上下文(全可选;缺省即空/默认,与服务端引擎缺省语义一致) */
+export interface MacroExpandCtx {
+  character_name?: string;
+  character_description?: string;
+  personality?: string;
+  scenario?: string;
+  user_name?: string;
+  user_input?: string;
+  history?: MacroHistoryItem[];
+  /** 扁平变量 map({{getvar::key}}/{{var::key}} 读取;值为显示字符串) */
+  vars?: Record<string, string | number | boolean>;
+}
+
+/** 宏展开结果 */
+export interface MacroExpandResult {
+  expanded: string;
+}

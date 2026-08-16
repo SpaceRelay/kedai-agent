@@ -1,0 +1,17 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Kedai 桌面应用能力(窗口 + 导出保存对话框与文件写入)",
+  "windows": ["main"],
+  "remote": {
+    "urls": ["http://127.0.0.1:*/"]
+  },
+  "permissions": [
+    "core:default",
+    "dialog:allow-save",
+    {
+      "identifier": "fs:allow-write-text-file",
+      "allow": [{ "path": "**" }]
+    }
+  ]
+}

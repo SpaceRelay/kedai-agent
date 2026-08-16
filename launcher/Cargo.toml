@@ -1,0 +1,21 @@
+[package]
+name = "kedai-launcher"
+version = "0.2.0"
+edition = "2021"
+description = "Kedai 图形启动器:双击即用,失败弹窗给出可读原因"
+
+# 产物即用户双击的 Kedai.exe
+[[bin]]
+name = "Kedai"
+path = "src/main.rs"
+
+# 零第三方依赖:仅用 std + 手工声明的 user32/shell32 符号。
+# 保证启动器编译秒级完成,且不受后端依赖树影响。
+[dependencies]
+
+[profile.release]
+opt-level = "z"
+lto = true
+strip = true
+panic = "abort"
+codegen-units = 1

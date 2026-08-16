@@ -1,0 +1,160 @@
+// Agent 工具授权 API：查询当前会话/角色裁决结果，授予或撤销显式权限。
+use crate::api::app_state::AppState;
+use crate::api::WithStatus;
+use crate::models::types::ToolContext;
+use crate::tools::permissions::PendingAuthorizationDecision;
+use axum::extract::{Query, State};
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
+use axum::Json;
+use serde::Deserialize;
+use serde_json::json;
+use std::sync::Arc;
+
+#[derive(Deserialize)]
+pub struct PermissionQuery {
+    pub session_id: String,
+    /// 旧客户端仍可传入，但服务端始终以会话记录中的角色为准。
+    #[serde(default)]
+    pub character_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct PermissionBody {
+    pub session_id: String,
+    pub tool: String,
+    pub scope: String,
+    /// 恢复当前调用时必填;旧的预授权/撤销接口可不传。
+    #[serde(default)]
+    pub run_id: Option<String>,
+    #[serde(default)]
+    pub call_id: Option<String>,
+    /// 仅为兼容旧协议保留,不参与授权目标推导。
+    #[serde(default)]
+    pub scope_id: Option<String>,
+}
+
+pub async fn list(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<PermissionQuery>,
+) -> Response {
+    let Some(session) = state.sessions.get(&query.session_id) else {
+        return permission_error(StatusCode::NOT_FOUND, "会话不存在");
+    };
+    let ctx = ToolContext {
+        session_id: session.id.clone(),
+        character_id: session.character_id.clone(),
+    };
+    let tools: Vec<_> = state
+        .tool_registry
+        .list_definitions()
+        .into_iter()
+        .map(|definition| {
+            let decision = state
+                .tool_registry
+                .permissions()
+                .decide(&definition.name, &ctx);
+            json!({
+                "name": definition.name,
+                "description": definition.description,
+                "risk": decision.risk,
+                "allowed": decision.allowed,
+                "reason": decision.reason,
+            })
+        })
+        .collect();
+    Json(json!({
+        "tools": tools,
+        "grants": state.tool_registry.permissions().grants_for(&session.id, &session.character_id),
+    }))
+    .into_response()
+}
+
+pub async fn authorize(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<PermissionBody>,
+) -> Response {
+    mutate_permission(&state, &body, true)
+}
+
+pub async fn revoke(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<PermissionBody>,
+) -> Response {
+    mutate_permission(&state, &body, false)
+}
+
+pub async fn resolve(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<PermissionBody>,
+) -> Response {
+    let Some(run_id) = body.run_id.as_deref() else {
+        return permission_error(StatusCode::BAD_REQUEST, "缺少 run_id");
+    };
+    let Some(call_id) = body.call_id.as_deref() else {
+        return permission_error(StatusCode::BAD_REQUEST, "缺少 call_id");
+    };
+    if state.sessions.get(&body.session_id).is_none() {
+        return permission_error(StatusCode::NOT_FOUND, "会话不存在");
+    }
+    if state.tool_registry.get(&body.tool).is_none() {
+        return permission_error(StatusCode::BAD_REQUEST, "工具未注册");
+    }
+    let decision = match body.scope.as_str() {
+        "once" => PendingAuthorizationDecision::AllowOnce,
+        "session" => PendingAuthorizationDecision::AllowSession,
+        "role" => PendingAuthorizationDecision::AllowRole,
+        "deny" => PendingAuthorizationDecision::Deny,
+        _ => {
+            return permission_error(
+                StatusCode::BAD_REQUEST,
+                "decision 仅支持 once/session/role/deny",
+            )
+        }
+    };
+    match state.tool_registry.permissions().resolve_wait(
+        run_id,
+        call_id,
+        &body.session_id,
+        &body.tool,
+        decision,
+    ) {
+        Ok(()) => Json(json!({ "ok": true })).into_response(),
+        Err(error) => permission_error(StatusCode::CONFLICT, &error),
+    }
+}
+
+fn mutate_permission(state: &AppState, body: &PermissionBody, authorize: bool) -> Response {
+    let Some(session) = state.sessions.get(&body.session_id) else {
+        return permission_error(StatusCode::NOT_FOUND, "会话不存在");
+    };
+    if state.tool_registry.get(&body.tool).is_none() {
+        return permission_error(StatusCode::BAD_REQUEST, "工具未注册");
+    }
+    let scope_id = match body.scope.as_str() {
+        "session" => session.id.as_str(),
+        "role" => session.character_id.as_str(),
+        _ => return permission_error(StatusCode::BAD_REQUEST, "scope 仅支持 session 或 role"),
+    };
+    let result = if authorize {
+        state
+            .tool_registry
+            .permissions()
+            .authorize(&body.tool, &body.scope, scope_id)
+    } else {
+        state
+            .tool_registry
+            .permissions()
+            .revoke(&body.tool, &body.scope, scope_id)
+    };
+    match result {
+        Ok(()) => Json(json!({ "ok": true })).into_response(),
+        Err(error) => permission_error(StatusCode::BAD_REQUEST, &error),
+    }
+}
+
+fn permission_error(status: StatusCode, error: &str) -> Response {
+    Json(json!({ "error": error }))
+        .into_response()
+        .with_status(status)
+}

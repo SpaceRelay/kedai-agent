@@ -1,0 +1,73 @@
+// 音频路由:/api/audio(读取全量)/ PUT settings / PUT playlist
+use crate::api::app_state::AppState;
+use crate::api::WithStatus;
+use crate::services::audio_service::{AudioChannel, AudioTrack, ChannelSettingsPatch};
+use axum::extract::State;
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
+use axum::Json;
+use serde::Deserialize;
+use serde_json::json;
+use std::sync::Arc;
+
+/// GET /api/audio:返回双通道全量状态
+pub async fn get(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    let audio = state
+        .audio
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get();
+    Json(json!({ "audio": audio }))
+}
+
+#[derive(Deserialize)]
+pub struct SettingsBody {
+    /// 通道:bgm | ambient
+    pub r#type: String,
+    pub settings: ChannelSettingsPatch,
+}
+
+/// PUT /api/audio/settings:更新单通道设置(部分字段合并)
+pub async fn update_settings(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<SettingsBody>,
+) -> Response {
+    let Some(channel) = AudioChannel::parse(&body.r#type) else {
+        return Json(json!({ "error": "无效的音频通道" }))
+            .into_response()
+            .with_status(StatusCode::BAD_REQUEST);
+    };
+    let mut audio = state.audio.lock().unwrap_or_else(|e| e.into_inner());
+    match audio.update_settings(channel, body.settings) {
+        Ok(()) => Json(json!({ "ok": true, "audio": audio.get() })).into_response(),
+        Err(e) => Json(json!({ "error": e }))
+            .into_response()
+            .with_status(StatusCode::BAD_REQUEST),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct PlaylistBody {
+    /// 通道:bgm | ambient
+    pub r#type: String,
+    pub tracks: Vec<AudioTrack>,
+}
+
+/// PUT /api/audio/playlist:替换单通道播放列表(URL 协议白名单校验)
+pub async fn update_playlist(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<PlaylistBody>,
+) -> Response {
+    let Some(channel) = AudioChannel::parse(&body.r#type) else {
+        return Json(json!({ "error": "无效的音频通道" }))
+            .into_response()
+            .with_status(StatusCode::BAD_REQUEST);
+    };
+    let mut audio = state.audio.lock().unwrap_or_else(|e| e.into_inner());
+    match audio.update_playlist(channel, body.tracks) {
+        Ok(()) => Json(json!({ "ok": true, "audio": audio.get() })).into_response(),
+        Err(e) => Json(json!({ "error": e }))
+            .into_response()
+            .with_status(StatusCode::BAD_REQUEST),
+    }
+}

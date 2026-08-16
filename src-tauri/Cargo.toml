@@ -1,0 +1,38 @@
+[package]
+name = "kedai-desktop"
+version = "0.2.0"
+description = "Kedai 桌面应用(Tauri 壳 + 内嵌 Rust 服务)"
+edition = "2021"
+
+[lib]
+name = "kedai_desktop_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[[bin]]
+name = "kedai-desktop"
+path = "src/main.rs"
+
+# 便携构建使用独立产物名,避免已运行的开发版锁住 kedai-desktop.exe。
+[[bin]]
+name = "kedai-portable"
+path = "src/portable_main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+tauri-plugin-fs = "2"
+tokio = { version = "1", features = ["time", "rt", "macros", "sync"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+reqwest = { version = "0.12", default-features = false, features = ["native-tls"] }
+url = "2"
+rusqlite = { version = "0.32", features = ["bundled", "backup"] }
+# 复用既有 axum 后端:以库形式内嵌,同一进程内启动服务
+kedai-server = { path = "../server-rs" }
+
+[profile.release]
+lto = true
+strip = true

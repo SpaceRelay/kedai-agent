@@ -1,0 +1,11 @@
+{
+  "name": "greeting",
+  "description": "向用户打招呼,可带昵称参数",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "nickname": { "type": "string", "description": "用户昵称" }
+    }
+  },
+  "script": "return '你好,' + args.nickname + '!这是来自 Kedai 工具插件的问候。'"
+}

@@ -1,0 +1,22 @@
+# 依赖与构建产物
+node_modules/
+dist/
+server-rs/target/
+
+# 本地环境与密钥(API Key 经 .env 或 data/settings.json 提供,均不入库)
+.env
+.DS_Store
+*.log
+
+# 运行期用户数据:data/ 默认全部忽略,仅白名单放行仓库自带内容
+data/*
+!data/AGENTS_RUNTIME.md
+!data/agent_flows.json
+!data/characters/
+data/characters/*
+!data/characters/builtin-system.json
+!data/plugins/
+data/plugins/*
+!data/plugins/tools/
+data/plugins/tools/*
+!data/plugins/tools/greeting.json

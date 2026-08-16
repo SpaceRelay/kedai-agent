@@ -1,0 +1,145 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>kedai resource frame</title>
+<script>
+// 角色卡远程资源界面宿主文档。
+// 父页面 CSP 的 script-src 'self' 会禁止内联脚本,而 srcdoc/blob iframe 都会继承
+// 父页面 CSP,作者页面(常为 Vite 打包的内联 module script)无法执行;用 src 加载
+// 本独立文档则不继承父 CSP(见 security::resource_frame_headers,script-src
+// 'unsafe-inline' 且网络放开)。收到宿主经后端代理抓取的作者页面 HTML 后,通过
+// DOM 重建触发脚本执行(document.write 会丢失 module script,appendChild 可执行)。
+// sandbox(无 allow-same-origin)下作者脚本访问 localStorage/sessionStorage 会抛
+// SecurityError,导致界面中断;这里注入内存 shim,并把注入脚本里的
+// localStorage/sessionStorage 引用替换为 shim——界面状态存内存,功能不受影响,
+// 同时保持与宿主完全隔离。
+// 只接受第一条 boot(booted 闩锁),防止重复注入。
+'use strict';
+var __kdMemoryStorage = (function () {
+  var store = {};
+  return {
+    getItem: function (k) { return Object.prototype.hasOwnProperty.call(store, k) ? store[k] : null; },
+    setItem: function (k, v) { store[k] = String(v); },
+    removeItem: function (k) { delete store[k]; },
+    clear: function () { store = {}; },
+    key: function (i) { return Object.keys(store)[i] || null; },
+    get length() { return Object.keys(store).length; }
+  };
+})();
+var __kdSessionStorage = (function () {
+  var store = {};
+  return {
+    getItem: function (k) { return Object.prototype.hasOwnProperty.call(store, k) ? store[k] : null; },
+    setItem: function (k, v) { store[k] = String(v); },
+    removeItem: function (k) { delete store[k]; },
+    clear: function () { store = {}; },
+    key: function (i) { return Object.keys(store)[i] || null; },
+    get length() { return Object.keys(store).length; }
+  };
+})();
+// Cache API 内存 shim:沙箱 iframe(无 allow-same-origin,opaque origin)读取
+// globalThis.caches 属性会直接抛 SecurityError,作者页面(Vite SPA)初始化时读取
+// 它做资源缓存与更新检查,一旦抛错便落入「重试」错误态,资源界面无法显示。
+// 注入作者脚本时把 globalThis.caches 引用重写为 __kdCaches(见下方 boot 处理)。
+//
+// 缓存语义:作者页面用 put(match) 校验资源包缓存——先读响应头(x-sha256/
+// x-expires-at)判断有效性,再 arrayBuffer() 读 body 使用。同一 Response 的
+// body 只能消费一次,若直接存/返回原 Response,二次 match 读 body 会抛
+// 「body already read」,作者走「Cache Missed」分支反复重新下载(无限循环)。
+// 因此 put 时立即把 body 读入 ArrayBuffer 存副本,match 每次返回全新的
+// Response(headers 保留、body 可重复读),下载一次后同会话内永久命中。
+var __kdCaches = (function () {
+  var stores = {};
+  function store(name) {
+    if (!Object.prototype.hasOwnProperty.call(stores, name)) stores[name] = { map: {} };
+    return stores[name];
+  }
+  function keyOf(req) {
+    return (typeof req === 'string') ? req : String(req && (req.url || req.href) || '');
+  }
+  // 读取响应体副本:优先 arrayBuffer(可重复消费);已消费的响应回退存原样
+  function snapshotResponse(res) {
+    var rec = { headers: {}, raw: res, bodyPromise: null };
+    try {
+      var h = res.headers;
+      if (h && typeof h.forEach === 'function') h.forEach(function (v, k) { rec.headers[k] = v; });
+    } catch (e) { /* headers 不可读则留空 */ }
+    try {
+      rec.bodyPromise = res.arrayBuffer().then(function (buf) { return buf.slice(0); });
+    } catch (e) { rec.bodyPromise = null; }
+    return rec;
+  }
+  return {
+    open: function (name) {
+      var s = store(String(name));
+      return Promise.resolve({
+        put: function (req, res) {
+          s.map[keyOf(req)] = snapshotResponse(res);
+          return Promise.resolve();
+        },
+        match: function (req) {
+          var rec = s.map[keyOf(req)];
+          if (!rec) return Promise.resolve(undefined);
+          if (rec.bodyPromise) {
+            // 每次返回全新 Response:headers 保留、body 可重复 arrayBuffer()
+            return rec.bodyPromise.then(function (buf) {
+              return new Response(new Uint8Array(buf), { headers: rec.headers });
+            });
+          }
+          return Promise.resolve(rec.raw);
+        },
+        delete: function (req) { delete s.map[keyOf(req)]; return Promise.resolve(true); },
+        keys: function () { return Promise.resolve(Object.keys(s.map)); },
+        has: function (req) { return Promise.resolve(Object.prototype.hasOwnProperty.call(s.map, keyOf(req))); }
+      });
+    },
+    keys: function () { return Promise.resolve(Object.keys(stores)); },
+    match: function () { return Promise.resolve(undefined); },
+    has: function () { return Promise.resolve(false); },
+    delete: function () { return Promise.resolve(true); }
+  };
+})();
+let booted = false;
+const bootNonce = decodeURIComponent(location.hash.slice(1));
+location.hash = '';
+addEventListener('message', function (event) {
+  const m = event.data;
+  if (event.source !== parent) return;
+  if (!m || m.channel !== 'kedai-resource-frame-v1' || m.nonce !== bootNonce || booted) return;
+  if (m.type !== 'boot' || typeof m.html !== 'string') return;
+  booted = true;
+  const doc = new DOMParser().parseFromString(m.html, 'text/html');
+  // 先重建 body(作者脚本(React/Vue)挂载目标 #root 必须先存在),再执行 head 脚本
+  const body = document.body;
+  while (body.firstChild) body.removeChild(body.firstChild);
+  for (let i = 0; i < doc.body.childNodes.length; i++) {
+    const child = doc.body.childNodes[i];
+    if (child.nodeType === 1) body.appendChild(document.importNode(child, true));
+    else if (child.nodeType === 3 && child.textContent.trim()) body.appendChild(child.cloneNode(true));
+  }
+  // 重建 head:脚本用 appendChild 新元素触发执行(动态插入的 module script 可执行),
+  // localStorage/sessionStorage 引用替换为内存 shim;其余节点(style/base/link)importNode 保留
+  const head = document.head;
+  while (head.firstChild) head.removeChild(head.firstChild);
+  const srcHead = doc.head;
+  for (let i = 0; i < srcHead.childNodes.length; i++) {
+    const child = srcHead.childNodes[i];
+    if (child.nodeType !== 1) continue;
+    const tag = child.tagName.toUpperCase();
+    if (tag === 'SCRIPT') {
+      const s = document.createElement('script');
+      for (let a = 0; a < child.attributes.length; a++) {
+        s.setAttribute(child.attributes[a].name, child.attributes[a].value);
+      }
+      s.textContent = (child.textContent || '')
+        .replace(/\blocalStorage\b/g, '__kdMemoryStorage')
+        .replace(/\bsessionStorage\b/g, '__kdSessionStorage')
+        .replace(/\bglobalThis\.caches\b/g, '__kdCaches');
+      head.appendChild(s);
+    } else {
+      head.appendChild(document.importNode(child, true));
+    }
+  }
+});
+parent.postMessage({ channel: 'kedai-resource-frame-v1', nonce: bootNonce, type: 'ready' }, '*');
+</script>
+

@@ -1,0 +1,21 @@
+{
+  "name": "score_eval",
+  "description": "创作评分判定:输入得分与及格线,返回是否达标与等级(合格/待改进)。适合 agent 对草稿做快速自检或给用户反馈评分。示例:score=85, pass=60 → 合格。",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "score": {
+        "type": "number",
+        "description": "得分(0-100)"
+      },
+      "pass": {
+        "type": "number",
+        "description": "及格线,默认 60"
+      }
+    },
+    "required": [
+      "score"
+    ]
+  },
+  "script": "result = args.score >= args.pass ? {\"passed\": true, \"grade\": \"合格\", \"score\": args.score} : {\"passed\": false, \"grade\": \"待改进\", \"score\": args.score}"
+}

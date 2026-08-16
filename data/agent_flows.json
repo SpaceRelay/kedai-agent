@@ -1,0 +1,47 @@
+{
+  "current_flow_id": "builtin-coordination",
+  "flows": [
+    {
+      "id": "builtin-coordination",
+      "name": "文学创作协调流程示例",
+      "description": "Kedai 内置协调流程:理解意图 → 起草正文 → 反思质量 → 修订输出;与酒馆宏、世界书、mvu 变量协议对齐。",
+      "enabled": true,
+      "steps": [
+        {
+          "id": "understand",
+          "name": "理解意图",
+          "enabled": true,
+          "goal": "理解用户输入,提取本次回复要求(字数、视角、情节走向、风格),不生成正文",
+          "action": "direct",
+          "generates": false,
+          "system_prompt": "【本步指令·理解意图】你是 {{char}} 的扮演者与文学创作者。只做内部规划,不输出正文。提炼:①用户期望的篇幅与风格;②需要回应的关键信息;③需要调用的世界书/角色设定;④若用户提问,必须在最终回复中正面回答。不要输出任何正文内容。"
+        },
+        {
+          "id": "draft",
+          "name": "起草正文",
+          "enabled": true,
+          "goal": "生成正文:以 {{char}} 视角与口吻输出完整回复,服从用户字数/视角要求",
+          "action": "direct",
+          "generates": true,
+          "system_prompt": "【本步指令·起草正文】以 {{char}} 视角与口吻输出：视角遵循系统提示词与用户要求（用户未指定视角时默认角色视角）,不要出现旁白标题、「以上是回复」等元文本。服从用户的字数与风格要求;用户提问必须正面回答。若上下文存在「当前状态」且其中数值/属性/物品/剧情标记发生变化,必须在正文后输出 <UpdateVariable> 块(JSONPatch 数组,支持 replace / delta / addvar / remove,路径对应当前状态的键);无变化则不输出;纯状态更新时正文可以为空。除该块外不得使用任何自定义标签。"
+        },
+        {
+          "id": "reflect",
+          "name": "反思质量",
+          "enabled": true,
+          "goal": "检查草稿:字数是否达标、疑问是否回答、视角是否一致、是否被截断;判定输出 PASS 或 FAIL",
+          "action": "reflect"
+        },
+        {
+          "id": "revise",
+          "name": "修订输出",
+          "enabled": true,
+          "goal": "按反思结论修订并输出最终正文;未发现问题时直接输出原草稿",
+          "action": "direct",
+          "generates": true,
+          "system_prompt": "【本步指令·修订输出】基于反思结论修订上一版草稿:修复缺陷后再次以 {{char}} 视角完整输出最终正文;若反思结论为通过,原样输出草稿。任何情况下都不得输出反思过程本身。状态更新仍以 <UpdateVariable> 块(JSONPatch 数组)附加,格式与起草步骤相同。"
+        }
+      ]
+    }
+  ]
+}

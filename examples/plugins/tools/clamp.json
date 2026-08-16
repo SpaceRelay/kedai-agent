@@ -1,0 +1,25 @@
+{
+  "name": "clamp",
+  "description": "数值限幅:把 value 约束在 [min, max] 区间内返回。适合控制生成参数或章节字数不越界。示例:value=150, min=0, max=100 → 100.0。",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "value": {
+        "type": "number",
+        "description": "待限幅的数值"
+      },
+      "min": {
+        "type": "number",
+        "description": "下限,默认 0"
+      },
+      "max": {
+        "type": "number",
+        "description": "上限,默认 100"
+      }
+    },
+    "required": [
+      "value"
+    ]
+  },
+  "script": "result = Math.max(args.min, Math.min(args.max, args.value))"
+}

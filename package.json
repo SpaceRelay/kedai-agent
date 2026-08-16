@@ -1,0 +1,23 @@
+{
+  "name": "kedai",
+  "version": "0.2.0",
+  "private": true,
+  "description": "文学创作 / 角色扮演交互工具 —— 前端 Vue 3,后端 Rust(axum)",
+  "workspaces": [
+    "web"
+  ],
+  "scripts": {
+    "dev": "npm run dev -w web",
+    "build": "npm run build -w web",
+    "test": "npm test -w web",
+    "build:rs": "powershell -NoProfile -ExecutionPolicy Bypass -File build.ps1",
+    "build:desktop": "powershell -NoProfile -ExecutionPolicy Bypass -File build.ps1 -Tauri",
+    "build:portable": "powershell -NoProfile -ExecutionPolicy Bypass -File tools/build-portable.ps1",
+    "desktop": "src-tauri\\target\\release\\kedai-desktop.exe",
+    "start": "server-rs\\target\\release\\kedai-server.exe"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.11.4",
+    "concurrently": "^9.1.0"
+  }
+}

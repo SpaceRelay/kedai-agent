@@ -1,0 +1,42 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>kedai render panel</title>
+<script>
+// TH-render 等价物宿主文档:消息内 HTML 代码块(含 <html>/<head>/<body 标记)经
+// 约定式识别后,宿主把面板 HTML 经 postMessage 投递,本文档经 appendChild 注入
+// body 执行。nonce 由宿主放在 URL fragment(fragment 不会随 HTTP 请求发送),
+// ready/boot 双向认证;只接受第一条 boot(booted 闩锁),防止重复注入。
+// 与 sandbox.html 同级安全:本文档响应头的 CSP 断掉一切网络出口(见
+// security::render_frame_headers),iframe 带 sandbox="allow-scripts"
+// (无 allow-same-origin),面板脚本运行在不透明来源,拿不到宿主 DOM/localStorage/
+// API token。
+// 面板脚本通信保持最小化:
+//   - 高度自适应:面板内脚本(或宿主注入)经 parent.postMessage 上报
+//     {channel, type:'kd-panel-resize', height},宿主据此调整 iframe 高度;
+//   - 事件上报:面板内可发 {channel, type:'kd-panel-event', ...}(宿主 console
+//     记录,事件回推与 TavernHelper API 注入留扩展位)。
+// 注意:不要在此顶层声明 const/let 与注入脚本同名的标识符(如 CHANNEL)。
+'use strict';
+let booted = false;
+const bootNonce = decodeURIComponent(location.hash.slice(1));
+location.hash = '';
+addEventListener('message', function (event) {
+  const m = event.data;
+  if (event.source !== parent) return;
+  if (!m || m.channel !== 'kedai-render-panel-v1' || m.nonce !== bootNonce || booted) return;
+  if (m.type !== 'boot' || typeof m.html !== 'string') return;
+  booted = true;
+  // 面板 HTML 仅作正文注入:清空 body 后逐节点 appendChild(脚本经动态插入的
+  // script 元素执行,style 节点原样保留;不从面板 HTML 重建 head,面板不应自行
+  // 改 <title> 或引外部资源——CSP 已断掉网络,外部引用也不会生效)。
+  const body = document.body;
+  while (body.firstChild) body.removeChild(body.firstChild);
+  const doc = new DOMParser().parseFromString(m.html, 'text/html');
+  for (let i = 0; i < doc.body.childNodes.length; i++) {
+    const child = doc.body.childNodes[i];
+    if (child.nodeType === 1) body.appendChild(document.importNode(child, true));
+    else if (child.nodeType === 3 && child.textContent.trim()) body.appendChild(child.cloneNode(true));
+  }
+});
+parent.postMessage({ channel: 'kedai-render-panel-v1', nonce: bootNonce, type: 'ready' }, '*');
+</script>

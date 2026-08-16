@@ -1,0 +1,28 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>kedai sandbox</title>
+<script>
+// 角色卡脚本沙箱 bootstrap。
+// nonce 由宿主放在 URL fragment(fragment 不会随 HTTP 请求发送),ready/boot 双向认证。
+// 本文档不含任何业务逻辑与变量:等宿主投递 boot 消息,把脚本体作为内联 <script> 注入执行。
+// 只接受第一条 boot(booted 闩锁),防止后续消息二次注入脚本。
+// 用 appendChild 注入而非 eval:CSP 只给了 'unsafe-inline',动态插入的内联 <script>
+// 属于 inline 范畴被放行,而 eval/new Function 需要 'unsafe-eval'(已实测,故意不开)。
+// 注意:不要在此顶层声明 const/let 与注入脚本同名的标识符(如 CHANNEL)——经典脚本
+// 顶层 const 是全局词法绑定,注入脚本里 `const CHANNEL=...` 会与其重名而整段解析失败。
+'use strict';
+let booted = false;
+const bootNonce = decodeURIComponent(location.hash.slice(1));
+location.hash = '';
+addEventListener('message', function (event) {
+  const m = event.data;
+  if (event.source !== parent) return;
+  if (!m || m.channel !== 'kedai-character-script-v1' || m.nonce !== bootNonce || booted) return;
+  if (m.type !== 'boot' || typeof m.script !== 'string') return;
+  booted = true;
+  const s = document.createElement('script');
+  s.textContent = m.script;
+  document.head.appendChild(s);
+});
+parent.postMessage({ channel: 'kedai-character-script-v1', nonce: bootNonce, type: 'ready' }, '*');
+</script>
