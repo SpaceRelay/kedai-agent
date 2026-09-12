@@ -2,7 +2,7 @@
 // GET  /api/characters/{id}/contract/history?limit=50  历史列表(最新在前)
 // POST /api/characters/{id}/contract/rollback {"seq": n} 回滚到指定记录
 use crate::api::app_state::AppState;
-use crate::api::WithStatus;
+use crate::api::db_err;
 use crate::contracts::changelog::ChangelogSource;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
@@ -24,16 +24,12 @@ pub async fn list(
     Path(id): Path<String>,
     Query(query): Query<HistoryQuery>,
 ) -> Response {
-    let records = match state
-        .contract_changelog
-        .list(&id, query.limit.unwrap_or(50))
-    {
-        Ok(records) => records,
-        Err(e) => {
-            return Json(json!({ "error": e }))
-                .into_response()
-                .with_status(StatusCode::INTERNAL_SERVER_ERROR)
-        }
+    let svc = state.contract_changelog.clone();
+    let limit = query.limit.unwrap_or(50);
+    let records = match state.db_call(move || svc.list(&id, limit)).await {
+        Err(e) => return db_err(&e),
+        Ok(Ok(records)) => records,
+        Ok(Err(e)) => return err_json(e, StatusCode::INTERNAL_SERVER_ERROR),
     };
     let entries = match records
         .iter()
@@ -42,9 +38,10 @@ pub async fn list(
     {
         Ok(entries) => entries,
         Err(e) => {
-            return Json(json!({ "error": format!("序列化历史记录失败: {e}") }))
-                .into_response()
-                .with_status(StatusCode::INTERNAL_SERVER_ERROR)
+            return err_json(
+                format!("序列化历史记录失败: {e}"),
+                StatusCode::INTERNAL_SERVER_ERROR,
+            )
         }
     };
     Json(json!({ "entries": entries })).into_response()
@@ -61,50 +58,48 @@ pub async fn rollback(
 ) -> Response {
     // 1. 请求体必须为对象且含整数 seq
     let Some(seq) = body.get("seq").and_then(Value::as_i64) else {
-        return Json(json!({ "error": "请求体必须包含整数 seq" }))
-            .into_response()
-            .with_status(StatusCode::BAD_REQUEST);
+        return err_json("请求体必须包含整数 seq", StatusCode::BAD_REQUEST);
     };
     // 2. 记录不存在
-    let record = match state.contract_changelog.get(&id, seq) {
-        Ok(Some(record)) => record,
-        Ok(None) => {
-            return Json(json!({ "error": "历史记录不存在" }))
-                .into_response()
-                .with_status(StatusCode::NOT_FOUND)
-        }
-        Err(e) => {
-            return Json(json!({ "error": e }))
-                .into_response()
-                .with_status(StatusCode::INTERNAL_SERVER_ERROR)
-        }
+    let svc = state.contract_changelog.clone();
+    let id_q = id.clone();
+    let record = match state.db_call(move || svc.get(&id_q, seq)).await {
+        Err(e) => return db_err(&e),
+        Ok(Ok(Some(record))) => record,
+        Ok(Ok(None)) => return err_json("历史记录不存在", StatusCode::NOT_FOUND),
+        Ok(Err(e)) => return err_json(e, StatusCode::INTERNAL_SERVER_ERROR),
     };
     // 3. 该记录无可恢复内容(如 remove 记录)
     let Some(after) = record.after else {
-        return Json(json!({ "error": "该记录无可恢复内容" }))
-            .into_response()
-            .with_status(StatusCode::UNPROCESSABLE_ENTITY);
+        return err_json("该记录无可恢复内容", StatusCode::UNPROCESSABLE_ENTITY);
     };
     // 4. 防御性校验(入库时已校验过,理论上不触发)
     if let Err(e) = crate::contracts::parse_contract(&after) {
-        return Json(json!({ "error": e }))
-            .into_response()
-            .with_status(StatusCode::UNPROCESSABLE_ENTITY);
+        return err_json(e, StatusCode::UNPROCESSABLE_ENTITY);
     }
     // 5. 回滚前当前契约(留痕用;必须在 set_embedded_contract 之前读取)
-    let before = state
-        .characters
-        .get(&id)
-        .and_then(|card| card.data_raw)
-        .as_ref()
-        .and_then(crate::contracts::raw_contract_from_character_card)
-        .cloned();
+    let svc = state.characters.clone();
+    let id_c = id.clone();
+    let after_c = after.clone();
+    let phase = state
+        .db_call(move || {
+            // 回滚前当前契约(留痕用;必须在 set_embedded_contract 之前读取),随后写回
+            let before = svc
+                .get(&id_c)
+                .and_then(|card| card.data_raw)
+                .as_ref()
+                .and_then(crate::contracts::raw_contract_from_character_card)
+                .cloned();
+            let set = svc.set_embedded_contract(&id_c, Some(&after_c));
+            (before, set)
+        })
+        .await;
+    let (before, set_result) = match phase {
+        Ok(v) => v,
+        Err(e) => return db_err(&e),
+    };
     // 6. 写回角色卡
-    if state
-        .characters
-        .set_embedded_contract(&id, Some(&after))
-        .is_none()
-    {
+    if set_result.is_none() {
         return not_found();
     }
     // 7. 失效契约缓存(下次加载读到恢复后的契约)
@@ -112,14 +107,23 @@ pub async fn rollback(
     // 8. 回滚留痕。契约恢复已生效,append 失败不能报 500(会误导为「回滚失败」),
     // 降级为成功响应带 warning、seq 置 null。
     let rationale = format!("回滚自 seq {seq}");
-    let append_result = state.contract_changelog.append(
-        &id,
-        ChangelogSource::Rollback,
-        "replace",
-        before.as_ref(),
-        Some(&after),
-        Some(&rationale),
-    );
+    let svc = state.contract_changelog.clone();
+    // 闭包 move 捕获副本,id/after 留待响应 JSON 使用
+    let id_log = id.clone();
+    let after_log = after.clone();
+    let append_result = state
+        .db_call(move || {
+            svc.append(
+                &id_log,
+                ChangelogSource::Rollback,
+                "replace",
+                before.as_ref(),
+                Some(&after_log),
+                Some(&rationale),
+            )
+        })
+        .await
+        .unwrap_or_else(Err);
     let (new_seq, warning) = match append_result {
         Ok(seq) => (Some(seq), None),
         Err(e) => (None, Some(format!("契约已回滚,但变更历史写入失败: {e}"))),
@@ -136,9 +140,12 @@ pub async fn rollback(
 }
 
 fn not_found() -> Response {
-    Json(json!({ "error": "角色卡不存在" }))
-        .into_response()
-        .with_status(StatusCode::NOT_FOUND)
+    err_json("角色卡不存在", StatusCode::NOT_FOUND)
+}
+
+/// 本模块统一错误响应:按状态码自动附带结构化错误码(见 api/errors.rs)。
+fn err_json(msg: impl AsRef<str>, status: StatusCode) -> Response {
+    crate::api::err_with_code(crate::api::code_for_status(status), msg, status)
 }
 
 #[cfg(test)]
@@ -152,10 +159,8 @@ mod tests {
     fn app() -> (axum::Router, Arc<AppState>) {
         let mut config = crate::config::AppConfig::from_env();
         config.auth_required = false;
-        let dir = std::env::temp_dir().join(format!(
-            "kedai-contract-history-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("kedai-contract-history-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         config.data_dir = dir;
         config.connector = "mock".into();
@@ -181,7 +186,7 @@ mod tests {
 
     /// 直接插入裸角色记录(不动生产代码接口)
     fn seed_character(state: &AppState, id: &str) {
-        let conn = state.db.conn();
+        let conn = state.db.write();
         conn.execute(
             "INSERT INTO characters (id, name, chara_name, description, file_path, data_raw, created_at) \
              VALUES (?1, ?2, ?2, '', '', '{}', ?3)",
@@ -218,8 +223,13 @@ mod tests {
             .await
             .unwrap();
         let status = resp.status();
-        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
-        (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+        )
     }
 
     async fn get_history(router: &axum::Router, id: &str, limit: usize) -> (StatusCode, Value) {
@@ -227,15 +237,22 @@ mod tests {
             .clone()
             .oneshot(
                 Request::builder()
-                    .uri(format!("/api/characters/{id}/contract/history?limit={limit}"))
+                    .uri(format!(
+                        "/api/characters/{id}/contract/history?limit={limit}"
+                    ))
                     .body(Body::empty())
                     .unwrap(),
             )
             .await
             .unwrap();
         let status = resp.status();
-        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
-        (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+        )
     }
 
     async fn post_rollback(router: &axum::Router, id: &str, body: &Value) -> (StatusCode, Value) {
@@ -252,8 +269,13 @@ mod tests {
             .await
             .unwrap();
         let status = resp.status();
-        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
-        (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+        )
     }
 
     /// 1+2:PUT 首次挂载记 contract_init;再次 PUT 记 manual,且 before 为上一版。
@@ -351,11 +373,7 @@ mod tests {
         assert_eq!(last.op_kind, "replace");
         assert_eq!(last.before.as_ref().unwrap(), &v2);
         assert_eq!(last.after.as_ref().unwrap(), &v2);
-        assert!(last
-            .rationale
-            .as_deref()
-            .unwrap()
-            .contains("回滚自 seq 2"));
+        assert!(last.rationale.as_deref().unwrap().contains("回滚自 seq 2"));
 
         // 缓存已失效:registry 直接读到恢复后的契约
         let loaded = state.engine.contract_registry.load("c-rb").unwrap();
@@ -383,19 +401,22 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
 
-        // 不存在的 seq → 404
+        // 不存在的 seq → 404 + code NOT_FOUND(errors.rs 结构化错误码)
         let (status, resp) = post_rollback(&router, "c-err", &json!({ "seq": 999 })).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert_eq!(resp["error"], "历史记录不存在");
+        assert_eq!(resp["code"], "NOT_FOUND");
 
-        // remove 记录无可恢复内容 → 422
+        // remove 记录无可恢复内容 → 422 + code VALIDATION
         let (status, resp) = post_rollback(&router, "c-err", &json!({ "seq": 2 })).await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
         assert_eq!(resp["error"], "该记录无可恢复内容");
+        assert_eq!(resp["code"], "VALIDATION");
 
-        // 请求体非法:缺 seq / 非整数 → 400
-        let (status, _) = post_rollback(&router, "c-err", &json!({})).await;
+        // 请求体非法:缺 seq / 非整数 → 400 + code VALIDATION
+        let (status, resp) = post_rollback(&router, "c-err", &json!({})).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(resp["code"], "VALIDATION");
         let (status, _) = post_rollback(&router, "c-err", &json!({ "seq": "2" })).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
     }
@@ -418,7 +439,11 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::NO_CONTENT);
         assert!(
-            state.contract_changelog.list("c-noc", 10).unwrap().is_empty(),
+            state
+                .contract_changelog
+                .list("c-noc", 10)
+                .unwrap()
+                .is_empty(),
             "无契约角色的 DELETE 不应落账"
         );
     }

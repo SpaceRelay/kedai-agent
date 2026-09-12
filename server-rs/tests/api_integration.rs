@@ -685,15 +685,15 @@ async fn concurrent_partial_settings_updates_preserve_both_fields() {
         "/api/settings",
         json!({ "preset_tail_role": "assistant" }),
     );
-    let second = send_json(
-        app,
-        "PUT",
-        "/api/settings",
-        json!({ "render_html": true }),
-    );
+    let second = send_json(app, "PUT", "/api/settings", json!({ "render_html": true }));
     let (first, second) = tokio::join!(first, second);
     assert_eq!(first.0, StatusCode::OK, "第一笔设置更新失败: {:?}", first.1);
-    assert_eq!(second.0, StatusCode::OK, "第二笔设置更新失败: {:?}", second.1);
+    assert_eq!(
+        second.0,
+        StatusCode::OK,
+        "第二笔设置更新失败: {:?}",
+        second.1
+    );
 
     let (status, current) = send_json(app, "GET", "/api/settings", json!({})).await;
     assert_eq!(status, StatusCode::OK);
@@ -1666,7 +1666,11 @@ async fn resource_proxy_rejects_invalid_urls() {
         json!({}),
     )
     .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "javascript: 应拒绝: {body}");
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "javascript: 应拒绝: {body}"
+    );
     // 私网地址拒绝(SSRF):127.0.0.1
     let (status, body) = send_json(
         app,
@@ -1723,7 +1727,10 @@ async fn multi_greeting_seed_and_switch() {
     let (_, h0) = send_json(
         app,
         "GET",
-        &format!("/api/chat/history?session_id={}", s0["id"].as_str().unwrap()),
+        &format!(
+            "/api/chat/history?session_id={}",
+            s0["id"].as_str().unwrap()
+        ),
         json!({}),
     )
     .await;
@@ -1742,7 +1749,10 @@ async fn multi_greeting_seed_and_switch() {
     let (_, h2) = send_json(
         app,
         "GET",
-        &format!("/api/chat/history?session_id={}", s2["id"].as_str().unwrap()),
+        &format!(
+            "/api/chat/history?session_id={}",
+            s2["id"].as_str().unwrap()
+        ),
         json!({}),
     )
     .await;
@@ -1761,7 +1771,10 @@ async fn multi_greeting_seed_and_switch() {
     let (_, h99) = send_json(
         app,
         "GET",
-        &format!("/api/chat/history?session_id={}", s99["id"].as_str().unwrap()),
+        &format!(
+            "/api/chat/history?session_id={}",
+            s99["id"].as_str().unwrap()
+        ),
         json!({}),
     )
     .await;
@@ -1816,7 +1829,10 @@ async fn multi_greeting_seed_and_switch() {
         json!({ "alternate_greetings": [] }),
     )
     .await;
-    assert!(cleared.get("alternate_greetings").is_none(), "空数组应清空备用开场: {cleared}");
+    assert!(
+        cleared.get("alternate_greetings").is_none(),
+        "空数组应清空备用开场: {cleared}"
+    );
 }
 
 #[tokio::test]
@@ -1826,12 +1842,12 @@ async fn slash_commands_list() {
     let (status, json) = send_json(app, "GET", "/api/slash/commands", json!({})).await;
     assert_eq!(status, StatusCode::OK);
     let commands = json["commands"].as_array().expect("commands 应为数组");
-    let names: Vec<&str> = commands
-        .iter()
-        .filter_map(|c| c["name"].as_str())
-        .collect();
+    let names: Vec<&str> = commands.iter().filter_map(|c| c["name"].as_str()).collect();
     for expected in ["echo", "var", "setvar", "getvar", "addvar", "help"] {
-        assert!(names.contains(&expected), "命令清单应包含 {expected}: {names:?}");
+        assert!(
+            names.contains(&expected),
+            "命令清单应包含 {expected}: {names:?}"
+        );
     }
     // 每项含 name/description/params 元信息
     for c in commands {
@@ -1895,7 +1911,10 @@ async fn audio_crud() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(json["audio"]["bgm"]["playlist"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        json["audio"]["bgm"]["playlist"].as_array().unwrap().len(),
+        2
+    );
 
     // 5) 非法协议 → 400,且不落盘不改内存
     let (status, body) = send_json(
@@ -1911,7 +1930,10 @@ async fn audio_crud() {
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert!(body["error"].as_str().unwrap().contains("协议"));
     let (_, after) = send_json(app, "GET", "/api/audio", json!({})).await;
-    assert_eq!(after["audio"]["bgm"]["playlist"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        after["audio"]["bgm"]["playlist"].as_array().unwrap().len(),
+        2
+    );
 }
 
 #[tokio::test]
@@ -1935,14 +1957,734 @@ async fn render_frame_document_is_served() {
         .to_str()
         .unwrap()
         .to_string();
-    assert!(csp.contains("default-src 'none'"), "CSP 应为 default-src 'none': {csp}");
+    assert!(
+        csp.contains("default-src 'none'"),
+        "CSP 应为 default-src 'none': {csp}"
+    );
     assert!(csp.contains("script-src 'unsafe-inline'"));
     assert!(csp.contains("connect-src 'none'"));
     assert!(csp.contains("frame-ancestors 'self'"));
     assert_eq!(resp.headers()["x-frame-options"], "SAMEORIGIN");
     let bytes = resp.into_body().collect().await.unwrap().to_bytes();
     let html = String::from_utf8_lossy(&bytes);
-    assert!(html.contains("kedai-render-panel-v1"), "宿主文档应含面板 channel");
+    assert!(
+        html.contains("kedai-render-panel-v1"),
+        "宿主文档应含面板 channel"
+    );
     assert!(html.contains("booted"), "宿主文档应含 boot 闩锁");
 }
 
+// ===== 缓存诊断端点(缓存感知管线) =====
+
+/// 直插 llm_requests 缓存统计行(绕过引擎,精确控制命中/未命中数据)
+fn insert_cache_rows(sid: &str) {
+    let db_path = std::env::temp_dir()
+        .join(format!("kedai-test-{}", std::process::id()))
+        .join("kedai.db");
+    let conn = rusqlite::Connection::open(&db_path).expect("打开测试库失败");
+    for (seq, hit, miss, prompt, completion) in
+        [(1, 700, 300, 1000, 200), (2, 600, 400, 1000, 1000)]
+    {
+        conn.execute(
+            "INSERT INTO llm_requests
+               (session_id, run_id, seq, payload, model, created_at,
+                prompt_cache_hit_tokens, prompt_cache_miss_tokens, prompt_tokens, completion_tokens)
+             VALUES (?1, 'run-diag', ?2, '', 'mock', ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params![
+                sid,
+                seq,
+                format!("2026-08-16T00:00:0{seq}Z"),
+                hit,
+                miss,
+                prompt,
+                completion
+            ],
+        )
+        .expect("插入缓存统计行失败");
+    }
+}
+
+#[tokio::test]
+async fn diagnostics_cache_reports_hit_rate_and_pricing() {
+    let app = test_app();
+    let (_, char) = upload_character(app, "缓存诊断.json").await;
+    let cid = char["id"].as_str().unwrap().to_string();
+    let (_, session) = send_json(
+        app,
+        "POST",
+        "/api/chat/sessions",
+        json!({ "character_id": cid, "title": "缓存诊断会话" }),
+    )
+    .await;
+    let sid = session["id"].as_str().unwrap().to_string();
+    insert_cache_rows(&sid);
+
+    let (_, body) = send_json(
+        app,
+        "GET",
+        &format!("/api/diagnostics/cache?session_id={sid}"),
+        json!({}),
+    )
+    .await;
+    let totals = &body["totals"];
+    assert_eq!(totals["count"], json!(2), "应统计 2 条: {body}");
+    assert_eq!(totals["total_hit"], json!(1300));
+    assert_eq!(totals["total_miss"], json!(700));
+    let rate = totals["hit_rate"].as_f64().expect("hit_rate 应为数值");
+    assert!((rate - 0.65).abs() < 1e-9, "加权命中率 0.65,实际 {rate}");
+    // 费用 = (1300*0.27 + 700*2 + 1200*8)/1e6 = 0.011351(默认 DeepSeek 参考价)
+    let cost = body["cost"].as_f64().unwrap();
+    assert!((cost - 0.011351).abs() < 1e-9, "费用估算: {cost}");
+    let saved = body["saved"].as_f64().unwrap();
+    assert!((saved - 0.002249).abs() < 1e-9, "节省估算: {saved}");
+    // 明细:时间正序(seq 1 在前),含 session/时间/hit/miss
+    let entries = body["entries"].as_array().unwrap();
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries[0]["hit"], json!(700));
+    assert_eq!(entries[1]["miss"], json!(400));
+    assert_eq!(entries[0]["session_id"], json!(sid));
+    // 单价结构体透出(每百万 token,不做货币换算)
+    assert_eq!(body["pricing"]["cache_hit_per_m"], json!(0.27));
+    assert_eq!(body["pricing"]["input_per_m"], json!(2.0));
+    assert_eq!(body["pricing"]["output_per_m"], json!(8.0));
+    // 水位报告字段齐全(档位合法集合;具体档位随并行测试的 settings 变化,不精确断言)
+    let level = body["watermark"]["level"].as_str().unwrap_or("");
+    assert!(
+        ["ok", "soft", "snip", "compact", "force", "unknown"].contains(&level),
+        "水位档位应合法: {body}"
+    );
+    assert!(body["watermark"]["max_context_tokens"].is_u64());
+
+    // 窗口过滤:window=1 只取最新一条(seq 2)
+    let (_, body) = send_json(
+        app,
+        "GET",
+        &format!("/api/diagnostics/cache?session_id={sid}&window=1"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(body["totals"]["count"], json!(1));
+    assert_eq!(body["entries"][0]["hit"], json!(600));
+}
+
+// ===== 跨会话记忆蒸馏(落地项 2) =====
+
+/// 记忆库全流程:设置开关 → 蒸馏(mock [[reply:]] 钩子按行拆分)→ 列表 → 手动添加
+/// → 编辑 → 删除;默认未开启蒸馏时端点拒绝。
+#[tokio::test]
+async fn memory_distill_crud_flow() {
+    let app = test_app();
+    let (_, char) = upload_character(app, "记忆角色.json").await;
+    let cid = char["id"].as_str().unwrap().to_string();
+    let (_, session) = send_json(
+        app,
+        "POST",
+        "/api/chat/sessions",
+        json!({ "character_id": cid }),
+    )
+    .await;
+    let sid = session["id"].as_str().unwrap().to_string();
+
+    // 默认蒸馏关闭:端点拒绝并给出开启指引(先显式复位,规避并行用例的设置残留)
+    let _ = send_json(
+        app,
+        "PUT",
+        "/api/settings",
+        json!({ "memory_distill_enabled": false }),
+    )
+    .await;
+    let (status, err) = send_json(
+        app,
+        "POST",
+        "/api/memory/distill",
+        json!({ "session_id": sid }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "未开启应 400: {err}");
+    assert!(err["error"]
+        .as_str()
+        .unwrap()
+        .contains("memory_distill_enabled"));
+
+    // 开启蒸馏
+    let (status, _) = send_json(
+        app,
+        "PUT",
+        "/api/settings",
+        json!({ "memory_distill_enabled": true }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // 导入带 [[reply:]] 钩子的历史:mock 连接器回显标记内文本 → 按行拆 2 条
+    let (status, _) = send_json(
+        app,
+        "POST",
+        "/api/import/chat",
+        json!({ "session_id": sid, "messages": [
+            { "role": "user", "content": "我们聊聊吧[[reply:用户喜欢下雪天\n角色害怕打雷]]" },
+            { "role": "assistant", "content": "好呀。" }
+        ] }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, body) = send_json(
+        app,
+        "POST",
+        "/api/memory/distill",
+        json!({ "session_id": sid }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "蒸馏失败: {body}");
+    assert_eq!(body["inserted"], json!(2), "应按行拆 2 条: {body}");
+    assert_eq!(body["character_id"], json!(cid));
+
+    // 列表:全字段(id/kind/source_session_id/content/usage_count/selected)
+    let (status, list) = send_json(
+        app,
+        "GET",
+        &format!("/api/memory?character_id={cid}"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let memories = list["memories"].as_array().unwrap();
+    assert_eq!(memories.len(), 2);
+    let m0 = &memories[0];
+    assert!(m0["id"].is_i64());
+    assert_eq!(m0["character_id"], json!(cid));
+    assert_eq!(m0["kind"], json!("distilled"));
+    assert_eq!(m0["source_session_id"], json!(sid));
+    assert_eq!(m0["usage_count"], json!(0));
+    assert_eq!(m0["selected"], json!(true));
+    assert!(m0["created_at"].is_string());
+    let contents: Vec<&str> = memories
+        .iter()
+        .map(|m| m["content"].as_str().unwrap())
+        .collect();
+    assert!(contents.contains(&"用户喜欢下雪天"), "内容: {contents:?}");
+    assert!(contents.contains(&"角色害怕打雷"), "内容: {contents:?}");
+
+    // 手动添加
+    let (status, created) = send_json(
+        app,
+        "POST",
+        "/api/memory",
+        json!({ "character_id": cid, "content": "  用户养了一只猫  " }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "手动添加失败: {created}");
+    assert_eq!(created["memory"]["kind"], json!("manual"));
+    assert_eq!(created["memory"]["content"], json!("用户养了一只猫"));
+    let manual_id = created["memory"]["id"].as_i64().unwrap();
+
+    // 编辑:content 与 selected
+    let (status, updated) = send_json(
+        app,
+        "PATCH",
+        &format!("/api/memory/{manual_id}"),
+        json!({ "content": "用户养了两只猫", "selected": false }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "编辑失败: {updated}");
+    assert_eq!(updated["memory"]["content"], json!("用户养了两只猫"));
+    assert_eq!(updated["memory"]["selected"], json!(false));
+    // 空白 content 拒绝
+    let (status, _) = send_json(
+        app,
+        "PATCH",
+        &format!("/api/memory/{manual_id}"),
+        json!({ "content": "   " }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    // 不存在的 id → 404
+    let (status, _) = send_json(
+        app,
+        "PATCH",
+        "/api/memory/999999",
+        json!({ "selected": true }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // 删除:204;重复删除 404
+    let status = send_empty(app, "DELETE", &format!("/api/memory/{manual_id}")).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let status = send_empty(app, "DELETE", &format!("/api/memory/{manual_id}")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    // 删除后列表只剩 2 条蒸馏记忆
+    let (_, list) = send_json(
+        app,
+        "GET",
+        &format!("/api/memory?character_id={cid}"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(list["memories"].as_array().unwrap().len(), 2);
+    // 还原蒸馏开关,避免污染并行用例
+    let _ = send_json(
+        app,
+        "PUT",
+        "/api/settings",
+        json!({ "memory_distill_enabled": false }),
+    )
+    .await;
+}
+
+/// GET /api/memory/search:中文 FTS 命中、缺参 400、limit 上限钳制;
+/// POST /api/memory/prune:硬删除 selected=0 归档条目并返回条数
+#[tokio::test]
+async fn memory_search_and_prune_endpoints() {
+    let app = test_app();
+    let (_, char) = upload_character(app, "记忆检索角色.json").await;
+    let cid = char["id"].as_str().unwrap().to_string();
+
+    // 落两条记忆(其中一条含「图书馆」)
+    let (status, created) = send_json(
+        app,
+        "POST",
+        "/api/memory",
+        json!({ "character_id": cid, "content": "用户与角色在图书馆初识" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let lib_id = created["memory"]["id"].as_i64().unwrap();
+    let (_, other) = send_json(
+        app,
+        "POST",
+        "/api/memory",
+        json!({ "character_id": cid, "content": "角色害怕打雷" }),
+    )
+    .await;
+    let other_id = other["memory"]["id"].as_i64().unwrap();
+
+    // 检索:中文命中
+    let (status, body) = send_json(
+        app,
+        "GET",
+        &format!("/api/memory/search?character_id={cid}&q=%E5%9B%BE%E4%B9%A6%E9%A6%86"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "检索失败: {body}");
+    let memories = body["memories"].as_array().unwrap();
+    assert_eq!(memories.len(), 1, "应仅命中含「图书馆」的记忆: {body}");
+    assert_eq!(memories[0]["id"], json!(lib_id));
+    assert_eq!(memories[0]["pinned"], json!(false), "条目应含 pinned 字段");
+
+    // 缺参 400
+    let (status, _) = send_json(
+        app,
+        "GET",
+        &format!("/api/memory/search?character_id={cid}"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "缺 q 应 400");
+    let (status, _) = send_json(app, "GET", "/api/memory/search?q=test", json!({})).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "缺 character_id 应 400");
+
+    // limit 超上限钳制到 100(不报错)
+    let (status, body) = send_json(
+        app,
+        "GET",
+        &format!("/api/memory/search?character_id={cid}&q=%E5%9B%BE%E4%B9%A6%E9%A6%86&limit=9999"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["memories"].as_array().unwrap().len(), 1);
+
+    // prune:两条都 selected=1 → 删除 0 条
+    let (status, body) = send_json(
+        app,
+        "POST",
+        "/api/memory/prune",
+        json!({ "character_id": cid }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["removed"], json!(0), "无归档条目应删 0 条");
+
+    // 归档一条后 prune 硬删除它,列表只剩一条
+    let (status, _) = send_json(
+        app,
+        "PATCH",
+        &format!("/api/memory/{other_id}"),
+        json!({ "selected": false }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, body) = send_json(
+        app,
+        "POST",
+        "/api/memory/prune",
+        json!({ "character_id": cid }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["removed"], json!(1), "应硬删除 1 条归档条目: {body}");
+    let (_, list) = send_json(
+        app,
+        "GET",
+        &format!("/api/memory?character_id={cid}"),
+        json!({}),
+    )
+    .await;
+    let remaining = list["memories"].as_array().unwrap();
+    assert_eq!(remaining.len(), 1);
+    assert_eq!(remaining[0]["id"], json!(lib_id));
+
+    // 缺参 400
+    let (status, _) = send_json(app, "POST", "/api/memory/prune", json!({})).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+/// 记忆设置白名单透出:GET 默认 关闭/上限 8;PUT 可写,越界(>50)忽略、0 合法
+#[tokio::test]
+async fn memory_settings_exposed_and_clamped() {
+    let app = test_app();
+    let (status, s) = send_json(app, "GET", "/api/settings", json!({})).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        s["memory_distill_enabled"].is_boolean(),
+        "设置应透出 memory_distill_enabled: {s}"
+    );
+    assert_eq!(s["memory_inject_limit"], json!(8), "注入上限默认 8: {s}");
+    assert_eq!(
+        s["memory_inject_char_budget"],
+        json!(2000),
+        "字符预算默认 2000: {s}"
+    );
+    assert_eq!(s["memory_max_entries"], json!(200), "容量默认 200: {s}");
+
+    // 越界值忽略(保持默认);0 合法(关闭注入/不限制/不淘汰)
+    let (status, _) = send_json(
+        app,
+        "PUT",
+        "/api/settings",
+        json!({ "memory_inject_limit": 999 }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, s) = send_json(app, "GET", "/api/settings", json!({})).await;
+    assert_eq!(s["memory_inject_limit"], json!(8), "越界值应被忽略");
+
+    // 新增两字段:越界忽略、合法值生效
+    let (status, _) = send_json(
+        app,
+        "PUT",
+        "/api/settings",
+        json!({ "memory_inject_char_budget": 999_999, "memory_max_entries": 999_999 }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, s) = send_json(app, "GET", "/api/settings", json!({})).await;
+    assert_eq!(
+        s["memory_inject_char_budget"],
+        json!(2000),
+        "越界预算应忽略"
+    );
+    assert_eq!(s["memory_max_entries"], json!(200), "越界容量应忽略");
+    let (status, _) = send_json(
+        app,
+        "PUT",
+        "/api/settings",
+        json!({ "memory_inject_char_budget": 500, "memory_max_entries": 10 }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, s) = send_json(app, "GET", "/api/settings", json!({})).await;
+    assert_eq!(s["memory_inject_char_budget"], json!(500), "合法预算应生效");
+    assert_eq!(s["memory_max_entries"], json!(10), "合法容量应生效");
+    // 还原
+    let _ = send_json(
+        app,
+        "PUT",
+        "/api/settings",
+        json!({ "memory_inject_char_budget": 2000, "memory_max_entries": 200 }),
+    )
+    .await;
+
+    let (status, _) = send_json(
+        app,
+        "PUT",
+        "/api/settings",
+        json!({ "memory_inject_limit": 0 }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, s) = send_json(app, "GET", "/api/settings", json!({})).await;
+    assert_eq!(s["memory_inject_limit"], json!(0), "0 应合法(关闭注入)");
+    // 还原注入上限默认,避免影响并行用例
+    let _ = send_json(
+        app,
+        "PUT",
+        "/api/settings",
+        json!({ "memory_inject_limit": 8 }),
+    )
+    .await;
+}
+
+/// 端到端:记忆槽随 chat/send 注入消息数组([[floors]] 回显断言),响应完成后
+/// touch 回写 usage_count;inject_limit=0 时等价关闭注入。
+#[tokio::test]
+async fn memory_slot_injected_and_touched() {
+    let app = test_app();
+    let (_, char) = upload_character(app, "记忆注入角色.json").await;
+    let cid = char["id"].as_str().unwrap().to_string();
+    let (_, session) = send_json(
+        app,
+        "POST",
+        "/api/chat/sessions",
+        json!({ "character_id": cid }),
+    )
+    .await;
+    let sid = session["id"].as_str().unwrap().to_string();
+
+    // 手动添加一条记忆(默认 inject_limit=8 > 0,即注入)
+    let (status, created) = send_json(
+        app,
+        "POST",
+        "/api/memory",
+        json!({ "character_id": cid, "content": "用户偏爱雨天" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let memory_id = created["memory"]["id"].as_i64().unwrap();
+
+    // 发送一轮:[[floors]] 回显完整 LLM 消息数组 → 记忆槽应作为独立 system 消息出现
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/chat/send")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({ "session_id": sid, "character_id": cid, "message": "看记忆 [[floors]]" })
+                .to_string(),
+        ))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let text = String::from_utf8_lossy(&bytes).to_string();
+    let events: Vec<Value> = text
+        .split("\n\n")
+        .filter_map(|block| {
+            let block = block.trim();
+            if block.is_empty() {
+                return None;
+            }
+            let data_line = block.lines().find(|l| l.starts_with("data: "))?;
+            serde_json::from_str(&data_line[6..]).ok()
+        })
+        .collect();
+    let finish = events
+        .iter()
+        .find(|e| e["type"] == "finish")
+        .expect("应有 finish 事件");
+    let echoed = finish["content"].as_str().unwrap();
+    assert!(
+        echoed.contains("[system] 【角色长期记忆】"),
+        "回显应含记忆槽 system 消息: {}",
+        &echoed[..echoed.len().min(300)]
+    );
+    assert!(
+        echoed.contains("- 用户偏爱雨天"),
+        "记忆槽应逐条一行注入: {}",
+        &echoed[..echoed.len().min(300)]
+    );
+
+    // 响应完成后 touch 生效:usage_count+1、last_usage 落时间戳,content 不变
+    let (_, list) = send_json(
+        app,
+        "GET",
+        &format!("/api/memory?character_id={cid}"),
+        json!({}),
+    )
+    .await;
+    let entry = list["memories"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["id"].as_i64() == Some(memory_id))
+        .expect("应能查到记忆条目");
+    assert_eq!(entry["usage_count"], json!(1), "注入后应回写计数: {entry}");
+    assert!(
+        entry["last_usage"].is_string(),
+        "last_usage 应有值: {entry}"
+    );
+
+    // inject_limit=0 等价关闭注入:新会话(避免上轮回显文本残留在历史)不再出现记忆槽
+    let _ = send_json(
+        app,
+        "PUT",
+        "/api/settings",
+        json!({ "memory_inject_limit": 0 }),
+    )
+    .await;
+    let (_, session2) = send_json(
+        app,
+        "POST",
+        "/api/chat/sessions",
+        json!({ "character_id": cid }),
+    )
+    .await;
+    let sid2 = session2["id"].as_str().unwrap().to_string();
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/chat/send")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({ "session_id": sid2, "character_id": cid, "message": "再看 [[floors]]" })
+                .to_string(),
+        ))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let text = String::from_utf8_lossy(&bytes).to_string();
+    let events: Vec<Value> = text
+        .split("\n\n")
+        .filter_map(|block| {
+            let block = block.trim();
+            if block.is_empty() {
+                return None;
+            }
+            let data_line = block.lines().find(|l| l.starts_with("data: "))?;
+            serde_json::from_str(&data_line[6..]).ok()
+        })
+        .collect();
+    let finish = events
+        .iter()
+        .find(|e| e["type"] == "finish")
+        .expect("应有 finish 事件");
+    let echoed2 = finish["content"].as_str().unwrap();
+    assert!(
+        !echoed2.contains("【角色长期记忆】"),
+        "limit=0 时不应注入记忆槽: {}",
+        &echoed2[..echoed2.len().min(300)]
+    );
+    // 计数不再增长(第二轮未注入)
+    let (_, list) = send_json(
+        app,
+        "GET",
+        &format!("/api/memory?character_id={cid}"),
+        json!({}),
+    )
+    .await;
+    let entry = list["memories"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["id"].as_i64() == Some(memory_id))
+        .unwrap();
+    assert_eq!(entry["usage_count"], json!(1), "未注入不应回写计数");
+
+    // 还原设置,避免污染并行用例
+    let _ = send_json(
+        app,
+        "PUT",
+        "/api/settings",
+        json!({ "memory_inject_limit": 8 }),
+    )
+    .await;
+}
+
+// ==================== 工具插件文件名净化策略统一(优化项 B-4) ====================
+
+/// 上传入口:文件名经净化后与原始名不一致即拒绝(「..」路径穿越 / 非法字符);
+/// 合法名通过并注册成功。与删除入口同一 sanitize_plugin_filename 判定。
+#[tokio::test]
+async fn plugin_upload_sanitizes_filename() {
+    let app = test_app();
+    let _guard = test_lock().await;
+    let upload = |filename: &str| {
+        let body = format!(
+            "--BOUND\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{filename}\"\r\nContent-Type: application/json\r\n\r\n{}\r\n--BOUND--\r\n",
+            json!({ "name": "b4_demo", "description": "B-4 测试插件", "script": "result = 1;" })
+        );
+        Request::builder()
+            .method("POST")
+            .uri("/api/plugins/tools/upload")
+            .header("content-type", "multipart/form-data; boundary=BOUND")
+            .body(Body::from(body))
+            .unwrap()
+    };
+
+    // 「..」路径穿越:净化删掉 '/' 后与原名不一致 → 400,不落盘
+    let resp = app.clone().oneshot(upload("../evil.json")).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST, ".. 路径穿越应被拒");
+    // 含非法字符(空格):净化后与原名不一致 → 400
+    let resp = app.clone().oneshot(upload("my tool.json")).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "含空格文件名应被拒");
+
+    // 合法名通过:201 + 落盘注册;用唯一名避免与并行用例互踩
+    let resp = app
+        .clone()
+        .oneshot(upload("b4-demo_plugin.json"))
+        .await
+        .unwrap();
+    let status = resp.status();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let json: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+    assert_eq!(status, StatusCode::CREATED, "合法文件名应通过: {json}");
+    assert_eq!(json["file"], json!("b4-demo_plugin.json"));
+    // 收尾删除(兼覆盖删除入口合法名路径)
+    let (status, _) = send_json(
+        app,
+        "DELETE",
+        "/api/plugins/tools/b4-demo_plugin.json",
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "删除合法文件名应通过");
+}
+
+/// 删除入口:「..」与含非法字符名被拒(与上传同一净化函数);
+/// 净化允许的点号组合(如无分隔符的「..」开头)不在拒绝范围,故「..」用带分隔符形态构造。
+#[tokio::test]
+async fn plugin_delete_sanitizes_filename() {
+    let app = test_app();
+    let _guard = test_lock().await;
+    // 「..」路径穿越(URL 编码 %2E%2E%2F = ../):路径段解码后与原名不一致 → 400
+    let status = send_empty(app, "DELETE", "/api/plugins/tools/..%2Fevil.json").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, ".. 路径穿越应被拒");
+    // 含非法字符(空格 %20):净化后与原名不一致 → 400
+    let status = send_empty(app, "DELETE", "/api/plugins/tools/my%20tool.json").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "含空格文件名应被拒");
+    // 合法名通过(文件不存在也走完整校验后 200,删除语义幂等)
+    let status = send_empty(app, "DELETE", "/api/plugins/tools/nonexistent-b4.json").await;
+    assert_eq!(status, StatusCode::OK, "合法文件名应通过校验");
+}
+
+/// SPA 回退边界(2026-09 修复「面板加载失败」):静态资源未命中必须 404,
+/// 不能回退成 index.html——否则浏览器把 HTML 当 JS 解析,前端表现为
+/// 「面板加载失败」且懒加载重试永远失败(典型触发:前端重建后 chunk hash 变化)。
+#[tokio::test]
+async fn spa_fallback_returns_404_for_missing_assets() {
+    let app = test_app();
+    let _guard = test_lock().await;
+
+    // 不存在的 assets chunk → 404(不是 200 + text/html)
+    let (status, _) = send_json(
+        app,
+        "GET",
+        "/assets/EmbeddingSection-STALEHASH.js",
+        json!({}),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "缺失的 assets chunk 应 404,不能回退 index.html"
+    );
+
+    // 其它带扩展名的静态资源(如 favicon 缺失)同样 404
+    let (status, _) = send_json(app, "GET", "/missing-icon.png", json!({})).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "缺失的静态资源应 404");
+
+    // 路由式路径(无点、非 assets)仍回退 index.html,保证前端路由可刷新
+    let (status, _) = send_json(app, "GET", "/some-spa-route", json!({})).await;
+    assert_eq!(status, StatusCode::OK, "路由路径应回退 index.html");
+}

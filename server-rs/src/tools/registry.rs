@@ -2,6 +2,7 @@
 // 执行器为 async(sleep/agentgo/search 等工具需要异步能力),签名:
 //   Fn(Value, ToolContext) -> BoxFuture<Result<String, String>>
 use crate::models::types::{ToolContext, ToolDefinition};
+use crate::tools::action_class::ToolOrigin;
 use crate::tools::permissions::{PermissionDecision, ToolPermissionManager};
 use futures::future::BoxFuture;
 use serde_json::Value;
@@ -22,6 +23,12 @@ pub type ToolExecutor =
 pub struct RegisteredTool {
     pub definition: ToolDefinition,
     pub execute: ToolExecutor,
+    /// 该工具的执行超时;None = 跟随注册表 tool_timeout(默认 30s,测试可缩短)。
+    /// MCP 等慢外部工具经 register_with_timeout 显式放宽(批次 6.2)。
+    pub timeout: Option<Duration>,
+    /// 工具来源(内置/插件/MCP):三档授权模式据此判定路径区域可信度
+    /// (内置文件工具受角色文件区沙箱约束,外部工具的参数对引擎不透明)。
+    pub origin: ToolOrigin,
 }
 
 pub struct ToolRegistry {
@@ -29,6 +36,11 @@ pub struct ToolRegistry {
     permissions: ToolPermissionManager,
     /// 工具执行超时(测试可缩短,生产默认 30s)
     tool_timeout: Duration,
+    /// 回退快照服务(批次 6.1「undo」):由 app_state 在工具注册后经 set_undo 注入
+    /// (OnceLock:UndoService 依赖的 Db/SessionService 早于注册表存在,但装配顺序
+    /// 上注册表先构造,故后注;与 ToolDeps.engine/tasks 的 OnceLock 后注同范式)。
+    /// 未注入(单元测试 ToolRegistry::new())时写工具不产快照,行为与旧版一致。
+    undo: std::sync::OnceLock<Arc<crate::services::undo_service::UndoService>>,
 }
 
 impl ToolRegistry {
@@ -41,6 +53,7 @@ impl ToolRegistry {
             tools: Mutex::new(HashMap::new()),
             permissions,
             tool_timeout: DEFAULT_TOOL_TIMEOUT,
+            undo: std::sync::OnceLock::new(),
         }
     }
 
@@ -55,29 +68,82 @@ impl ToolRegistry {
         &self.permissions
     }
 
+    /// 注入回退快照服务(批次 6.1;app_state 装配时调用一次,重复 set 忽略)
+    pub fn set_undo(&self, undo: Arc<crate::services::undo_service::UndoService>) {
+        let _ = self.undo.set(undo);
+    }
+
     pub fn register(&self, definition: ToolDefinition, execute: ToolExecutor) {
+        self.register_with_timeout(definition, execute, None);
+    }
+
+    /// 带自定义执行超时的注册(批次 6.2 MCP 外部工具用,如 120s);
+    /// timeout=None 与 register 完全一致(跟随注册表 tool_timeout,生产 30s),
+    /// 既有调用方行为零变化。
+    pub fn register_with_timeout(
+        &self,
+        definition: ToolDefinition,
+        execute: ToolExecutor,
+        timeout: Option<Duration>,
+    ) {
+        self.register_external(definition, execute, timeout, ToolOrigin::Builtin);
+    }
+
+    /// 带来源标记的注册:插件与 MCP 工具须经此登记 origin,
+    /// 否则三档授权模式会把外部工具误当作受沙箱约束的内置工具。
+    pub fn register_external(
+        &self,
+        definition: ToolDefinition,
+        execute: ToolExecutor,
+        timeout: Option<Duration>,
+        origin: ToolOrigin,
+    ) {
         let mut g = self.tools.lock().unwrap_or_else(|e| e.into_inner());
         g.insert(
             definition.name.clone(),
             RegisteredTool {
                 definition,
                 execute,
+                timeout,
+                origin,
             },
         );
     }
 
+    /// 工具来源;未注册返回 None。裁决时用于区分沙箱内外的路径可信度。
+    pub fn origin_of(&self, name: &str) -> Option<ToolOrigin> {
+        self.tools
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(name)
+            .map(|t| t.origin)
+    }
+
+    /// 是否内置工具(受角色文件区沙箱约束)
+    pub fn is_builtin(&self, name: &str) -> bool {
+        self.origin_of(name) == Some(ToolOrigin::Builtin)
+    }
+
     pub fn unregister(&self, name: &str) {
-        self.tools.lock().unwrap_or_else(|e| e.into_inner()).remove(name);
+        self.tools
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(name);
     }
 
     pub fn get(&self, name: &str) -> Option<RegisteredTool> {
-        self.tools.lock().unwrap_or_else(|e| e.into_inner()).get(name).cloned()
+        self.tools
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(name)
+            .cloned()
     }
 
     pub fn list_definitions(&self) -> Vec<ToolDefinition> {
         let mut definitions: Vec<_> = self
             .tools
-            .lock().unwrap_or_else(|e| e.into_inner())
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
             .values()
             .map(|t| t.definition.clone())
             .collect();
@@ -129,10 +195,13 @@ impl ToolRegistry {
     ) -> Result<String, String> {
         let tool = self
             .get(name)
-            .ok_or_else(|| format!("未注册的工具:{name}"))?;
+            .ok_or_else(|| format!("未注册的工具:{name}。请先用 todo 工具查看可用能力,或改用已注册的工具名(区分大小写)"))?;
         let decision = self.permissions.decide(name, &ctx);
         if !decision.allowed {
-            return Err(format!("工具 \"{name}\" 未执行:{}", decision.reason));
+            return Err(format!(
+                "工具 \"{name}\" 未执行:{}。下一步:在授权弹窗中允许,或改用无需授权的只读工具(如 read/todo)",
+                decision.reason
+            ));
         }
         self.run_tool(tool, args_json, ctx).await
     }
@@ -148,11 +217,14 @@ impl ToolRegistry {
         decision: &PermissionDecision,
     ) -> Result<String, String> {
         if !decision.allowed {
-            return Err(format!("工具 \"{name}\" 未执行:{}", decision.reason));
+            return Err(format!(
+                "工具 \"{name}\" 未执行:{}。下一步:检查步骤白名单配置,或改用白名单内的工具",
+                decision.reason
+            ));
         }
         let tool = self
             .get(name)
-            .ok_or_else(|| format!("未注册的工具:{name}"))?;
+            .ok_or_else(|| format!("未注册的工具:{name}。请先用 todo 工具查看可用能力,或改用已注册的工具名(区分大小写)"))?;
         self.run_tool(tool, args_json, ctx).await
     }
 
@@ -164,15 +236,54 @@ impl ToolRegistry {
         ctx: ToolContext,
     ) -> Result<String, String> {
         let name = tool.definition.name.clone();
-        let args: Value = serde_json::from_str(args_json)
-            .map_err(|_| format!("工具 \"{name}\" 参数解析失败:{args_json}"))?;
+        let args: Value = serde_json::from_str(args_json).map_err(|_| {
+            format!("工具 \"{name}\" 参数解析失败:{args_json}。下一步:改为合法 JSON 对象,键名与类型对照工具定义的 parameters")
+        })?;
+        // 批次 6.1 回退快照(两段式):写工具执行前取逆操作负载暂存;执行成功 commit
+        // 落库,失败 discard 丢弃。快照构建含角色文件区文件读取与同步 DB 查询,
+        // 经 spawn_blocking 挪出 tokio worker(B-1:消除 async 热路径同步 IO);
+        // 构建失败/任务取消返回 None——快照 best-effort,绝不挡工具执行。
+        // undo_enabled 开关在 UndoService 内读取(全局开关,直接读基础值)。
+        let stager = match self.undo.get() {
+            Some(undo) => {
+                let undo = undo.clone();
+                let snap_name = name.clone();
+                let snap_args = args.clone();
+                let snap_ctx = ctx.clone();
+                tokio::task::spawn_blocking(move || {
+                    undo.snapshot_before(&snap_name, &snap_args, &snap_ctx)
+                })
+                .await
+                .ok()
+                .flatten()
+            }
+            None => None,
+        };
         let fut = (tool.execute)(args, ctx);
-        let timeout = self.tool_timeout;
+        // 单工具自定义超时(MCP 等慢外部工具)优先,否则跟随注册表档(生产 30s)
+        let timeout = tool.timeout.unwrap_or(self.tool_timeout);
         let output = match tokio::time::timeout(timeout, fut).await {
             Ok(Ok(s)) => s,
-            Ok(Err(e)) => return Err(e),
-            Err(_) => return Err(format!("工具 \"{name}\" 执行超时({}s)", timeout.as_secs())),
+            Ok(Err(e)) => {
+                if let Some(s) = stager {
+                    s.discard();
+                }
+                return Err(e);
+            }
+            Err(_) => {
+                if let Some(s) = stager {
+                    s.discard();
+                }
+                return Err(format!(
+                    "工具 \"{name}\" 执行超时({}s)。下一步:缩小参数范围(如减少读取量)后重试,或改用 agentgo 后台执行",
+                    timeout.as_secs()
+                ));
+            }
         };
+        // 执行成功:补记执行后信息并落库(须在下方截断之前,截断后输出不再是合法 JSON)
+        if let Some(s) = stager {
+            s.commit(&output);
+        }
         // 超长结果截断(保留字节计数元数据,调用方按字符串回填模型/前端)
         if output.len() > MAX_TOOL_OUTPUT_BYTES {
             let mut boundary = MAX_TOOL_OUTPUT_BYTES;
@@ -242,6 +353,7 @@ mod tests {
         ToolContext {
             session_id: "s".into(),
             character_id: "c".into(),
+            agent_depth: 0,
         }
     }
 
@@ -504,6 +616,148 @@ mod tests {
             out.len() < 70 * 1024,
             "截断后应远小于原始 80KB: {}",
             out.len()
+        );
+    }
+
+    /// 工具治理:两次构建注册表,工具定义序列化逐字节一致——
+    /// HashMap 无序,若 list_definitions 不排序,下发给模型的工具定义数组顺序会跨启动漂移,
+    /// 击穿 DeepSeek 逐字节前缀缓存。此测试守护该顺序稳定性。
+    #[test]
+    fn tool_definitions_serialize_identically_across_builds() {
+        fn build_registry() -> ToolRegistry {
+            let reg = ToolRegistry::new();
+            // 注册顺序刻意乱序,验证输出不依赖插入顺序
+            for name in ["zeta", "alpha", "middle", "read", "write"] {
+                reg.register(
+                    ToolDefinition {
+                        name: name.into(),
+                        description: format!("{name} 工具"),
+                        parameters: serde_json::json!({"type":"object"}),
+                    },
+                    Arc::new(|_, _| Box::pin(async { Ok("ok".into()) })),
+                );
+            }
+            reg
+        }
+        let first = serde_json::to_string(&build_registry().list_definitions()).unwrap();
+        let second = serde_json::to_string(&build_registry().list_definitions()).unwrap();
+        assert_eq!(first, second, "两次构建的工具定义 JSON 必须逐字节一致");
+        assert!(first.contains("alpha"), "定义序列化应含工具名: {first}");
+    }
+
+    /// 工具治理:错误文案可操作化——裸错误一律附「下一步」指引,模型可直接照做
+    #[tokio::test]
+    async fn error_messages_carry_next_step_guidance() {
+        let reg = ToolRegistry::new().with_tool_timeout(Duration::from_millis(50));
+        reg.register(
+            ToolDefinition {
+                name: "write".into(),
+                description: "写入".into(),
+                parameters: serde_json::json!({}),
+            },
+            Arc::new(|_, _| {
+                Box::pin(async {
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    Ok("不应到达".into())
+                })
+            }),
+        );
+        // 未注册工具:补「查看可用能力/核对工具名」指引
+        let missing = reg.execute("nope", "{}", ctx()).await.unwrap_err();
+        assert!(
+            missing.contains("todo") && missing.contains("区分大小写"),
+            "未注册错误应含指引: {missing}"
+        );
+        // 权限拒绝:补「授权或改用只读工具」指引
+        let denied = reg.execute("write", "{}", ctx()).await.unwrap_err();
+        assert!(
+            denied.contains("授权弹窗") && denied.contains("只读工具"),
+            "权限拒绝应含指引: {denied}"
+        );
+        // 参数解析失败:补「对照 parameters 修正 JSON」指引
+        reg.permissions()
+            .authorize("write", "session", "s")
+            .unwrap();
+        let bad_args = reg.execute("write", "不是json", ctx()).await.unwrap_err();
+        assert!(
+            bad_args.contains("合法 JSON") && bad_args.contains("parameters"),
+            "参数解析失败应含指引: {bad_args}"
+        );
+        // 超时:补「缩小范围重试/转后台」指引
+        let timeout_err = reg.execute("write", "{}", ctx()).await.unwrap_err();
+        assert!(
+            timeout_err.contains("缩小参数范围") && timeout_err.contains("agentgo"),
+            "超时错误应含指引: {timeout_err}"
+        );
+    }
+
+    /// 批次 6.2:register_with_timeout 单工具超时覆盖注册表档——
+    /// 慢外部工具(MCP)可放宽到 120s 而不影响其余工具的 30s 默认。
+    #[tokio::test]
+    async fn register_with_timeout_overrides_registry_default() {
+        let reg = ToolRegistry::new().with_tool_timeout(Duration::from_millis(50));
+        // 自定义 5s 超时:执行器睡 100ms(超过注册表档 50ms)应成功——单工具档生效
+        reg.register_with_timeout(
+            ToolDefinition {
+                name: "slow-mcp".into(),
+                description: "慢外部工具".into(),
+                parameters: serde_json::json!({}),
+            },
+            Arc::new(|_, _| {
+                Box::pin(async {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    Ok("慢但完成".into())
+                })
+            }),
+            Some(Duration::from_secs(5)),
+        );
+        reg.permissions()
+            .authorize("slow-mcp", "session", "s")
+            .unwrap();
+        let out = reg.execute("slow-mcp", "{}", ctx()).await.unwrap();
+        assert_eq!(out, "慢但完成", "单工具 5s 档应覆盖注册表 50ms 档");
+
+        // 对照:普通 register 仍跟随注册表档(50ms),睡 100ms 应超时
+        reg.register(
+            ToolDefinition {
+                name: "slow-default".into(),
+                description: "默认档慢工具".into(),
+                parameters: serde_json::json!({}),
+            },
+            Arc::new(|_, _| {
+                Box::pin(async {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    Ok("不应到达".into())
+                })
+            }),
+        );
+        reg.permissions()
+            .authorize("slow-default", "session", "s")
+            .unwrap();
+        let err = reg.execute("slow-default", "{}", ctx()).await.unwrap_err();
+        assert!(err.contains("执行超时"), "默认档应超时: {err}");
+    }
+
+    /// 批次 6.2:缺省路径零变化——register 与 register_with_timeout(None) 等价(30s 生产档)
+    #[test]
+    fn register_default_timeout_unchanged() {
+        assert_eq!(
+            DEFAULT_TOOL_TIMEOUT,
+            Duration::from_secs(30),
+            "生产默认工具超时不得漂移(30s)"
+        );
+        let reg = ToolRegistry::new();
+        reg.register(
+            ToolDefinition {
+                name: "plain".into(),
+                description: "普通注册".into(),
+                parameters: serde_json::json!({}),
+            },
+            Arc::new(|_, _| Box::pin(async { Ok("ok".into()) })),
+        );
+        assert!(
+            reg.get("plain").unwrap().timeout.is_none(),
+            "register 不应携带单工具超时(None = 跟随注册表档)"
         );
     }
 }

@@ -52,7 +52,7 @@ pub fn eval_js(source: &str, opts: &EvalOptions) -> EvalOutcome {
     };
     if let Some(limit) = opts.memory_limit {
         // 内存上限:超限执行抛 JS 异常
-        let _ = rt.set_memory_limit(limit);
+        rt.set_memory_limit(limit);
     }
     let st = state.clone();
     rt.set_interrupt_handler(Some(Box::new(move || {
@@ -91,7 +91,7 @@ pub fn eval_with_bridge(
         return EvalOutcome::Error("初始化 JS 运行时失败".into());
     };
     if let Some(limit) = opts.memory_limit {
-        let _ = rt.set_memory_limit(limit);
+        rt.set_memory_limit(limit);
     }
     let st = state.clone();
     rt.set_interrupt_handler(Some(Box::new(move || {
@@ -125,9 +125,7 @@ pub fn eval_with_bridge(
         let b = bridge.clone();
         let slash_fn = Function::new(
             ctx.clone(),
-            move |cmd: String| -> Result<String, rquickjs::Error> {
-                Ok(b.trigger_slash(&cmd))
-            },
+            move |cmd: String| -> Result<String, rquickjs::Error> { Ok(b.trigger_slash(&cmd)) },
         );
         // 生成闭包(阶段六 6g-1):脚本调 TavernHelper.generate → Rust 非流式生成。
         // 闭包捕获 bridge 的 Arc clone(引擎注入的 GenerateHandler 已捕获 connector)。
@@ -143,7 +141,11 @@ pub fn eval_with_bridge(
         let b = bridge.clone();
         let import_fn = Function::new(
             ctx.clone(),
-            move |kind: String, filename: String, content: String, session_id: String| -> Result<String, rquickjs::Error> {
+            move |kind: String,
+                  filename: String,
+                  content: String,
+                  session_id: String|
+                  -> Result<String, rquickjs::Error> {
                 b.import_raw(&kind, &filename, &content, &session_id)
                     .map_err(|_| rquickjs::Error::Unknown)
             },
@@ -247,7 +249,9 @@ mod tests {
 
     #[test]
     fn runtime_error_message_extracted() {
-        assert!(matches!(run("throw new Error('炸了')"), EvalOutcome::Error(msg) if msg.contains("炸了")));
+        assert!(
+            matches!(run("throw new Error('炸了')"), EvalOutcome::Error(msg) if msg.contains("炸了"))
+        );
     }
 
     #[test]

@@ -5,8 +5,8 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use super::super::RenderCtxData;
 use super::super::AssistantVars;
+use super::super::RenderCtxData;
 use super::value::*;
 
 #[derive(Debug, Clone)]

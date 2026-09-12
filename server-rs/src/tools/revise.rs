@@ -66,14 +66,22 @@ mod tests {
     #[test]
     fn replaces_found_passage() {
         assert_eq!(
-            revise_passage("他走进了屋子,然后坐了下来。", "坐了下来", "站了一会儿又坐下").unwrap(),
+            revise_passage(
+                "他走进了屋子,然后坐了下来。",
+                "坐了下来",
+                "站了一会儿又坐下"
+            )
+            .unwrap(),
             "他走进了屋子,然后站了一会儿又坐下。"
         );
     }
 
     #[test]
     fn missing_find_returns_original() {
-        assert_eq!(revise_passage("原文内容", "不存在的片段", "x").unwrap(), "原文内容");
+        assert_eq!(
+            revise_passage("原文内容", "不存在的片段", "x").unwrap(),
+            "原文内容"
+        );
     }
 
     #[test]
@@ -84,6 +92,9 @@ mod tests {
 
     #[test]
     fn replaces_all_occurrences() {
-        assert_eq!(revise_passage("他笑了笑,然后笑了笑。", "笑了笑", "点了点头").unwrap(), "他点了点头,然后点了点头。");
+        assert_eq!(
+            revise_passage("他笑了笑,然后笑了笑。", "笑了笑", "点了点头").unwrap(),
+            "他点了点头,然后点了点头。"
+        );
     }
 }

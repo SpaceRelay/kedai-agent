@@ -1,9 +1,7 @@
 // 音频服务:bgm/ambient 双通道播放器状态,持久化到 data/audio.json
 // 契约对齐酒馆助手 @types/function/audio.d.ts(setAudioSettings 为部分字段合并,
 // volume clamp 0-100,replace/append 播放列表 URL 协议白名单)。
-use crate::utils::logger;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use std::path::{Path, PathBuf};
 
 /// 播放模式(与酒馆助手 audio.d.ts 的 AudioSettings.mode 对齐)
@@ -167,29 +165,23 @@ impl AudioState {
             Ok(text) => match serde_json::from_str::<AudioState>(&text) {
                 Ok(state) => state,
                 Err(e) => {
-                    logger::error(
-                        "音频配置解析失败,已回退默认配置",
-                        &[("error", Value::String(e.to_string()))],
-                    );
+                    tracing::error!(error = e.to_string(), "音频配置解析失败,已回退默认配置");
                     AudioState::default()
                 }
             },
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => AudioState::default(),
             Err(e) => {
-                logger::error(
-                    "音频配置读取失败,已回退默认配置",
-                    &[("error", Value::String(e.to_string()))],
-                );
+                tracing::error!(error = e.to_string(), "音频配置读取失败,已回退默认配置");
                 AudioState::default()
             }
         }
     }
 
-    /// 持久化到 data/audio.json
+    /// 持久化到 data/audio.json(原子写:崩溃不留半截 JSON)
     pub fn save(&self, data_dir: &Path) -> Result<(), String> {
-        let _ = std::fs::create_dir_all(data_dir);
         let text = serde_json::to_string_pretty(self).map_err(|e| e.to_string())?;
-        std::fs::write(data_dir.join("audio.json"), text).map_err(|e| e.to_string())
+        crate::utils::fs_atomic::write_atomic(&data_dir.join("audio.json"), text.as_bytes())
+            .map_err(|e| e.to_string())
     }
 
     fn channel_mut(&mut self, channel: AudioChannel) -> &mut ChannelState {
@@ -206,7 +198,11 @@ fn validate_audio_url(url: &str) -> Result<(), String> {
     if trimmed.is_empty() {
         return Err("音频 URL 不能为空".to_string());
     }
-    let scheme = trimmed.split("://").next().unwrap_or("").to_ascii_lowercase();
+    let scheme = trimmed
+        .split("://")
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
     if matches!(scheme.as_str(), "http" | "https") {
         Ok(())
     } else {
@@ -220,11 +216,7 @@ mod tests {
     use std::fs;
 
     fn temp_dir(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "kedai-audio-{}-{}",
-            std::process::id(),
-            tag
-        ));
+        let dir = std::env::temp_dir().join(format!("kedai-audio-{}-{}", std::process::id(), tag));
         let _ = fs::remove_dir_all(&dir);
         let _ = fs::create_dir_all(&dir);
         dir

@@ -6,11 +6,11 @@ use std::rc::Rc;
 
 use serde_json::Value;
 
+use super::super::{InjectedPrompt, RenderCtx, RenderCtxData};
 use super::ast::*;
 use super::env::*;
 use super::eval::*;
 use super::value::*;
-use super::super::{InjectedPrompt, RenderCtx, RenderCtxData};
 use crate::parsing::scopes::Scope;
 
 // evalTemplate 嵌套渲染深度计数(线程局部):
@@ -47,7 +47,7 @@ fn render_nested(env: &mut Env<'_, '_>, content: &str, locals: &[(&str, JsValue)
             },
         };
         let (out, _errs) = super::render_template_with_ctx(content, &mut nctx, locals);
-        env.ctx.injected.extend(nctx.data.injected.into_iter());
+        env.ctx.injected.extend(nctx.data.injected);
         d.set(d.get() - 1);
         out
     })
@@ -347,7 +347,8 @@ fn call_builtin(
             let bytes = s.as_bytes();
             let mut seen_dot = false;
             while end < bytes.len() {
-                let c = s[end..].chars().next().unwrap();
+                // 循环条件保证 end 在界内,必有下一字符
+                let c = s[end..].chars().next().expect("end 在界内,必有下一字符");
                 if c.is_ascii_digit() {
                     end += 1;
                 } else if c == '.' && !seen_dot {
@@ -591,12 +592,12 @@ fn call_builtin(
                     JsValue::Num(n) => Some(fmt_num(*n)),
                     _ => None,
                 })
-                .last();
+                .next_back();
             let Some(needle) = needle else {
                 return Ok(JsValue::Str(String::new()));
             };
             let found = entries.iter().find(|e| {
-                e.id.to_string() == needle || e.comment.eq_ignore_ascii_case(&needle.trim())
+                e.id.to_string() == needle || e.comment.eq_ignore_ascii_case(needle.trim())
             });
             match found {
                 Some(e) => {
@@ -678,7 +679,9 @@ fn call_builtin(
             } else {
                 None
             };
-            Ok(JsValue::Str(m.map(|m| m.content.clone()).unwrap_or_default()))
+            Ok(JsValue::Str(
+                m.map(|m| m.content.clone()).unwrap_or_default(),
+            ))
         }
         // getChatMessages(...):返回历史消息对象数组({role, content})
         Builtin::GetChatMessages => {
@@ -729,7 +732,7 @@ fn call_builtin(
         // getPromptsInjected(key?):返回已登记注入的 JSON 数组字符串(key/prompt/order);
         // 无登记返回空字符串
         Builtin::GetPromptsInjected => {
-            let key = match args.get(0) {
+            let key = match args.first() {
                 Some(v) if !matches!(v, JsValue::Undefined) => js_to_string(v),
                 _ => String::new(),
             };
@@ -758,7 +761,10 @@ fn call_builtin(
         Builtin::HasPromptsInjected => {
             let key = arg_str(0);
             Ok(JsValue::Bool(
-                env.ctx.injected.iter().any(|p| key.is_empty() || p.key == key),
+                env.ctx
+                    .injected
+                    .iter()
+                    .any(|p| key.is_empty() || p.key == key),
             ))
         }
         // parseJSON(text):宽松解析,成功返回解析值,失败原样返回字符串
@@ -866,7 +872,12 @@ fn scoped_get(env: &mut Env<'_, '_>, scope: Scope, path: &str) -> Result<JsValue
 
 /// 作用域写入 builtin 公共实现(计划二):scopes 上下文存在时写目标作用域;
 /// None 回退旧行为(直接写变量树)。
-fn scoped_set(env: &mut Env<'_, '_>, scope: Scope, path: &str, value: JsValue) -> Result<JsValue, String> {
+fn scoped_set(
+    env: &mut Env<'_, '_>,
+    scope: Scope,
+    path: &str,
+    value: JsValue,
+) -> Result<JsValue, String> {
     match env.ctx.scopes.as_mut() {
         Some(sv) => {
             sv.write(scope, path, js_to_json(&value));
@@ -1198,6 +1209,9 @@ mod tests {
             "<%= getPromptsInjected() %>",
             &mut ctx,
         );
-        assert!(out2.contains("风格") && out2.contains("注重氛围描写"), "out2: {out2}");
+        assert!(
+            out2.contains("风格") && out2.contains("注重氛围描写"),
+            "out2: {out2}"
+        );
     }
 }

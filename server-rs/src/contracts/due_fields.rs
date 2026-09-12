@@ -53,7 +53,7 @@ fn is_due(f: &FieldDef, turn_id: u64) -> bool {
             if n == 0 {
                 false
             } else {
-                turn_id % n == 0
+                turn_id.is_multiple_of(n)
             }
         }
         UpdateMode::Trigger => false,
@@ -99,13 +99,22 @@ mod tests {
     /// classifyField:fixed→static,every_n_turns→lowfreq,every_turn/trigger→dynamic。
     #[test]
     fn classify_field_maps_pools() {
-        assert_eq!(classify_field(&field("a", UpdateMode::Fixed, None)), FieldPool::Static);
+        assert_eq!(
+            classify_field(&field("a", UpdateMode::Fixed, None)),
+            FieldPool::Static
+        );
         assert_eq!(
             classify_field(&field("b", UpdateMode::EveryNTurns, Some(3))),
             FieldPool::LowFreq
         );
-        assert_eq!(classify_field(&field("c", UpdateMode::EveryTurn, None)), FieldPool::Dynamic);
-        assert_eq!(classify_field(&field("d", UpdateMode::Trigger, None)), FieldPool::Dynamic);
+        assert_eq!(
+            classify_field(&field("c", UpdateMode::EveryTurn, None)),
+            FieldPool::Dynamic
+        );
+        assert_eq!(
+            classify_field(&field("d", UpdateMode::Trigger, None)),
+            FieldPool::Dynamic
+        );
     }
 
     /// 到期判定:every_turn 每轮,fixed 永不到期,every_n 按 turn_id % N。

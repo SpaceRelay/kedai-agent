@@ -72,7 +72,7 @@ pub(super) fn register_replace(registry: &ToolRegistry, deps: Arc<ToolDeps>) {
     registry.register(
         ToolDefinition {
             name: "replace".into(),
-            description: "修改主对话气泡或角色文件区文件内容,支持一次传入多个操作同步执行(operations 数组)。action: append=追加, prepend=前置, replace=替换(search 子串→content,search 为空则整体替换), delete=删除。气泡用 id 定位,文件用 path 定位。".into(),
+            description: "修改主对话气泡或角色文件区文件内容,支持一次传入多个操作同步执行(operations 数组)。action: append=追加, prepend=前置, replace=替换(search 子串→content,search 为空则整体替换), delete=删除内容(文件保留、内容清空), remove=删除文件本身(仅 target=file,不可恢复)。气泡用 id 定位,文件用 path 定位。".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -84,7 +84,7 @@ pub(super) fn register_replace(registry: &ToolRegistry, deps: Arc<ToolDeps>) {
                                 "target": { "type": "string", "enum": ["bubble", "file"] },
                                 "id": { "type": "integer", "description": "气泡消息 id" },
                                 "path": { "type": "string", "description": "文件相对路径" },
-                                "action": { "type": "string", "enum": ["append", "prepend", "replace", "delete"] },
+                                "action": { "type": "string", "enum": ["append", "prepend", "replace", "delete", "remove"] },
                                 "content": { "type": "string" },
                                 "search": { "type": "string", "description": "replace 时的查找子串" },
                                 "create_if_missing": { "type": "boolean", "description": "文件不存在时是否显式创建,默认 false" }
@@ -175,6 +175,9 @@ fn replace_bubble(
     content: &str,
     search: &str,
 ) -> Result<Value, String> {
+    if action == "remove" {
+        return Err("remove 仅支持 target=file(删除整个文件);删除气泡请用 action=delete".into());
+    }
     if action == "delete" && search.is_empty() {
         if !deps.sessions.delete_message(&ctx.session_id, id) {
             return Err(format!("气泡 {id} 不存在"));
@@ -210,6 +213,17 @@ fn replace_file(
     create_if_missing: bool,
 ) -> Result<Value, String> {
     let rel = safe_rel_path(path)?;
+    // remove:删除文件本身(与 delete 清空内容语义区分)。不存在时明确报错,不静默成功。
+    if action == "remove" {
+        let full = character_file_root(deps, &ctx.character_id).join(&rel);
+        return match std::fs::remove_file(&full) {
+            Ok(_) => Ok(json!({ "target": "file", "path": rel, "action": "remove", "ok": true })),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                Err(format!("文件 {rel} 不存在,无需删除"))
+            }
+            Err(e) => Err(format!("删除文件 {rel} 失败: {e}")),
+        };
+    }
     let existing = match read_file_checked(deps, ctx, &rel) {
         Ok(value) => value,
         Err(_error) if create_if_missing => String::new(),

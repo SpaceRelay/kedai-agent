@@ -54,7 +54,7 @@ impl ContractChangelogService {
         let source = source_to_str(source);
         let before_json = before.map(Value::to_string);
         let after_json = after.map(Value::to_string);
-        let conn = self.db.conn();
+        let conn = self.db.write();
         conn.execute(
             "INSERT INTO contract_changelog (character_id, source, op_kind, path, before_json, after_json, rationale, created_at) \
              VALUES (?1, ?2, ?3, 'contract', ?4, ?5, ?6, ?7)",
@@ -71,7 +71,7 @@ impl ContractChangelogService {
         limit: usize,
     ) -> Result<Vec<ContractChangeRecord>, String> {
         let limit = limit.clamp(1, 500) as i64;
-        let conn = self.db.conn();
+        let conn = self.db.read()?;
         let mut stmt = conn
             .prepare(
                 "SELECT seq, character_id, source, op_kind, path, before_json, after_json, rationale, created_at \
@@ -95,8 +95,17 @@ impl ContractChangelogService {
             .map_err(|e| format!("查询契约变更记录失败: {e}"))?;
         let mut records = Vec::new();
         for row in rows {
-            let (seq, character_id, source, op_kind, path, before_json, after_json, rationale, created_at) =
-                row.map_err(|e| format!("读取契约变更记录失败: {e}"))?;
+            let (
+                seq,
+                character_id,
+                source,
+                op_kind,
+                path,
+                before_json,
+                after_json,
+                rationale,
+                created_at,
+            ) = row.map_err(|e| format!("读取契约变更记录失败: {e}"))?;
             records.push(build_record(
                 seq,
                 character_id,
@@ -118,7 +127,7 @@ impl ContractChangelogService {
         character_id: &str,
         seq: i64,
     ) -> Result<Option<ContractChangeRecord>, String> {
-        let conn = self.db.conn();
+        let conn = self.db.read()?;
         let row = conn
             .query_row(
                 "SELECT seq, character_id, source, op_kind, path, before_json, after_json, rationale, created_at \
@@ -195,15 +204,15 @@ fn build_record(
     created_at: String,
 ) -> Result<ContractChangeRecord, String> {
     let before = match before_json {
-        Some(raw) => Some(
-            serde_json::from_str(&raw).map_err(|e| format!("解析 before_json 失败: {e}"))?,
-        ),
+        Some(raw) => {
+            Some(serde_json::from_str(&raw).map_err(|e| format!("解析 before_json 失败: {e}"))?)
+        }
         None => None,
     };
     let after = match after_json {
-        Some(raw) => Some(
-            serde_json::from_str(&raw).map_err(|e| format!("解析 after_json 失败: {e}"))?,
-        ),
+        Some(raw) => {
+            Some(serde_json::from_str(&raw).map_err(|e| format!("解析 after_json 失败: {e}"))?)
+        }
         None => None,
     };
     Ok(ContractChangeRecord {

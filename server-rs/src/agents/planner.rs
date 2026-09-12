@@ -282,7 +282,12 @@ mod tests {
                 .system_prompt
                 .as_deref()
                 .unwrap_or("")
-                .contains("200 字") && p.steps[0].system_prompt.as_deref().unwrap_or("").contains("计划"),
+                .contains("200 字")
+                && p.steps[0]
+                    .system_prompt
+                    .as_deref()
+                    .unwrap_or("")
+                    .contains("计划"),
             "deep 生成步应先写计划再输出正文"
         );
         assert_eq!(p.steps[0].generates, Some(true));

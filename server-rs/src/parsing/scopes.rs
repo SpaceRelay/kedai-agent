@@ -35,6 +35,7 @@ impl Scope {
         }
     }
 
+    #[allow(clippy::should_implement_trait)] // 自定义作用域解析,刻意不实现 FromStr(无对称 Display/规范语义)
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
             "global" => Some(Scope::Global),
@@ -95,10 +96,6 @@ impl ScopeVars {
         self.character_scope_id = id;
     }
 
-    pub fn set_preset_scope_id(&mut self, id: Option<String>) {
-        self.preset_scope_id = id;
-    }
-
     /// 当前消息作用域 id(供脚本桥读取;None 表示未指定)
     pub fn message_scope_id(&self) -> Option<&str> {
         self.message_scope_id.as_deref()
@@ -144,8 +141,12 @@ impl ScopeVars {
     pub fn scope_data(&self, scope: Scope, scope_id: &str) -> Option<&Value> {
         match scope {
             Scope::Chat => Some(self.chat_tree.tree()),
-            Scope::Message | Scope::Character | Scope::Preset | Scope::Global
-            | Scope::Script | Scope::Extension => {
+            Scope::Message
+            | Scope::Character
+            | Scope::Preset
+            | Scope::Global
+            | Scope::Script
+            | Scope::Extension => {
                 let id = match scope {
                     Scope::Message => self.message_scope_id.as_deref().unwrap_or(scope_id),
                     Scope::Character => self.character_scope_id.as_deref().unwrap_or(scope_id),
@@ -161,7 +162,8 @@ impl ScopeVars {
 
     /// 合并视图:按优先级 message → chat树 → chat扁平 → character → preset → global,
     /// 返回第一个命中值的克隆。路径经 split_path 剥 stat_data 前缀。
-    pub fn view(&self, path: &str) -> Option<Value> {        let segs = split_path(path);
+    pub fn view(&self, path: &str) -> Option<Value> {
+        let segs = split_path(path);
         // 1) message 作用域(指定了消息 id 时)
         if let Some(id) = &self.message_scope_id {
             if let Some(v) = self
@@ -252,7 +254,7 @@ impl ScopeVars {
             _ => self
                 .scope_data(scope, "")
                 .and_then(|d| path_get(d, &split_path(path)))
-                .map(|v| v.clone()),
+                .cloned(),
         }
     }
 
@@ -260,10 +262,16 @@ impl ScopeVars {
     pub fn format_scope(&self, scope: Scope, path: Option<&str>) -> String {
         let data = match scope {
             Scope::Chat => Some(self.chat_tree.tree().clone()),
-            Scope::Message | Scope::Character | Scope::Preset | Scope::Global
-            | Scope::Script | Scope::Extension => self.read_scope(scope, ""),
+            Scope::Message
+            | Scope::Character
+            | Scope::Preset
+            | Scope::Global
+            | Scope::Script
+            | Scope::Extension => self.read_scope(scope, ""),
         };
-        let Some(data) = data else { return String::new() };
+        let Some(data) = data else {
+            return String::new();
+        };
         let tmp = AssistantVars::from_value(data);
         tmp.format(path)
     }
@@ -279,29 +287,36 @@ impl ScopeVars {
                 let p = path.trim();
                 // stat_data.* 前缀或已在树中的路径 → 树(兼容规则,§2.2);
                 // 否则单层扁平键 → 扁平层(与宏 {{setvar::k::v}} 语义一致)
-                let is_tree_path =
-                    p == "stat_data" || p.starts_with("stat_data.") || self.chat_tree.get_value(path).is_some();
+                let is_tree_path = p == "stat_data"
+                    || p.starts_with("stat_data.")
+                    || self.chat_tree.get_value(path).is_some();
                 if !is_tree_path && segs.len() <= 1 {
                     self.chat_flat.insert(
-                        segs.first().cloned().unwrap_or_else(|| path.trim().to_string()),
-                        value.as_str().map(|s| s.to_string()).unwrap_or_else(|| value.to_string()),
+                        segs.first()
+                            .cloned()
+                            .unwrap_or_else(|| path.trim().to_string()),
+                        value
+                            .as_str()
+                            .map(|s| s.to_string())
+                            .unwrap_or_else(|| value.to_string()),
                     );
                 } else {
                     self.chat_tree.set(path, value);
                 }
             }
-            Scope::Message | Scope::Character | Scope::Preset | Scope::Global
-            | Scope::Script | Scope::Extension => {
+            Scope::Message
+            | Scope::Character
+            | Scope::Preset
+            | Scope::Global
+            | Scope::Script
+            | Scope::Extension => {
                 let id = match scope {
                     Scope::Message => self.message_scope_id.clone().unwrap_or_default(),
                     Scope::Character => self.character_scope_id.clone().unwrap_or_default(),
                     Scope::Preset => self.preset_scope_id.clone().unwrap_or_default(),
                     _ => String::new(),
                 };
-                let entry = self
-                    .others
-                    .entry((scope, id))
-                    .or_insert_with(|| json!({}));
+                let entry = self.others.entry((scope, id)).or_insert_with(|| json!({}));
                 crate::parsing::assistant::path_set(entry, &segs, value);
             }
         }
@@ -351,7 +366,10 @@ mod tests {
         assert_eq!(sv.read_scope(Scope::Message, "好感度"), Some(json!(77)));
         assert_eq!(sv.read_scope(Scope::Message, "仅消息"), Some(json!("m")));
         // 消息表缺 → 回退 chat 树(stat_data. 前缀等价路径)
-        assert_eq!(sv.read_scope(Scope::Message, "stat_data.好感度"), Some(json!(77)));
+        assert_eq!(
+            sv.read_scope(Scope::Message, "stat_data.好感度"),
+            Some(json!(77))
+        );
         sv.with_scope(Scope::Message, "1", json!({}));
         assert_eq!(sv.read_scope(Scope::Message, "好感度"), Some(json!(88)));
     }
@@ -401,8 +419,14 @@ mod tests {
         let mut sv = scope_vars();
         sv.chat_tree.set("a", json!(1));
         sv.with_scope(Scope::Global, "", json!({ "b": 2 }));
-        assert_eq!(sv.scope_data(Scope::Chat, "").and_then(|d| d.get("a")), Some(&json!(1)));
-        assert_eq!(sv.scope_data(Scope::Global, "").and_then(|d| d.get("b")), Some(&json!(2)));
+        assert_eq!(
+            sv.scope_data(Scope::Chat, "").and_then(|d| d.get("a")),
+            Some(&json!(1))
+        );
+        assert_eq!(
+            sv.scope_data(Scope::Global, "").and_then(|d| d.get("b")),
+            Some(&json!(2))
+        );
         assert_eq!(sv.scope_data(Scope::Script, ""), None);
     }
 }

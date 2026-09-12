@@ -26,10 +26,7 @@ pub fn raw_contract_from_character_card(data_raw: &Value) -> Option<&Value> {
 
 /// 兼容包装形态解包:{ contract: {...} } 且自身无 version 字段 → 取内层。
 fn unwrap_contract_value(raw: &Value) -> &Value {
-    if raw.is_object()
-        && raw.get("version").is_none()
-        && raw.get("contract").is_some()
-    {
+    if raw.is_object() && raw.get("version").is_none() && raw.get("contract").is_some() {
         raw.get("contract").expect("已确认存在")
     } else {
         raw
@@ -38,10 +35,16 @@ fn unwrap_contract_value(raw: &Value) -> &Value {
 
 /// 从世界书条目提取契约:comment 含 `[nlkaleido_contract]` 的条目,内容为契约 JSON。
 /// 大小写不敏感;取第一条命中(多条目时按条目顺序优先)。
-pub fn extract_from_world_entries(entries: &[crate::parsing::world_book::WorldEntry]) -> Option<Contract> {
+pub fn extract_from_world_entries(
+    entries: &[crate::parsing::world_book::WorldEntry],
+) -> Option<Contract> {
     entries
         .iter()
-        .find(|e| e.comment.to_ascii_lowercase().contains("[nlkaleido_contract]"))
+        .find(|e| {
+            e.comment
+                .to_ascii_lowercase()
+                .contains("[nlkaleido_contract]")
+        })
         .and_then(|e| serde_json::from_str::<Value>(&e.content).ok())
         .and_then(|v| extract_contract_value(&v))
 }

@@ -208,13 +208,7 @@ async fn character_scripts_read_write() {
     assert_eq!(status, StatusCode::NOT_FOUND);
 
     // 缺 character_id → 400
-    let (status, _) = send_json(
-        app,
-        "GET",
-        "/api/scripts/tree?scope=character",
-        json!({}),
-    )
-    .await;
+    let (status, _) = send_json(app, "GET", "/api/scripts/tree?scope=character", json!({})).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
 
     // 未知 scope → 400
@@ -260,7 +254,10 @@ async fn character_legacy_scripts_migrated() {
     // 旧字段已从角色卡删除;变量字段保留
     let (_, char) = send_json(app, "GET", &format!("/api/characters/{cid}"), json!({})).await;
     let ext = &char["data_raw"]["extensions"];
-    assert!(ext.get("TavernHelper_scripts").is_none(), "旧脚本字段应已删除");
+    assert!(
+        ext.get("TavernHelper_scripts").is_none(),
+        "旧脚本字段应已删除"
+    );
     assert_eq!(
         ext["TavernHelper_characterScriptVariables"]["hp"],
         json!(100),

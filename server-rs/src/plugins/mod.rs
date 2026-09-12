@@ -77,12 +77,15 @@ impl ToolPluginLoader {
             description: cfg.description,
             parameters: cfg.parameters,
         };
-        registry.register(
+        // 插件工具标记为外部来源:三档授权模式据此认定其参数不可信(可能含系统路径)
+        registry.register_external(
             definition,
             Arc::new(move |args: Value, _ctx| -> futures::future::BoxFuture<'static, Result<String, String>> {
                 let script = script.clone();
                 Box::pin(async move { eval_tool_script(&script, args) })
             }),
+            None,
+            crate::tools::action_class::ToolOrigin::Plugin,
         );
         Ok(())
     }

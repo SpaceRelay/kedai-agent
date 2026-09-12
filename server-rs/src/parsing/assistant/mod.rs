@@ -446,11 +446,17 @@ mod tests {
         );
         assert_eq!(
             parse_inject_tag("[GENERATE:2:BEFORE]"),
-            InjectTag::GenerateIndex { idx: 2, before: true }
+            InjectTag::GenerateIndex {
+                idx: 2,
+                before: true
+            }
         );
         assert_eq!(
             parse_inject_tag("[GENERATE:0:AFTER]"),
-            InjectTag::GenerateIndex { idx: 0, before: false }
+            InjectTag::GenerateIndex {
+                idx: 0,
+                before: false
+            }
         );
         assert_eq!(
             parse_inject_tag("[GENERATE:REGEX:\\d+岁]"),
@@ -481,7 +487,10 @@ mod tests {
         );
         assert_eq!(
             parse_inject_tag("[GENERATE:3:after]"),
-            InjectTag::GenerateIndex { idx: 3, before: false }
+            InjectTag::GenerateIndex {
+                idx: 3,
+                before: false
+            }
         );
         assert_eq!(
             parse_inject_tag("分阶段人设 [Render:After] 注入"),
@@ -540,12 +549,22 @@ mod tests {
         let entries = vec![e1, e2, e3, e4, e5, e6, e7];
         let (gen, rest) = collect_generate_entries(&entries, &mut v);
         // GENERATE x4 + RENDER x1 进收集;[InitVar] 与普通条目留原链路
-        assert_eq!(gen.len(), 5, "gen: {:?}", gen.iter().map(|g| g.entry.comment.clone()).collect::<Vec<_>>());
+        assert_eq!(
+            gen.len(),
+            5,
+            "gen: {:?}",
+            gen.iter()
+                .map(|g| g.entry.comment.clone())
+                .collect::<Vec<_>>()
+        );
         assert_eq!(rest.len(), 2);
         assert_eq!(rest[0].comment, "[InitVar]");
         assert_eq!(rest[1].comment, "普通条目");
         // 内容已渲染
-        let re = gen.iter().find(|g| g.entry.comment.contains("REGEX")).unwrap();
+        let re = gen
+            .iter()
+            .find(|g| g.entry.comment.contains("REGEX"))
+            .unwrap();
         assert_eq!(re.rendered, "150");
         // GenerateIndex 按 idx 升序(0 在 2 前)
         let idx_order: Vec<usize> = gen

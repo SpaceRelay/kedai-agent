@@ -146,7 +146,10 @@ async fn regenerate_updates_in_place_and_swipe_roundtrip() {
     let last = last_assistant(&msgs);
     let aid = last["id"].as_i64().unwrap();
     assert_eq!(last["role"], json!("assistant"));
-    assert!(last["extra"].get("swipes").is_none(), "首轮消息不应有 swipes");
+    assert!(
+        last["extra"].get("swipes").is_none(),
+        "首轮消息不应有 swipes"
+    );
 
     // 单版本消息不可切换
     let (status, res) = swipe(app, &sid, aid, 0).await;
@@ -170,8 +173,13 @@ async fn regenerate_updates_in_place_and_swipe_roundtrip() {
     assert_eq!(m["id"], json!(aid), "原消息 id 应保持不变");
     let new_content = m["content"].as_str().unwrap().to_string();
     assert_ne!(new_content, "旧内容一");
-    assert!(new_content.contains("（模拟回复）"), "新内容应为 mock 回复: {new_content}");
-    let swipes = m["extra"]["swipes"].as_array().expect("regenerate 后应有 swipes");
+    assert!(
+        new_content.contains("（模拟回复）"),
+        "新内容应为 mock 回复: {new_content}"
+    );
+    let swipes = m["extra"]["swipes"]
+        .as_array()
+        .expect("regenerate 后应有 swipes");
     assert_eq!(swipes.len(), 2, "swipes 应追加为 2 条: {swipes:?}");
     assert_eq!(swipes[0]["content"], json!("旧内容一"));
     assert_eq!(swipes[1]["content"], json!(new_content));
@@ -184,7 +192,11 @@ async fn regenerate_updates_in_place_and_swipe_roundtrip() {
     assert_eq!(res["swipe_id"], json!(0));
     assert_eq!(res["swipes_count"], json!(2));
     let msgs = history(app, &sid).await;
-    assert_eq!(msgs[2]["content"], json!("旧内容一"), "history 应反映切换后的激活版本");
+    assert_eq!(
+        msgs[2]["content"],
+        json!("旧内容一"),
+        "history 应反映切换后的激活版本"
+    );
 
     // 切回版本 1
     let (status, res) = swipe(app, &sid, aid, 1).await;
@@ -222,7 +234,13 @@ async fn regenerate_anchor_validation() {
     let aid = msgs[2]["id"].as_i64().unwrap(); // 最后一条 assistant
 
     // 不存在的锚点 → 409
-    let (status, _) = send_chat(app, &sid, &cid, json!({ "regenerate_assistant_id": 999999 })).await;
+    let (status, _) = send_chat(
+        app,
+        &sid,
+        &cid,
+        json!({ "regenerate_assistant_id": 999999 }),
+    )
+    .await;
     assert_eq!(status, StatusCode::CONFLICT, "不存在的锚点应 409");
 
     // user 消息作锚点(非最后一条 assistant)→ 409

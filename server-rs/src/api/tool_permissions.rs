@@ -1,6 +1,6 @@
 // Agent 工具授权 API：查询当前会话/角色裁决结果，授予或撤销显式权限。
 use crate::api::app_state::AppState;
-use crate::api::WithStatus;
+use crate::api::{db_err, WithStatus};
 use crate::models::types::ToolContext;
 use crate::tools::permissions::PendingAuthorizationDecision;
 use axum::extract::{Query, State};
@@ -38,12 +38,17 @@ pub async fn list(
     State(state): State<Arc<AppState>>,
     Query(query): Query<PermissionQuery>,
 ) -> Response {
-    let Some(session) = state.sessions.get(&query.session_id) else {
-        return permission_error(StatusCode::NOT_FOUND, "会话不存在");
+    let svc = state.sessions.clone();
+    let sid = query.session_id.clone();
+    let session = match state.db_call(move || svc.get(&sid)).await {
+        Err(e) => return db_err(&e),
+        Ok(Some(s)) => s,
+        Ok(None) => return permission_error(StatusCode::NOT_FOUND, "会话不存在"),
     };
     let ctx = ToolContext {
         session_id: session.id.clone(),
         character_id: session.character_id.clone(),
+        agent_depth: 0,
     };
     let tools: Vec<_> = state
         .tool_registry
@@ -74,14 +79,14 @@ pub async fn authorize(
     State(state): State<Arc<AppState>>,
     Json(body): Json<PermissionBody>,
 ) -> Response {
-    mutate_permission(&state, &body, true)
+    mutate_permission(&state, &body, true).await
 }
 
 pub async fn revoke(
     State(state): State<Arc<AppState>>,
     Json(body): Json<PermissionBody>,
 ) -> Response {
-    mutate_permission(&state, &body, false)
+    mutate_permission(&state, &body, false).await
 }
 
 pub async fn resolve(
@@ -94,8 +99,14 @@ pub async fn resolve(
     let Some(call_id) = body.call_id.as_deref() else {
         return permission_error(StatusCode::BAD_REQUEST, "缺少 call_id");
     };
-    if state.sessions.get(&body.session_id).is_none() {
-        return permission_error(StatusCode::NOT_FOUND, "会话不存在");
+    {
+        let svc = state.sessions.clone();
+        let sid = body.session_id.clone();
+        match state.db_call(move || svc.get(&sid)).await {
+            Err(e) => return db_err(&e),
+            Ok(None) => return permission_error(StatusCode::NOT_FOUND, "会话不存在"),
+            Ok(Some(_)) => {}
+        }
     }
     if state.tool_registry.get(&body.tool).is_none() {
         return permission_error(StatusCode::BAD_REQUEST, "工具未注册");
@@ -124,9 +135,13 @@ pub async fn resolve(
     }
 }
 
-fn mutate_permission(state: &AppState, body: &PermissionBody, authorize: bool) -> Response {
-    let Some(session) = state.sessions.get(&body.session_id) else {
-        return permission_error(StatusCode::NOT_FOUND, "会话不存在");
+async fn mutate_permission(state: &AppState, body: &PermissionBody, authorize: bool) -> Response {
+    let svc = state.sessions.clone();
+    let sid = body.session_id.clone();
+    let session = match state.db_call(move || svc.get(&sid)).await {
+        Err(e) => return db_err(&e),
+        Ok(Some(s)) => s,
+        Ok(None) => return permission_error(StatusCode::NOT_FOUND, "会话不存在"),
     };
     if state.tool_registry.get(&body.tool).is_none() {
         return permission_error(StatusCode::BAD_REQUEST, "工具未注册");
@@ -136,20 +151,24 @@ fn mutate_permission(state: &AppState, body: &PermissionBody, authorize: bool) -
         "role" => session.character_id.as_str(),
         _ => return permission_error(StatusCode::BAD_REQUEST, "scope 仅支持 session 或 role"),
     };
-    let result = if authorize {
-        state
-            .tool_registry
-            .permissions()
-            .authorize(&body.tool, &body.scope, scope_id)
-    } else {
-        state
-            .tool_registry
-            .permissions()
-            .revoke(&body.tool, &body.scope, scope_id)
-    };
+    // B-1:authorize/revoke 内含同步 JSON 原子落盘(tool_permissions.json),挪阻塞线程池
+    let registry = state.tool_registry.clone();
+    let tool = body.tool.clone();
+    let scope = body.scope.clone();
+    let scope_id = scope_id.to_string();
+    let result = state
+        .db_call(move || {
+            if authorize {
+                registry.permissions().authorize(&tool, &scope, &scope_id)
+            } else {
+                registry.permissions().revoke(&tool, &scope, &scope_id)
+            }
+        })
+        .await;
     match result {
-        Ok(()) => Json(json!({ "ok": true })).into_response(),
-        Err(error) => permission_error(StatusCode::BAD_REQUEST, &error),
+        Err(e) => db_err(&e),
+        Ok(Ok(())) => Json(json!({ "ok": true })).into_response(),
+        Ok(Err(error)) => permission_error(StatusCode::BAD_REQUEST, &error),
     }
 }
 

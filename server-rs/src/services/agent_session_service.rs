@@ -1,4 +1,5 @@
 // Agent 会话服务(与 Node 版 agent-session.service.ts 对齐)
+use super::log_query_failure;
 use crate::models::db::{now_iso, Db};
 use crate::models::types::{AgentSessionRecord, ToolCallRecord};
 use rusqlite::{params, OptionalExtension};
@@ -48,7 +49,7 @@ impl AgentSessionService {
     pub fn create(&self, session_id: &str, agent_mode: &str) -> Result<AgentSessionRecord, String> {
         let now = now_iso();
         let id = Uuid::new_v4().to_string();
-        let conn = self.db.conn();
+        let conn = self.db.write();
         conn.execute(
             "INSERT INTO agent_sessions (id, session_id, state, plan, steps, step_index, agent_mode, started_at, updated_at) VALUES (?1, ?2, 'idle', '[]', '[]', 0, ?3, ?4, ?4)",
             params![id, session_id, agent_mode, now],
@@ -84,7 +85,7 @@ impl AgentSessionService {
         let plan_str = serde_json::to_string(&new_plan).unwrap_or_else(|_| "[]".into());
         let steps_str = serde_json::to_string(&new_steps).unwrap_or_else(|_| "[]".into());
         let now = now_iso();
-        let conn = self.db.conn();
+        let conn = self.db.write();
         conn.execute(
             "UPDATE agent_sessions SET state = ?1, plan = ?2, step_index = ?3, steps = ?4, updated_at = ?5 WHERE id = ?6",
             params![new_state, plan_str, new_step, steps_str, now, id],
@@ -104,7 +105,7 @@ impl AgentSessionService {
     }
 
     pub fn get(&self, id: &str) -> Option<AgentSessionRecord> {
-        let conn = self.db.conn();
+        let conn = self.db.read().ok()?;
         conn.query_row(
             "SELECT id, session_id, state, plan, steps, step_index, agent_mode, started_at, updated_at FROM agent_sessions WHERE id = ?1",
             params![id],
@@ -117,7 +118,7 @@ impl AgentSessionService {
 
     /// 按 session 找最新一条
     pub fn find_by_session(&self, session_id: &str) -> Option<AgentSessionRecord> {
-        let conn = self.db.conn();
+        let conn = self.db.read().ok()?;
         conn.query_row(
             "SELECT id, session_id, state, plan, steps, step_index, agent_mode, started_at, updated_at FROM agent_sessions WHERE session_id = ?1 ORDER BY updated_at DESC LIMIT 1",
             params![session_id],
@@ -140,7 +141,7 @@ impl AgentSessionService {
         let id = Uuid::new_v4().to_string();
         let input_str = serde_json::to_string(&input).unwrap_or_else(|_| "{}".into());
         let output_str = serde_json::to_string(&output).unwrap_or_else(|_| "{}".into());
-        let conn = self.db.conn();
+        let conn = self.db.write();
         conn.execute(
             "INSERT INTO tool_calls (id, agent_session_id, name, input, output, duration_ms, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![id, agent_session_id, name, input_str, output_str, duration_ms, now],
@@ -158,18 +159,22 @@ impl AgentSessionService {
     }
 
     pub fn list_tool_calls(&self, agent_session_id: &str) -> Vec<ToolCallRecord> {
-        let conn = self.db.conn();
-        let mut stmt = conn
+        let conn = self.db.read().expect("获取只读连接失败");
+        let mut stmt = match conn
             .prepare("SELECT id, agent_session_id, name, input, output, duration_ms, created_at FROM tool_calls WHERE agent_session_id = ?1 ORDER BY created_at ASC")
-            .unwrap();
-        stmt.query_map(params![agent_session_id], row_to_tool_call)
-            .unwrap()
-            .filter_map(|r| r.ok())
-            .collect()
+        {
+            Ok(s) => s,
+            Err(e) => return log_query_failure("工具调用列表 prepare", e),
+        };
+        let query = stmt.query_map(params![agent_session_id], row_to_tool_call);
+        match query {
+            Ok(rows) => rows.filter_map(|r| r.ok()).collect(),
+            Err(e) => log_query_failure("工具调用列表 query_map", e),
+        }
     }
 
     pub fn delete_by_session(&self, session_id: &str) {
-        let conn = self.db.conn();
+        let conn = self.db.write();
         let _ = conn.execute(
             "DELETE FROM agent_sessions WHERE session_id = ?1",
             params![session_id],

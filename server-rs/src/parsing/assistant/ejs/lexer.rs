@@ -85,7 +85,8 @@ fn lex_until_rbrace(src: &str, pos: &mut usize) -> Result<Vec<Tok>, String> {
         if *pos >= src.len() {
             return Err("模板表达式未闭合".into());
         }
-        let ch = src[*pos..].chars().next().unwrap();
+        // 上方已返回错误或持续推进,pos < len 保证必有下一字符
+        let ch = src[*pos..].chars().next().expect("pos 在界内,必有下一字符");
         if ch == '}' && depth == 0 {
             *pos += 1;
             return Ok(toks);
@@ -110,7 +111,8 @@ fn lex_template(src: &str, pos: &mut usize) -> Result<Tok, String> {
         if *pos >= src.len() {
             return Err("未闭合的模板字符串".into());
         }
-        let ch = src[*pos..].chars().next().unwrap();
+        // 上方越界检查保证 pos < len,必有下一字符
+        let ch = src[*pos..].chars().next().expect("pos 在界内,必有下一字符");
         match ch {
             '`' => {
                 *pos += 1;
@@ -119,8 +121,12 @@ fn lex_template(src: &str, pos: &mut usize) -> Result<Tok, String> {
             '\\' => {
                 *pos += 1;
                 if *pos < src.len() {
-                    let e = src[*pos..].chars().next().unwrap();
-                    parts.last_mut().unwrap().push(unescape_char(e));
+                    let e = src[*pos..].chars().next().expect("pos 在界内,必有下一字符");
+                    // parts 初始化即含一段且只增不减,必有尾段
+                    parts
+                        .last_mut()
+                        .expect("parts 至少一段")
+                        .push(unescape_char(e));
                     *pos += e.len_utf8();
                 }
             }
@@ -131,7 +137,7 @@ fn lex_template(src: &str, pos: &mut usize) -> Result<Tok, String> {
                 parts.push(String::new());
             }
             _ => {
-                parts.last_mut().unwrap().push(ch);
+                parts.last_mut().expect("parts 至少一段").push(ch);
                 *pos += ch.len_utf8();
             }
         }
@@ -179,13 +185,14 @@ fn lex_one(src: &str, start: usize) -> Result<(Tok, usize), String> {
     if i >= bytes.len() {
         return Ok((Tok::Eof, src.len()));
     }
-    let ch = src[i..].chars().next().unwrap();
+    // 上方 i >= len 已返回 Eof,此处必有下一字符
+    let ch = src[i..].chars().next().expect("i 在界内,必有下一字符");
     match ch {
         '0'..='9' => {
             let mut j = i;
             let mut seen_dot = false;
             while j < bytes.len() {
-                let c = src[j..].chars().next().unwrap();
+                let c = src[j..].chars().next().expect("j 在界内,必有下一字符");
                 if c.is_ascii_digit() {
                     j += 1;
                 } else if c == '.' && !seen_dot {
@@ -202,7 +209,13 @@ fn lex_one(src: &str, start: usize) -> Result<(Tok, usize), String> {
                     k += 1;
                 }
                 let mut digits = 0;
-                while k < bytes.len() && src[k..].chars().next().unwrap().is_ascii_digit() {
+                while k < bytes.len()
+                    && src[k..]
+                        .chars()
+                        .next()
+                        .expect("k 在界内,必有下一字符")
+                        .is_ascii_digit()
+                {
                     k += 1;
                     digits += 1;
                 }
@@ -220,12 +233,12 @@ fn lex_one(src: &str, start: usize) -> Result<(Tok, usize), String> {
             let mut out = String::new();
             let mut closed = false;
             while j < bytes.len() {
-                let c = src[j..].chars().next().unwrap();
+                let c = src[j..].chars().next().expect("j 在界内,必有下一字符");
                 match c {
                     '\\' => {
                         j += 1;
                         if j < bytes.len() {
-                            let e = src[j..].chars().next().unwrap();
+                            let e = src[j..].chars().next().expect("j 在界内,必有下一字符");
                             if e == 'u' && j + 5 < bytes.len() {
                                 let hex = &src[j + 1..j + 5];
                                 if let Ok(code) = u32::from_str_radix(hex, 16) {
@@ -266,7 +279,7 @@ fn lex_one(src: &str, start: usize) -> Result<(Tok, usize), String> {
         c if c.is_alphabetic() || c == '_' || c == '$' => {
             let mut j = i + c.len_utf8();
             while j < bytes.len() {
-                let c = src[j..].chars().next().unwrap();
+                let c = src[j..].chars().next().expect("j 在界内,必有下一字符");
                 if c.is_alphanumeric() || c == '_' || c == '$' {
                     j += c.len_utf8();
                 } else {

@@ -2,7 +2,10 @@ use kedai_server::migration::merge_data_dirs;
 use std::path::PathBuf;
 
 fn main() {
-    let args = std::env::args_os().skip(1).map(PathBuf::from).collect::<Vec<_>>();
+    let args = std::env::args_os()
+        .skip(1)
+        .map(PathBuf::from)
+        .collect::<Vec<_>>();
     if args.len() != 3 {
         eprintln!("用法: kedai-data-merge <基线数据目录> <源数据目录> <工作目录>");
         std::process::exit(2);

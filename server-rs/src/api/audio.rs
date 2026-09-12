@@ -12,11 +12,7 @@ use std::sync::Arc;
 
 /// GET /api/audio:返回双通道全量状态
 pub async fn get(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
-    let audio = state
-        .audio
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .get();
+    let audio = state.audio.lock().unwrap_or_else(|e| e.into_inner()).get();
     Json(json!({ "audio": audio }))
 }
 
@@ -37,12 +33,23 @@ pub async fn update_settings(
             .into_response()
             .with_status(StatusCode::BAD_REQUEST);
     };
-    let mut audio = state.audio.lock().unwrap_or_else(|e| e.into_inner());
-    match audio.update_settings(channel, body.settings) {
-        Ok(()) => Json(json!({ "ok": true, "audio": audio.get() })).into_response(),
-        Err(e) => Json(json!({ "error": e }))
+    // B-1:update_settings 内含同步 JSON 落盘,持锁 + 写文件整体挪阻塞线程池
+    let audio = state.audio.clone();
+    let result = state
+        .db_call(move || {
+            let mut svc = audio.lock().unwrap_or_else(|e| e.into_inner());
+            svc.update_settings(channel, body.settings)
+                .map(|()| svc.get())
+        })
+        .await;
+    match result {
+        Ok(Ok(state)) => Json(json!({ "ok": true, "audio": state })).into_response(),
+        Ok(Err(e)) => Json(json!({ "error": e }))
             .into_response()
             .with_status(StatusCode::BAD_REQUEST),
+        Err(e) => Json(json!({ "error": e }))
+            .into_response()
+            .with_status(StatusCode::INTERNAL_SERVER_ERROR),
     }
 }
 
@@ -63,11 +70,22 @@ pub async fn update_playlist(
             .into_response()
             .with_status(StatusCode::BAD_REQUEST);
     };
-    let mut audio = state.audio.lock().unwrap_or_else(|e| e.into_inner());
-    match audio.update_playlist(channel, body.tracks) {
-        Ok(()) => Json(json!({ "ok": true, "audio": audio.get() })).into_response(),
-        Err(e) => Json(json!({ "error": e }))
+    // B-1:update_playlist 内含同步 JSON 落盘,持锁 + 写文件整体挪阻塞线程池
+    let audio = state.audio.clone();
+    let result = state
+        .db_call(move || {
+            let mut svc = audio.lock().unwrap_or_else(|e| e.into_inner());
+            svc.update_playlist(channel, body.tracks)
+                .map(|()| svc.get())
+        })
+        .await;
+    match result {
+        Ok(Ok(state)) => Json(json!({ "ok": true, "audio": state })).into_response(),
+        Ok(Err(e)) => Json(json!({ "error": e }))
             .into_response()
             .with_status(StatusCode::BAD_REQUEST),
+        Err(e) => Json(json!({ "error": e }))
+            .into_response()
+            .with_status(StatusCode::INTERNAL_SERVER_ERROR),
     }
 }

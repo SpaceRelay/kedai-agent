@@ -31,35 +31,27 @@ pub enum UpdateMode {
 /// 持久化作用域(§7-FieldDef.persist,默认 chat)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum PersistScope {
+    #[default]
     Chat,
     Run,
     Global,
-}
-
-impl Default for PersistScope {
-    fn default() -> Self {
-        PersistScope::Chat
-    }
 }
 
 /// 字段稳定性三档(§7-StabilityClass):决定「注入方式」(值/引用/不注入),
 /// 与 classifyField 的「调度池分类」是正交维度。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum StabilityClass {
     /// 动态池(L3 尾部真实值,每轮可变)
+    #[default]
     Volatile,
     /// 静态池(STABLE_BATCH 引用 token / L2 沿用值)
     Stable,
     /// 完全不注入,由作者自定义规则维护
     Frozen,
-}
-
-impl Default for StabilityClass {
-    fn default() -> Self {
-        StabilityClass::Volatile
-    }
 }
 
 /// 更新频率/写入上限(§7-FieldDef.cap)
@@ -177,10 +169,7 @@ impl FieldDef {
     /// 归属的可写者白名单(未声明 ownership 时回退默认值)。
     pub fn writers(&self) -> Vec<String> {
         match &self.ownership {
-            Some(o) => o
-                .writers
-                .clone()
-                .unwrap_or_else(|| vec![o.owner.clone()]),
+            Some(o) => o.writers.clone().unwrap_or_else(|| vec![o.owner.clone()]),
             None => vec!["agent".to_string(), "manual".to_string()],
         }
     }

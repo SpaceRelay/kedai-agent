@@ -405,7 +405,10 @@ async fn contract_changelog_for_update_variable_text_protocol() {
         .find(|e| e["type"] == "finish")
         .expect("应有 finish 事件");
     assert!(
-        !finish["content"].as_str().unwrap().contains("<UpdateVariable"),
+        !finish["content"]
+            .as_str()
+            .unwrap()
+            .contains("<UpdateVariable"),
         "正文应剥离协议块"
     );
 
@@ -568,7 +571,8 @@ async fn contract_defaults_fill_missing_initvar_fields() {
     let messages = h["messages"].as_array().unwrap();
     let tree = &messages.last().unwrap()["extra"]["mvu"]["stat_data"];
     assert_eq!(
-        tree["心之所向"]["好感度"], json!(6),
+        tree["心之所向"]["好感度"],
+        json!(6),
         "mvu_tool 更新生效: {tree}"
     );
     // changelog 的 old 值暴露初始基线:若 default(99)覆盖了 InitVar 的 5,
@@ -581,15 +585,18 @@ async fn contract_defaults_fill_missing_initvar_fields() {
     assert_eq!(hit["old"], json!(5), "default 不得覆盖 InitVar 已写值");
     assert_eq!(hit["new"], json!(6));
     assert_eq!(
-        tree["心之所向"]["信任度"], json!(10),
+        tree["心之所向"]["信任度"],
+        json!(10),
         "缺失字段应补契约 default: {tree}"
     );
     assert_eq!(
-        tree["世界"]["天气"], json!("晴"),
+        tree["世界"]["天气"],
+        json!("晴"),
         "InitVar 未建的键应补 default(已有层保留): {tree}"
     );
     assert_eq!(
-        tree["世界"]["年分"], json!(2024),
+        tree["世界"]["年分"],
+        json!(2024),
         "非契约声明的 InitVar 字段保持不动: {tree}"
     );
 }

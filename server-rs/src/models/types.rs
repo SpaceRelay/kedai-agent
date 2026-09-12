@@ -28,6 +28,15 @@ pub struct CharacterRecord {
     /// 角色卡内嵌插件检测结果(酒馆助手等;仅详情接口填充,列表不携带)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub card_plugins: Option<Vec<crate::parsing::assistant::CardPluginInfo>>,
+    /// 卡元数据(从 data_raw 提取,列表也携带):远程资源卡(酒馆助手式资源页)
+    /// 需要 creator/character_version/creator_notes 推导资源包口令(见 resource_frame 模板
+    /// 的 TavernHelper shim),体积小,列表/详情均返回
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub creator: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub character_version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub creator_notes: Option<String>,
     pub created_at: String,
 }
 
@@ -199,7 +208,7 @@ pub struct PlanStep {
     pub enabled: bool,
     #[serde(default)]
     pub goal: String,
-    /// direct | tool | reflect
+    /// direct | reflect(校验见 `services/agent_flow_service.rs`;`tool` 不在支持范围)
     #[serde(default)]
     pub action: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -244,6 +253,10 @@ pub struct TokenUsage {
     /// 用于前端「当前命中率」展示;无缓存字段的提供商恒为 0)
     #[serde(default)]
     pub prompt_cache_hit_tokens: i64,
+    /// prompt 缓存未命中 token(DeepSeek prompt_cache_miss_tokens;OpenAI 风格由
+    /// prompt_tokens - cached_tokens 推导;无缓存字段的提供商恒为 0)
+    #[serde(default)]
+    pub prompt_cache_miss_tokens: i64,
 }
 
 // ---------- LLM ----------
@@ -324,6 +337,16 @@ pub enum LlmStreamChunk {
         total_tokens: i64,
         /// prompt 缓存命中 token(DeepSeek 等提供商;其余为 0)
         prompt_cache_hit_tokens: i64,
+        /// prompt 缓存未命中 token(DeepSeek 风格原样透传;OpenAI 风格由推导得出)
+        prompt_cache_miss_tokens: i64,
+        /// completion 中推理消耗的 token(DeepSeek 推理模型 completion_tokens_details.
+        /// reasoning_tokens;无此字段的提供商为 0)。诊断「空输出 = 推理耗尽预算」的关键证据
+        reasoning_tokens: i64,
+    },
+    /// 流正常结束时的 finish_reason(stop/length/content_filter 等;tool_calls 不单独产出)。
+    /// 任务模式据此区分「真空响应」与「max_tokens 截断」,决定是否提高上限重试
+    Finish {
+        reason: String,
     },
 }
 
@@ -389,6 +412,39 @@ pub enum SseEvent {
         usage: TokenUsage,
         content: String,
     },
+    /// 任务模式(task 工作台)事件(WP4):任务生命周期广播,由 TaskService 的
+    /// broadcast 通道推送,GET /api/tasks/events 转发为 SSE,取代前端 1s REST 轮询。
+    /// 除 task_id 外全部可选,旧客户端缺字段即忽略(向后兼容)。
+    Task {
+        task_id: String,
+        /// 事件分类:created | status | plan | subtask | usage | llm_call | deleted |
+        /// agent_status | approval_required | delta
+        ///(llm_call:批次 3 调用追踪,task_llm_calls 落库成功后发射,面板据此重拉;
+        ///  delta:批次 R4 流式输出,LLM 正文增量经攒批后透出,暂态事件不落库——
+        ///  权威数据以 llm_call 落库行/calls 端点为准,见 events.rs emit_delta)
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        kind: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        status: Option<TaskStatus>,
+        /// 简短中文说明(供前端事件监控面板展示);kind=delta 时为攒批后的正文增量文本
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
+        /// 上游 finish_reason(仅 kind=llm_call 且成功调用携带;可观测性问题①:
+        /// "length" 即 max_tokens 截断标记)。None = 不适用/未知,序列化时省略。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        finish_reason: Option<String>,
+        /// 调用归属阶段(批次 R4;仅 kind=delta/llm_call 携带:planner | step |
+        /// summarize | summary | agent | subagent | audit | final_audit 等,
+        /// 与 task_llm_calls.phase 同口径;前端流式缓冲 key 的前半)
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        phase: Option<String>,
+        /// 调用归属步骤下标(0 起,与 task_llm_calls.step_index 同口径;
+        /// 仅步骤类调用携带,非步骤阶段 None 省略;前端缓冲 key 的后半)
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        step_index: Option<usize>,
+    },
 }
 
 // ---------- 工具 ----------
@@ -403,10 +459,17 @@ pub struct ToolDefinition {
 pub struct ToolContext {
     pub session_id: String,
     pub character_id: String,
+    /// 子智能体嵌套深度(主 Agent 为 0;子任务内再派发时 +1)。
+    /// 深度守卫:子 agent 以 `agent_depth + 1` 运行,达 `subagent_max_depth` 后不再派发
+    /// (见 `tools/agent_tools_agent.rs`)。
+    pub agent_depth: u32,
 }
 
 // ---------- Skill 库 ----------
-/// 提示词技能(skill):read 工具按名/关键词读取,可注入上下文
+/// 提示词技能(skill):read 工具按名/关键词读取,可注入上下文。
+/// 渐进披露(落地项 3):system 仅注入 name+description 紧凑清单,
+/// 正文按需经 read(type=skill) 读取;allowed_tools/run_as_subagent/model
+/// 为调度增强预留元数据(旧库缺列由迁移补默认)。
 #[derive(Debug, Clone, Serialize)]
 pub struct SkillRecord {
     pub id: String,
@@ -415,6 +478,12 @@ pub struct SkillRecord {
     pub content: String,
     pub enabled: bool,
     pub created_at: String,
+    /// 工具白名单(JSON 数组字符串;空数组 = 不限制)
+    pub allowed_tools: String,
+    /// 是否可作为子智能体技能派发(0/1;默认 false)
+    pub run_as_subagent: bool,
+    /// 可选模型名覆盖(空 = 用当前模型)
+    pub model: String,
 }
 
 // ---------- 子智能体任务(agentgo / agentend) ----------
@@ -431,4 +500,676 @@ pub struct AgentSubtaskRecord {
     pub error: String,
     pub created_at: String,
     pub updated_at: String,
+}
+
+// ---------- 任务模式(task 工作台) ----------
+/// 任务执行模式(tasks.task_mode 列,批次 4 六模式)。序列化/落盘均为 snake_case
+/// 文本;旧行缺省 'legacy',行为与六模式引入前逐字节一致。语义见 docs/任务引擎六模式.md。
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskRunMode {
+    /// 三段式:规划 → 逐步执行 → 汇总(既有行为,默认)
+    Legacy,
+    /// 单主 agent 工具自循环(run_tool_loop,工具全量)
+    Solo,
+    /// solo + 子 agent 工具化(agent_depth+1 深度守卫)
+    Multi,
+    /// 只规划不执行:产出计划进 planned 待批准,批准后按计划逐步骤续跑
+    Plan,
+    /// 多主 agent 分工(2~4 主,每主 1~4 子目标)+ 审计终审升华
+    Team,
+    /// 自定义流程(AgentFlowConfig 步骤序列,轻量 step 执行器)
+    Custom,
+}
+
+impl TaskRunMode {
+    /// 文本形态(与 serde 输出一致;DB 参数化写入与日志用)
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Legacy => "legacy",
+            Self::Solo => "solo",
+            Self::Multi => "multi",
+            Self::Plan => "plan",
+            Self::Team => "team",
+            Self::Custom => "custom",
+        }
+    }
+
+    /// DB 读取容错:未知值(未来版本/异常行)记 warn 回退 Legacy,不 panic 不丢行。
+    pub fn from_str_lossy(s: &str) -> Self {
+        match s {
+            "legacy" => Self::Legacy,
+            "solo" => Self::Solo,
+            "multi" => Self::Multi,
+            "plan" => Self::Plan,
+            "team" => Self::Team,
+            "custom" => Self::Custom,
+            _ => {
+                tracing::warn!(value = s, "未知 task_mode,回退 legacy");
+                Self::Legacy
+            }
+        }
+    }
+
+    /// 严格解析(API 入参用):未知值返回 None,由调用方回 400「未知任务模式」;
+    /// DB 读取请用 from_str_lossy(容错回退,不丢行)。
+    pub fn from_str_strict(s: &str) -> Option<Self> {
+        match s {
+            "legacy" => Some(Self::Legacy),
+            "solo" => Some(Self::Solo),
+            "multi" => Some(Self::Multi),
+            "plan" => Some(Self::Plan),
+            "team" => Some(Self::Team),
+            "custom" => Some(Self::Custom),
+            _ => None,
+        }
+    }
+}
+
+/// TaskRecord.task_mode 的 serde 缺省(旧 JSON 无此字段 = legacy)
+fn task_default_run_mode() -> TaskRunMode {
+    TaskRunMode::Legacy
+}
+
+/// 终态追加指令的作用模式(批次 R2b+,2026-09-10 实跑修复 F5)。
+/// 序列化为 snake_case 文本;`append`(默认)为历史行为,`replace` 用新产出整体
+/// 替换原 result,支持「压缩 / 重写 / 改前面」这类 append 无法表达的指令。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskFollowupMode {
+    /// 追加:新产出以「追加 N」段附加到 result 末尾(历史行为,默认)
+    Append,
+    /// 替换:新产出整体替换 result(段标「修订 N」)
+    Replace,
+}
+
+impl TaskFollowupMode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Append => "append",
+            Self::Replace => "replace",
+        }
+    }
+
+    /// 严格解析(API 入参用):缺省/空 = Append;未知值返回 None 由调用方回 400。
+    /// 与 TaskRunMode 口径一致:入参严格、无容错回退。
+    pub fn from_str_strict(s: &str) -> Option<Self> {
+        match s {
+            "append" => Some(Self::Append),
+            "replace" => Some(Self::Replace),
+            _ => None,
+        }
+    }
+}
+
+/// 任务状态(tasks.status 列)。序列化输出与 DB 落盘均为 snake_case 文本,
+/// 与历史 String 形态逐字节一致(API JSON 与存量数据零变化;TS 侧同名 union 对齐)。
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskStatus {
+    Pending,
+    /// LLM 规划拆解中(run 入口至首步执行前)
+    Planning,
+    Running,
+    /// 计划已产出、待用户批准(plan 模式特有;批准后转 planning 续跑,放弃走 stop)
+    Planned,
+    Done,
+    /// 部分完成(含 error 步骤但成果已产出)
+    Partial,
+    Error,
+    /// 用户停止(stop)
+    Ended,
+}
+
+impl TaskStatus {
+    /// 文本形态(与 serde 输出一致;DB 参数化写入与日志用)
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Planning => "planning",
+            Self::Running => "running",
+            Self::Planned => "planned",
+            Self::Done => "done",
+            Self::Partial => "partial",
+            Self::Error => "error",
+            Self::Ended => "ended",
+        }
+    }
+
+    /// DB 读取容错:历史/异常行的未知值记 warn 并回退 Pending,不 panic 不丢行。
+    pub fn from_str_lossy(s: &str) -> Self {
+        match s {
+            "pending" => Self::Pending,
+            "planning" => Self::Planning,
+            "running" => Self::Running,
+            "planned" => Self::Planned,
+            "done" => Self::Done,
+            "partial" => Self::Partial,
+            "error" => Self::Error,
+            "ended" => Self::Ended,
+            _ => {
+                tracing::warn!(
+                    r#type = "task_status",
+                    value = s,
+                    "任务状态未知值,回退 pending"
+                );
+                Self::Pending
+            }
+        }
+    }
+}
+
+/// 任务计划步骤状态(tasks.plan JSON 数组内 TaskStep.status)。
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskStepStatus {
+    Pending,
+    Running,
+    Done,
+    Error,
+}
+
+impl TaskStepStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Running => "running",
+            Self::Done => "done",
+            Self::Error => "error",
+        }
+    }
+
+    /// 容错同 TaskStatus::from_str_lossy;plan JSON 反序列化经 de_step_status_lossy 走此处。
+    pub fn from_str_lossy(s: &str) -> Self {
+        match s {
+            "pending" => Self::Pending,
+            "running" => Self::Running,
+            "done" => Self::Done,
+            "error" => Self::Error,
+            _ => {
+                tracing::warn!(
+                    r#type = "task_step_status",
+                    value = s,
+                    "任务状态未知值,回退 pending"
+                );
+                Self::Pending
+            }
+        }
+    }
+}
+
+/// 任务子任务状态(task_subtasks.status 列)。pending 无写入点,仅 stop 的防御性比较保留。
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskSubtaskStatus {
+    Pending,
+    Running,
+    Done,
+    Error,
+    Ended,
+}
+
+impl TaskSubtaskStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Running => "running",
+            Self::Done => "done",
+            Self::Error => "error",
+            Self::Ended => "ended",
+        }
+    }
+
+    /// 容错同 TaskStatus::from_str_lossy。
+    pub fn from_str_lossy(s: &str) -> Self {
+        match s {
+            "pending" => Self::Pending,
+            "running" => Self::Running,
+            "done" => Self::Done,
+            "error" => Self::Error,
+            "ended" => Self::Ended,
+            _ => {
+                tracing::warn!(
+                    r#type = "task_subtask_status",
+                    value = s,
+                    "任务状态未知值,回退 pending"
+                );
+                Self::Pending
+            }
+        }
+    }
+}
+
+/// TaskStep.status 容错反序列化:LLM 产出的 plan JSON 里 status 偶发未知值
+/// (或旧版执行期写入的中间态),严格 derive 会让整个 plan 解析失败;
+/// 先读 String 再 from_str_lossy 回退 Pending。字段缺失仍走 #[serde(default)]。
+fn de_step_status_lossy<'de, D>(deserializer: D) -> Result<TaskStepStatus, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let s = String::deserialize(deserializer)?;
+    Ok(TaskStepStatus::from_str_lossy(&s))
+}
+
+/// 任务计划步骤(plan 以 JSON 数组存于 tasks.plan 列)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskStep {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub goal: String,
+    /// pending | running | done | error(类型化为 TaskStepStatus;未知值容错回退 Pending)
+    #[serde(
+        default = "task_step_default_status",
+        deserialize_with = "de_step_status_lossy"
+    )]
+    pub status: TaskStepStatus,
+    #[serde(default)]
+    pub result: String,
+}
+
+fn task_step_default_status() -> TaskStepStatus {
+    TaskStepStatus::Pending
+}
+
+impl Default for TaskStep {
+    fn default() -> Self {
+        TaskStep {
+            name: String::new(),
+            goal: String::new(),
+            status: TaskStepStatus::Pending,
+            result: String::new(),
+        }
+    }
+}
+
+/// 任务记录(任务工作台的一等公民)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskRecord {
+    pub id: String,
+    pub title: String,
+    /// 状态机见 TaskStatus doc:pending | planning | running | done | partial | error | ended
+    #[serde(default = "task_default_status")]
+    pub status: TaskStatus,
+    #[serde(default)]
+    pub plan: Vec<TaskStep>,
+    #[serde(default)]
+    pub result: String,
+    #[serde(default)]
+    pub error: String,
+    /// 执行者人设角色 id(空 = 通用执行者)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub character_id: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+    /// 执行模式(批次 4;缺省 legacy,旧客户端/旧行零变化)
+    #[serde(default = "task_default_run_mode")]
+    pub task_mode: TaskRunMode,
+}
+
+fn task_default_status() -> TaskStatus {
+    TaskStatus::Pending
+}
+
+/// 任务子任务(独立于 agent_subtasks:任务 id 非 sessions 外键,故单独建表)
+#[derive(Debug, Clone, Serialize)]
+pub struct TaskSubtaskRecord {
+    pub id: String,
+    pub task_id: String,
+    pub name: String,
+    pub instruction: String,
+    /// pending | running | done | error | ended
+    pub status: TaskSubtaskStatus,
+    pub result: String,
+    pub error: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// 任务 LLM 调用追踪行(task_llm_calls 表;批次 3「调用情况」面板时间线数据源)。
+/// phase:planner | step | summarize | agent | subagent | audit;
+/// status:ok | empty | error;摘要为截断文本(不携带全量上下文,面板可展开查看)。
+/// finish_reason(可观测性问题①):上游 stop/length/content_filter 等;
+/// '' = 未知/未下发(旧行默认值)。length = max_tokens 截断——修复前截断调用
+/// 与正常完成同为 status=ok,面板无从区分。
+#[derive(Debug, Clone, Serialize)]
+pub struct TaskLlmCallRecord {
+    pub id: String,
+    pub task_id: String,
+    pub phase: String,
+    pub step_index: Option<i64>,
+    pub model: String,
+    pub prompt_summary: String,
+    pub response_summary: String,
+    pub prompt_tokens: i64,
+    pub completion_tokens: i64,
+    pub reasoning_tokens: i64,
+    pub elapsed_ms: i64,
+    pub status: String,
+    /// 上游 finish_reason(stop/length/...);'' = 未知/未下发(旧行兼容)
+    pub finish_reason: String,
+    pub created_at: String,
+}
+
+/// 任务消息(task_messages 表;批次 R2 多轮用户输入):任务全程的用户输入
+///(followup 终态追加指令 / plan_chat 批准环节对话)与助手产出按行落库,
+/// GET /api/tasks/{id} 详情响应的 messages 数组(created_at 升序)数据源。
+/// 序列化字段 snake_case,与 TaskRecord/TaskSubtaskRecord/TaskLlmCallRecord 同风格;
+/// 任务删除经外键 ON DELETE CASCADE 一并清除。
+#[derive(Debug, Clone, Serialize)]
+pub struct TaskMessageRecord {
+    pub id: String,
+    pub task_id: String,
+    /// user | assistant(建表 CHECK 约束)
+    pub role: String,
+    /// normal | followup | plan_chat(旧行默认 normal;读取侧不做严格校验,宽容演进)
+    pub kind: String,
+    pub content: String,
+    pub created_at: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// serde 快照(批次 R2):TaskMessageRecord 序列化键集合与线格式
+    /// (snake_case,与 TaskRecord/TaskLlmCallRecord 同风格;前端 TaskMessage 类型对齐)。
+    #[test]
+    fn task_message_record_serde_snapshot() {
+        let rec = TaskMessageRecord {
+            id: "m1".into(),
+            task_id: "t1".into(),
+            role: "user".into(),
+            kind: "followup".into(),
+            content: "再补充一点".into(),
+            created_at: "2026-09-03T00:00:00.000Z".into(),
+        };
+        let v = serde_json::to_value(&rec).unwrap();
+        // serde_json 未启用 preserve_order:Map 键按字典序,断言键集合(排序后)
+        let mut keys: Vec<&str> = v.as_object().unwrap().keys().map(|k| k.as_str()).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec!["content", "created_at", "id", "kind", "role", "task_id"],
+            "字段集合快照: {keys:?}"
+        );
+        assert_eq!(v["role"], "user");
+        assert_eq!(v["kind"], "followup");
+        assert_eq!(v["content"], "再补充一点");
+    }
+
+    /// serde 快照:三个状态枚举序列化输出必须与历史 String 形态(API JSON/DB 落盘)
+    /// 逐字节一致;as_str 与 from_str_lossy 同表往返。
+    #[test]
+    fn task_status_serde_snapshot() {
+        let cases = [
+            (TaskStatus::Pending, "pending"),
+            (TaskStatus::Planning, "planning"),
+            (TaskStatus::Running, "running"),
+            (TaskStatus::Done, "done"),
+            (TaskStatus::Partial, "partial"),
+            (TaskStatus::Error, "error"),
+            (TaskStatus::Ended, "ended"),
+        ];
+        for (status, text) in cases {
+            assert_eq!(
+                serde_json::to_string(&status).unwrap(),
+                format!("\"{text}\"")
+            );
+            assert_eq!(status.as_str(), text);
+            assert_eq!(TaskStatus::from_str_lossy(text), status);
+        }
+    }
+
+    /// serde 快照:llm_call 事件线格式(批次 3 新增 kind)。kind 为 Option<String>,
+    /// 本测试锁定「type=task + kind=llm_call」帧形态(None 字段省略),防线格式漂移。
+    #[test]
+    fn sse_task_llm_call_event_wire_format() {
+        let ev = SseEvent::Task {
+            task_id: "t1".into(),
+            kind: Some("llm_call".into()),
+            title: None,
+            status: None,
+            detail: Some("step #1 · mock · 5 tokens".into()),
+            finish_reason: None,
+            phase: None,
+            step_index: None,
+        };
+        let v = serde_json::to_value(&ev).unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!({
+                "type": "task",
+                "task_id": "t1",
+                "kind": "llm_call",
+                "detail": "step #1 · mock · 5 tokens"
+            })
+        );
+    }
+
+    /// serde 快照:llm_call 事件携带 finish_reason(可观测性问题①,截断标记透出)。
+    /// Some 时字段出现,None 时省略(旧客户端兼容);同时锁定 TaskLlmCallRecord
+    /// 的 finish_reason 字段出现在 calls 端点 JSON(旧行为 '' 空串)。
+    #[test]
+    fn sse_task_llm_call_event_with_finish_reason_wire_format() {
+        let ev = SseEvent::Task {
+            task_id: "t1".into(),
+            kind: Some("llm_call".into()),
+            title: None,
+            status: None,
+            detail: Some("agent · mock · 5 tokens".into()),
+            finish_reason: Some("length".into()),
+            phase: None,
+            step_index: None,
+        };
+        let v = serde_json::to_value(&ev).unwrap();
+        assert_eq!(v["finish_reason"], serde_json::json!("length"));
+
+        let rec = TaskLlmCallRecord {
+            id: "c1".into(),
+            task_id: "t1".into(),
+            phase: "agent".into(),
+            step_index: None,
+            model: "m".into(),
+            prompt_summary: String::new(),
+            response_summary: String::new(),
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            reasoning_tokens: 0,
+            elapsed_ms: 0,
+            status: "ok".into(),
+            finish_reason: String::new(),
+            created_at: "c".into(),
+        };
+        let v = serde_json::to_value(&rec).unwrap();
+        assert_eq!(
+            v["finish_reason"],
+            serde_json::json!(""),
+            "旧行(未知)应以空串透出,不等于 stop"
+        );
+    }
+
+    /// serde 快照:delta 事件线格式(批次 R4 任务模式流式输出)。kind=delta +
+    /// detail 攒批文本 + phase/step_index 调用归属标识;暂态事件不落库(纪律例外,
+    /// 见 events.rs emit_delta),None 字段序列化省略,旧客户端缺字段即忽略。
+    #[test]
+    fn sse_task_delta_event_wire_format() {
+        let ev = SseEvent::Task {
+            task_id: "t1".into(),
+            kind: Some("delta".into()),
+            title: None,
+            status: None,
+            detail: Some("攒批后的正文增量".into()),
+            finish_reason: None,
+            phase: Some("step".into()),
+            step_index: Some(0),
+        };
+        let v = serde_json::to_value(&ev).unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!({
+                "type": "task",
+                "task_id": "t1",
+                "kind": "delta",
+                "detail": "攒批后的正文增量",
+                "phase": "step",
+                "step_index": 0
+            })
+        );
+    }
+
+    /// serde 快照:llm_call 事件携带 phase/step_index(批次 R4:前端据此清对应
+    /// 流式缓冲,delta 暂态数据由落库行取代对齐权威)。非步骤类阶段(planner 等)
+    /// step_index 为 None,序列化省略该字段。
+    #[test]
+    fn sse_task_llm_call_event_with_phase_wire_format() {
+        let ev = SseEvent::Task {
+            task_id: "t1".into(),
+            kind: Some("llm_call".into()),
+            title: None,
+            status: None,
+            detail: Some("step #1 · mock · 5 tokens".into()),
+            finish_reason: None,
+            phase: Some("step".into()),
+            step_index: Some(0),
+        };
+        let v = serde_json::to_value(&ev).unwrap();
+        assert_eq!(v["phase"], serde_json::json!("step"));
+        assert_eq!(v["step_index"], serde_json::json!(0));
+
+        let ev = SseEvent::Task {
+            task_id: "t1".into(),
+            kind: Some("llm_call".into()),
+            title: None,
+            status: None,
+            detail: Some("planner · mock · 5 tokens".into()),
+            finish_reason: None,
+            phase: Some("planner".into()),
+            step_index: None,
+        };
+        let v = serde_json::to_value(&ev).unwrap();
+        assert_eq!(v["phase"], serde_json::json!("planner"));
+        assert!(
+            v.get("step_index").is_none(),
+            "step_index 为 None 时应省略: {v}"
+        );
+    }
+
+    /// serde 快照:TaskRunMode 六模式枚举(批次 4 契约)。线格式 snake_case;
+    /// 旧行/旧配置缺省 = legacy;DB 未知值 from_str_lossy 容错回退 Legacy 不 panic。
+    #[test]
+    fn task_run_mode_serde_snapshot() {
+        let cases = [
+            (TaskRunMode::Legacy, "legacy"),
+            (TaskRunMode::Solo, "solo"),
+            (TaskRunMode::Multi, "multi"),
+            (TaskRunMode::Plan, "plan"),
+            (TaskRunMode::Team, "team"),
+            (TaskRunMode::Custom, "custom"),
+        ];
+        for (mode, text) in cases {
+            assert_eq!(serde_json::to_string(&mode).unwrap(), format!("\"{text}\""));
+            assert_eq!(mode.as_str(), text);
+            assert_eq!(TaskRunMode::from_str_lossy(text), mode);
+        }
+        assert_eq!(
+            TaskRunMode::from_str_lossy("未来未知模式"),
+            TaskRunMode::Legacy
+        );
+    }
+
+    /// TaskStatus::Planned(plan 模式待批准态)线格式 + as_str/from_str_lossy 往返。
+    #[test]
+    fn task_status_planned_serde() {
+        assert_eq!(
+            serde_json::to_string(&TaskStatus::Planned).unwrap(),
+            "\"planned\""
+        );
+        assert_eq!(TaskStatus::Planned.as_str(), "planned");
+        assert_eq!(TaskStatus::from_str_lossy("planned"), TaskStatus::Planned);
+    }
+
+    /// TaskRecord 缺省 task_mode = legacy:旧 API 体/旧 tasks 行 JSON 反序列化零迁移。
+    #[test]
+    fn task_record_task_mode_defaults_legacy() {
+        let t: TaskRecord = serde_json::from_value(serde_json::json!({
+            "id": "t", "title": "x", "created_at": "c", "updated_at": "u"
+        }))
+        .unwrap();
+        assert_eq!(t.task_mode, TaskRunMode::Legacy);
+    }
+
+    /// TaskStepStatus 快照(序列化/as_str/往返)
+    #[test]
+    fn task_step_status_serde_snapshot() {
+        let cases = [
+            (TaskStepStatus::Pending, "pending"),
+            (TaskStepStatus::Running, "running"),
+            (TaskStepStatus::Done, "done"),
+            (TaskStepStatus::Error, "error"),
+        ];
+        for (status, text) in cases {
+            assert_eq!(
+                serde_json::to_string(&status).unwrap(),
+                format!("\"{text}\"")
+            );
+            assert_eq!(status.as_str(), text);
+            assert_eq!(TaskStepStatus::from_str_lossy(text), status);
+        }
+    }
+
+    /// TaskSubtaskStatus 快照(序列化/as_str/往返)
+    #[test]
+    fn task_subtask_status_serde_snapshot() {
+        let cases = [
+            (TaskSubtaskStatus::Pending, "pending"),
+            (TaskSubtaskStatus::Running, "running"),
+            (TaskSubtaskStatus::Done, "done"),
+            (TaskSubtaskStatus::Error, "error"),
+            (TaskSubtaskStatus::Ended, "ended"),
+        ];
+        for (status, text) in cases {
+            assert_eq!(
+                serde_json::to_string(&status).unwrap(),
+                format!("\"{text}\"")
+            );
+            assert_eq!(status.as_str(), text);
+            assert_eq!(TaskSubtaskStatus::from_str_lossy(text), status);
+        }
+    }
+
+    /// from_str_lossy 未知值回退 Pending(记 warn,不 panic)
+    #[test]
+    fn status_from_str_lossy_fallback() {
+        assert_eq!(TaskStatus::from_str_lossy("进行中"), TaskStatus::Pending);
+        assert_eq!(TaskStatus::from_str_lossy(""), TaskStatus::Pending);
+        assert_eq!(
+            TaskStepStatus::from_str_lossy("ended"),
+            TaskStepStatus::Pending
+        );
+        assert_eq!(
+            TaskSubtaskStatus::from_str_lossy("PARTIAL"),
+            TaskSubtaskStatus::Pending
+        );
+    }
+
+    /// plan JSON 反序列化容错:未知 status 不破坏整个 plan 解析(回退 Pending);
+    /// 字段缺失走 serde default;合法值正常解析。
+    #[test]
+    fn task_step_status_deserialize_lossy() {
+        let step: TaskStep =
+            serde_json::from_str(r#"{"name":"一","goal":"g","status":"进行中"}"#).unwrap();
+        assert_eq!(step.status, TaskStepStatus::Pending);
+        let step: TaskStep = serde_json::from_str(r#"{"name":"一","goal":"g"}"#).unwrap();
+        assert_eq!(step.status, TaskStepStatus::Pending);
+        let step: TaskStep =
+            serde_json::from_str(r#"{"name":"一","goal":"g","status":"done"}"#).unwrap();
+        assert_eq!(step.status, TaskStepStatus::Done);
+        // 序列化回写仍是 snake_case 文本(plan 落盘形态不变)
+        let json = serde_json::to_string(&step).unwrap();
+        assert!(
+            json.contains(r#""status":"done""#),
+            "plan JSON 形态: {json}"
+        );
+    }
 }

@@ -1,4 +1,5 @@
 // 会话与消息服务(与 Node 版 session.service.ts 对齐)
+use super::log_query_failure;
 use crate::models::db::{now_iso, Db};
 use crate::models::types::{MessageRecord, SessionRecord, SessionWithCharacter, StMessage};
 use rusqlite::{params, OptionalExtension};
@@ -54,7 +55,7 @@ impl SessionService {
         let now = now_iso();
         let id = Uuid::new_v4().to_string();
         let title = title.unwrap_or("新会话");
-        let conn = self.db.conn();
+        let conn = self.db.write();
         conn.execute(
             "INSERT INTO sessions (id, character_id, title, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?4)",
             params![id, character_id, title, now],
@@ -70,36 +71,45 @@ impl SessionService {
     }
 
     pub fn list_by_character(&self, character_id: &str) -> Vec<SessionRecord> {
-        let conn = self.db.conn();
-        let mut stmt = conn
-            .prepare("SELECT id, character_id, title, created_at, updated_at FROM sessions WHERE character_id = ?1 ORDER BY updated_at DESC")
-            .unwrap();
-        stmt.query_map(params![character_id], row_to_session)
-            .unwrap()
-            .filter_map(|r| r.ok())
-            .collect()
+        let conn = self.db.read().expect("获取只读连接失败");
+        // prepare/参数绑定失败属 schema 级异常:记 warn 回退空列表,不在阻塞线程 panic
+        // (与 filter_map 丢弃坏行的既有 best-effort 语义一致)
+        let mut stmt = match conn
+            .prepare_cached("SELECT id, character_id, title, created_at, updated_at FROM sessions WHERE character_id = ?1 ORDER BY updated_at DESC")
+        {
+            Ok(s) => s,
+            Err(e) => return log_query_failure("会话列表(按角色) prepare", e),
+        };
+        let query = stmt.query_map(params![character_id], row_to_session);
+        match query {
+            Ok(rows) => rows.filter_map(|r| r.ok()).collect(),
+            Err(e) => log_query_failure("会话列表(按角色) query_map", e),
+        }
     }
 
     /// 全部会话(联表角色名),按 updated_at DESC —— 聊天记录面板
     pub fn list_all(&self) -> Vec<SessionWithCharacter> {
-        let conn = self.db.conn();
-        let mut stmt = conn
-            .prepare(
-                "SELECT s.id, s.character_id, s.title, s.created_at, s.updated_at, c.chara_name \
+        let conn = self.db.read().expect("获取只读连接失败");
+        let mut stmt = match conn.prepare(
+            "SELECT s.id, s.character_id, s.title, s.created_at, s.updated_at, c.chara_name \
                  FROM sessions s LEFT JOIN characters c ON c.id = s.character_id \
                  ORDER BY s.updated_at DESC",
-            )
-            .unwrap();
-        stmt.query_map([], row_to_session_with_char)
-            .unwrap()
-            .filter_map(|r| r.ok())
-            .collect()
+        ) {
+            Ok(s) => s,
+            Err(e) => return log_query_failure("会话列表(全部) prepare", e),
+        };
+        let query = stmt.query_map([], row_to_session_with_char);
+        match query {
+            Ok(rows) => rows.filter_map(|r| r.ok()).collect(),
+            Err(e) => log_query_failure("会话列表(全部) query_map", e),
+        }
     }
 
     /// 会话消息数量(聊天记录面板显示)
     pub fn message_count(&self, session_id: &str) -> i64 {
         self.db
-            .conn()
+            .read()
+            .expect("获取只读连接失败")
             .query_row(
                 "SELECT COUNT(*) FROM messages WHERE session_id = ?1",
                 params![session_id],
@@ -109,7 +119,7 @@ impl SessionService {
     }
 
     pub fn get(&self, id: &str) -> Option<SessionRecord> {
-        let conn = self.db.conn();
+        let conn = self.db.read().ok()?;
         conn.query_row(
             "SELECT id, character_id, title, created_at, updated_at FROM sessions WHERE id = ?1",
             params![id],
@@ -121,7 +131,7 @@ impl SessionService {
     }
 
     pub fn touch(&self, id: &str) {
-        let conn = self.db.conn();
+        let conn = self.db.write();
         let _ = conn.execute(
             "UPDATE sessions SET updated_at = ?1 WHERE id = ?2",
             params![now_iso(), id],
@@ -129,7 +139,7 @@ impl SessionService {
     }
 
     pub fn delete(&self, id: &str) -> bool {
-        let conn = self.db.conn();
+        let conn = self.db.write();
         conn.execute("DELETE FROM sessions WHERE id = ?1", params![id])
             .map(|n| n > 0)
             .unwrap_or(false)
@@ -155,7 +165,7 @@ impl SessionService {
         let extra_str = serde_json::to_string(&extra).unwrap_or_else(|_| "{}".to_string());
         // 注意:conn(MutexGuard)必须在调用 self.touch(再取锁)之前释放
         let id = {
-            let conn = self.db.conn();
+            let conn = self.db.write();
             conn.execute(
                 "INSERT INTO messages (session_id, role, content, extra, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
                 params![session_id, role, content, extra_str, now],
@@ -175,14 +185,18 @@ impl SessionService {
     }
 
     pub fn get_messages(&self, session_id: &str) -> Vec<MessageRecord> {
-        let conn = self.db.conn();
-        let mut stmt = conn
-            .prepare("SELECT id, session_id, role, content, extra, created_at FROM messages WHERE session_id = ?1 ORDER BY id ASC")
-            .unwrap();
-        stmt.query_map(params![session_id], row_to_message)
-            .unwrap()
-            .filter_map(|r| r.ok())
-            .collect()
+        let conn = self.db.read().expect("获取只读连接失败");
+        let mut stmt = match conn
+            .prepare_cached("SELECT id, session_id, role, content, extra, created_at FROM messages WHERE session_id = ?1 ORDER BY id ASC")
+        {
+            Ok(s) => s,
+            Err(e) => return log_query_failure("会话消息列表 prepare", e),
+        };
+        let query = stmt.query_map(params![session_id], row_to_message);
+        match query {
+            Ok(rows) => rows.filter_map(|r| r.ok()).collect(),
+            Err(e) => log_query_failure("会话消息列表 query_map", e),
+        }
     }
 
     /// 保存/覆盖会话的上下文压缩摘要(按 (session_id, upto_message_id) 幂等 upsert)。
@@ -194,7 +208,7 @@ impl SessionService {
         summary: &str,
         model: &str,
     ) -> Result<(), String> {
-        let conn = self.db.conn();
+        let conn = self.db.write();
         conn.execute(
             "INSERT INTO session_compactions (session_id, upto_message_id, summary, model, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5)
@@ -210,7 +224,7 @@ impl SessionService {
 
     /// 读取该会话最新一条压缩摘要(按 upto_message_id 最大),返回 (upto_message_id, summary)。
     pub fn get_compaction(&self, session_id: &str) -> Option<(i64, String)> {
-        let conn = self.db.conn();
+        let conn = self.db.read().ok()?;
         conn.query_row(
             "SELECT upto_message_id, summary FROM session_compactions WHERE session_id = ?1 ORDER BY upto_message_id DESC LIMIT 1",
             params![session_id],
@@ -223,7 +237,7 @@ impl SessionService {
 
     /// 删除会话的压缩摘要(可逆:删摘要即恢复完整原文历史)。
     pub fn delete_compaction(&self, session_id: &str) -> Result<(), String> {
-        let conn = self.db.conn();
+        let conn = self.db.write();
         conn.execute(
             "DELETE FROM session_compactions WHERE session_id = ?1",
             params![session_id],
@@ -241,7 +255,7 @@ impl SessionService {
         payload: &str,
         model: &str,
     ) -> Result<(), String> {
-        let conn = self.db.conn();
+        let conn = self.db.write();
         conn.execute(
             "INSERT INTO llm_requests (session_id, run_id, seq, payload, model, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
@@ -251,12 +265,71 @@ impl SessionService {
         Ok(())
     }
 
+    /// 记录一次 LLM 请求的 usage 缓存统计(缓存感知管线):
+    /// 已有该 (session_id, run_id, seq) 快照行时 UPDATE 缓存列(payload 不动);
+    /// 无既有行(快照开关关闭)时插入轻量行(payload 空串),保证缓存观测
+    /// 不依赖 llm_request_log 调试开关。失败由调用方决定是否告警。
+    #[allow(clippy::too_many_arguments)]
+    pub fn save_llm_cache_usage(
+        &self,
+        session_id: &str,
+        run_id: &str,
+        seq: i64,
+        model: &str,
+        prompt_tokens: i64,
+        completion_tokens: i64,
+        cache_hit_tokens: i64,
+        cache_miss_tokens: i64,
+    ) -> Result<(), String> {
+        let conn = self.db.write();
+        let updated = conn
+            .execute(
+                "UPDATE llm_requests SET
+                   prompt_cache_hit_tokens = ?4,
+                   prompt_cache_miss_tokens = ?5,
+                   prompt_tokens = ?6,
+                   completion_tokens = ?7
+                 WHERE session_id = ?1 AND run_id = ?2 AND seq = ?3",
+                params![
+                    session_id,
+                    run_id,
+                    seq,
+                    cache_hit_tokens,
+                    cache_miss_tokens,
+                    prompt_tokens,
+                    completion_tokens
+                ],
+            )
+            .map_err(|e| format!("更新 LLM 缓存统计失败: {e}"))?;
+        if updated == 0 {
+            conn.execute(
+                "INSERT INTO llm_requests
+                   (session_id, run_id, seq, payload, model, created_at,
+                    prompt_cache_hit_tokens, prompt_cache_miss_tokens, prompt_tokens, completion_tokens)
+                 VALUES (?1, ?2, ?3, '', ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![
+                    session_id,
+                    run_id,
+                    seq,
+                    model,
+                    now_iso(),
+                    cache_hit_tokens,
+                    cache_miss_tokens,
+                    prompt_tokens,
+                    completion_tokens
+                ],
+            )
+            .map_err(|e| format!("保存 LLM 缓存统计失败: {e}"))?;
+        }
+        Ok(())
+    }
+
     /// 裁剪会话的 LLM 请求快照,仅保留最近 keep 条(按 id 升序删最旧)。
     pub fn prune_llm_requests(&self, session_id: &str, keep: i64) -> Result<(), String> {
         if keep < 0 {
             return Ok(());
         }
-        let conn = self.db.conn();
+        let conn = self.db.write();
         conn.execute(
             "DELETE FROM llm_requests WHERE session_id = ?1 AND id NOT IN (
                SELECT id FROM llm_requests WHERE session_id = ?1 ORDER BY id DESC LIMIT ?2
@@ -285,7 +358,7 @@ impl SessionService {
         let extra_str = serde_json::to_string(&Value::Object(extra)).ok()?;
         // 注意:conn(MutexGuard)必须在再次调用 self.get_message 之前释放,避免重入死锁
         let affected = {
-            let conn = self.db.conn();
+            let conn = self.db.write();
             conn.execute(
                 "UPDATE messages SET content = ?1, extra = ?2 WHERE session_id = ?3 AND id = ?4",
                 params![content, extra_str, session_id, id],
@@ -307,7 +380,7 @@ impl SessionService {
         content: &str,
     ) -> Option<MessageRecord> {
         let affected = {
-            let conn = self.db.conn();
+            let conn = self.db.write();
             conn.execute(
                 "UPDATE messages SET content = ?1 WHERE session_id = ?2 AND id = ?3",
                 params![content, session_id, id],
@@ -331,7 +404,7 @@ impl SessionService {
     ) -> Option<MessageRecord> {
         let extra_str = serde_json::to_string(&extra).ok()?;
         let affected = {
-            let conn = self.db.conn();
+            let conn = self.db.write();
             conn.execute(
                 "UPDATE messages SET content = ?1, extra = ?2 WHERE session_id = ?3 AND id = ?4",
                 params![content, extra_str, session_id, id],
@@ -345,7 +418,7 @@ impl SessionService {
     }
 
     pub fn get_message(&self, session_id: &str, id: i64) -> Option<MessageRecord> {
-        let conn = self.db.conn();
+        let conn = self.db.read().ok()?;
         conn.query_row(
             "SELECT id, session_id, role, content, extra, created_at FROM messages WHERE session_id = ?1 AND id = ?2",
             params![session_id, id],
@@ -373,7 +446,7 @@ impl SessionService {
         }
         let extra_str = serde_json::to_string(&extra).ok()?;
         {
-            let conn = self.db.conn();
+            let conn = self.db.write();
             let n = conn
                 .execute(
                     "UPDATE messages SET extra = ?1 WHERE session_id = ?2 AND id = ?3",
@@ -388,7 +461,7 @@ impl SessionService {
     }
 
     pub fn delete_message(&self, session_id: &str, id: i64) -> bool {
-        let conn = self.db.conn();
+        let conn = self.db.write();
         conn.execute(
             "DELETE FROM messages WHERE session_id = ?1 AND id = ?2",
             params![session_id, id],
@@ -400,7 +473,7 @@ impl SessionService {
     /// 截断:删除该会话中 id 大于 anchor_id 的全部消息(anchor 本身保留)。
     /// 用于「编辑用户消息后重发」:保留被编辑消息、丢弃其后的所有上下文。
     pub fn truncate_messages_after(&self, session_id: &str, anchor_id: i64) -> usize {
-        let conn = self.db.conn();
+        let conn = self.db.write();
         conn.execute(
             "DELETE FROM messages WHERE session_id = ?1 AND id > ?2",
             params![session_id, anchor_id],
@@ -409,7 +482,7 @@ impl SessionService {
     }
 
     pub fn clear_messages(&self, session_id: &str) {
-        let conn = self.db.conn();
+        let conn = self.db.write();
         let _ = conn.execute(
             "DELETE FROM messages WHERE session_id = ?1",
             params![session_id],
@@ -452,7 +525,10 @@ impl SessionService {
 
     /// 读取会话全部变量 → HashMap
     pub fn load_session_vars(&self, session_id: &str) -> HashMap<String, String> {
-        let conn = self.db.conn();
+        let conn = match self.db.read() {
+            Ok(c) => c,
+            Err(_) => return HashMap::new(),
+        };
         let mut stmt =
             match conn.prepare("SELECT key, value FROM session_vars WHERE session_id = ?1") {
                 Ok(s) => s,
@@ -473,7 +549,7 @@ impl SessionService {
 
     /// 全量覆写会话变量(宏展开后由引擎调用);返回写入条数
     pub fn save_session_vars(&self, session_id: &str, vars: &HashMap<String, String>) -> usize {
-        let conn = self.db.conn();
+        let conn = self.db.write();
         let now = now_iso();
         let _ = conn.execute(
             "DELETE FROM session_vars WHERE session_id = ?1",
@@ -492,15 +568,6 @@ impl SessionService {
         count
     }
 
-    /// 删除会话全部变量
-    pub fn clear_session_vars(&self, session_id: &str) {
-        let conn = self.db.conn();
-        let _ = conn.execute(
-            "DELETE FROM session_vars WHERE session_id = ?1",
-            params![session_id],
-        );
-    }
-
     // ===== 酒馆助手变量树(assistant 插件 stat_data,会话级 JSON) =====
 
     /// 读取会话酒馆助手变量树;无记录返回空树
@@ -508,7 +575,9 @@ impl SessionService {
         &self,
         session_id: &str,
     ) -> crate::parsing::assistant::AssistantVars {
-        let conn = self.db.conn();
+        let Ok(conn) = self.db.read() else {
+            return crate::parsing::assistant::AssistantVars::new();
+        };
         let raw: Option<String> = conn
             .query_row(
                 "SELECT data_raw FROM session_assistant_vars WHERE session_id = ?1",
@@ -530,7 +599,7 @@ impl SessionService {
         session_id: &str,
         vars: &crate::parsing::assistant::AssistantVars,
     ) -> Result<(), String> {
-        let conn = self.db.conn();
+        let conn = self.db.write();
         let now = now_iso();
         conn.execute(
             "INSERT OR REPLACE INTO session_assistant_vars (session_id, data_raw, updated_at) VALUES (?1, ?2, ?3)",
@@ -540,20 +609,11 @@ impl SessionService {
         Ok(())
     }
 
-    /// 删除会话酒馆助手变量树
-    pub fn clear_assistant_vars(&self, session_id: &str) {
-        let conn = self.db.conn();
-        let _ = conn.execute(
-            "DELETE FROM session_assistant_vars WHERE session_id = ?1",
-            params![session_id],
-        );
-    }
-
     // ===== 7 作用域变量(计划二 · scope_variables 表) =====
 
     /// 读取指定作用域原始数据(JSON);无记录返回 None。
     pub fn load_scope_variables(&self, scope: &str, scope_id: &str) -> Option<serde_json::Value> {
-        let conn = self.db.conn();
+        let conn = self.db.read().ok()?;
         let raw: Option<String> = conn
             .query_row(
                 "SELECT data_raw FROM scope_variables WHERE scope = ?1 AND scope_id = ?2",
@@ -566,7 +626,7 @@ impl SessionService {
 
     /// 保存指定作用域原始数据(整树覆写;INSERT OR REPLACE)。
     pub fn save_scope_variables(&self, scope: &str, scope_id: &str, data: &serde_json::Value) {
-        let conn = self.db.conn();
+        let conn = self.db.write();
         let now = now_iso();
         let _ = conn.execute(
             "INSERT OR REPLACE INTO scope_variables (scope, scope_id, data_raw, updated_at) VALUES (?1, ?2, ?3, ?4)",
@@ -575,11 +635,8 @@ impl SessionService {
     }
 
     /// 批量落库非 chat 作用域(引擎收尾;scope, scope_id, data_raw 元组)。
-    pub fn save_scope_variables_batch(
-        &self,
-        entries: Vec<(String, String, String)>,
-    ) -> usize {
-        let conn = self.db.conn();
+    pub fn save_scope_variables_batch(&self, entries: Vec<(String, String, String)>) -> usize {
+        let conn = self.db.write();
         let now = now_iso();
         let mut count = 0;
         for (scope, scope_id, data_raw) in entries {
@@ -592,15 +649,6 @@ impl SessionService {
             }
         }
         count
-    }
-
-    /// 删除指定作用域记录(作用域数据重置)。
-    pub fn clear_scope_variables(&self, scope: &str, scope_id: &str) {
-        let conn = self.db.conn();
-        let _ = conn.execute(
-            "DELETE FROM scope_variables WHERE scope = ?1 AND scope_id = ?2",
-            params![scope, scope_id],
-        );
     }
 }
 
@@ -616,7 +664,7 @@ mod tests {
         let svc = SessionService::new(db);
         // llm_requests/session_compactions 均外键引用 sessions,测试需先建 character + session
         {
-            let conn = svc.db.conn();
+            let conn = svc.db.write();
             conn.execute(
                 "INSERT INTO characters (id, name, chara_name, description, file_path, data_raw, created_at)
                  VALUES ('c1', 'c', 'c', '', '', '{}', '')",
@@ -636,10 +684,11 @@ mod tests {
     #[test]
     fn save_llm_request_persists_payload() {
         let (svc, dir) = service();
-        svc.save_llm_request("s1", "run1", 0, r#"{"role":"system"}"#, "m").unwrap();
+        svc.save_llm_request("s1", "run1", 0, r#"{"role":"system"}"#, "m")
+            .unwrap();
 
         let db = svc.db.clone();
-        let conn = db.conn();
+        let conn = db.write();
         let (payload, model): (String, String) = conn
             .query_row(
                 "SELECT payload, model FROM llm_requests WHERE session_id='s1' AND seq=0",
@@ -663,20 +712,92 @@ mod tests {
         svc.prune_llm_requests("s1", 2).unwrap();
 
         let db = svc.db.clone();
-        let conn = db.conn();
+        let conn = db.write();
         let count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM llm_requests WHERE session_id='s1'", [], |r| r.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM llm_requests WHERE session_id='s1'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(count, 2, "应仅保留最近 2 条");
         // 保留的应是 seq 最大的两条(3、4)
         let max_seq: i64 = conn
-            .query_row("SELECT MAX(seq) FROM llm_requests WHERE session_id='s1'", [], |r| r.get(0))
+            .query_row(
+                "SELECT MAX(seq) FROM llm_requests WHERE session_id='s1'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         let min_seq: i64 = conn
-            .query_row("SELECT MIN(seq) FROM llm_requests WHERE session_id='s1'", [], |r| r.get(0))
+            .query_row(
+                "SELECT MIN(seq) FROM llm_requests WHERE session_id='s1'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(max_seq, 4);
         assert_eq!(min_seq, 3);
+        drop(conn);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// 缓存 usage 落库:已有请求快照行(seq 匹配)时 UPDATE 缓存列,payload 不被覆盖
+    #[test]
+    fn save_llm_cache_usage_updates_existing_row() {
+        let (svc, dir) = service();
+        svc.save_llm_request("s1", "run1", 0, r#"{"role":"system"}"#, "m")
+            .unwrap();
+        svc.save_llm_cache_usage("s1", "run1", 0, "m", 1000, 200, 700, 300)
+            .unwrap();
+
+        let db = svc.db.clone();
+        let conn = db.write();
+        let (hit, miss, prompt, completion, payload): (i64, i64, i64, i64, String) = conn
+            .query_row(
+                "SELECT prompt_cache_hit_tokens, prompt_cache_miss_tokens, prompt_tokens, completion_tokens, payload
+                 FROM llm_requests WHERE session_id='s1' AND run_id='run1' AND seq=0",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!((hit, miss, prompt, completion), (700, 300, 1000, 200));
+        assert_eq!(
+            payload, r#"{"role":"system"}"#,
+            "缓存列更新不应覆盖 payload"
+        );
+        drop(conn);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// 缓存 usage 落库:快照开关关闭(无既有行)时插入轻量行(payload 为空串),
+    /// 保证缓存观测数据不依赖 llm_request_log 调试开关
+    #[test]
+    fn save_llm_cache_usage_inserts_light_row_when_missing() {
+        let (svc, dir) = service();
+        svc.save_llm_cache_usage("s1", "run2", 3, "m", 500, 80, 0, 500)
+            .unwrap();
+
+        let db = svc.db.clone();
+        let conn = db.write();
+        let (hit, miss, payload): (i64, i64, String) = conn
+            .query_row(
+                "SELECT prompt_cache_hit_tokens, prompt_cache_miss_tokens, payload
+                 FROM llm_requests WHERE session_id='s1' AND run_id='run2' AND seq=3",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!((hit, miss), (0, 500));
+        assert_eq!(payload, "", "无快照开关时应插入轻量行(payload 空)");
         drop(conn);
         std::fs::remove_dir_all(dir).ok();
     }

@@ -6,7 +6,7 @@
 // 观察层变化只影响 L3 尾部(§3.6),不破坏 L0-L2 前缀。
 use serde_json::Value;
 
-use super::{observe, due_fields, Contract, KaleidoMeta};
+use super::{due_fields, observe, Contract, KaleidoMeta};
 
 /// 构建「当前状态」提示文本。
 ///

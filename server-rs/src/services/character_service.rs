@@ -1,4 +1,5 @@
 // 角色卡服务(与 Node 版 character.service.ts 对齐):上传/CRUD/文件落盘
+use super::log_query_failure;
 use crate::models::db::{now_iso, Db};
 use crate::models::types::CharacterRecord;
 use crate::parsing::character_card::{parse_character_card, safe_file_name};
@@ -52,6 +53,18 @@ fn row_to_character(row: &rusqlite::Row, with_data_raw: bool) -> rusqlite::Resul
         .as_ref()
         .map(crate::parsing::regex_script::extract_regex_scripts)
         .filter(|v| !v.is_empty());
+    // 卡元数据三件套(远程资源页口令推导用;列表也携带,体积小)
+    let pick_str = |key: &str| {
+        data_raw_value
+            .as_ref()
+            .and_then(|d| d.get(key))
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| s.to_string())
+    };
+    let creator = pick_str("creator");
+    let character_version = pick_str("character_version");
+    let creator_notes = pick_str("creator_notes");
     Ok(CharacterRecord {
         id: row.get(0)?,
         name: row.get(1)?,
@@ -64,6 +77,9 @@ fn row_to_character(row: &rusqlite::Row, with_data_raw: bool) -> rusqlite::Resul
         alternate_greetings,
         regex_scripts,
         card_plugins: None,
+        creator,
+        character_version,
+        creator_notes,
         created_at: row.get(7)?,
     })
 }
@@ -77,18 +93,22 @@ impl CharacterService {
 
     /// 列表不含 data_raw,按 created_at DESC
     pub fn list(&self) -> Vec<CharacterRecord> {
-        let conn = self.db.conn();
-        let mut stmt = conn
+        let conn = self.db.read().expect("获取只读连接失败");
+        let mut stmt = match conn
             .prepare("SELECT id, name, chara_name, description, file_path, avatar_path, data_raw, created_at FROM characters ORDER BY created_at DESC")
-            .unwrap();
-        stmt.query_map([], |row| row_to_character(row, false))
-            .unwrap()
-            .filter_map(|r| r.ok())
-            .collect()
+        {
+            Ok(s) => s,
+            Err(e) => return log_query_failure("角色列表 prepare", e),
+        };
+        let query = stmt.query_map([], |row| row_to_character(row, false));
+        match query {
+            Ok(rows) => rows.filter_map(|r| r.ok()).collect(),
+            Err(e) => log_query_failure("角色列表 query_map", e),
+        }
     }
 
     pub fn get(&self, id: &str) -> Option<CharacterRecord> {
-        let conn = self.db.conn();
+        let conn = self.db.read().ok()?;
         conn.query_row(
             "SELECT id, name, chara_name, description, file_path, avatar_path, data_raw, created_at FROM characters WHERE id = ?1",
             params![id],
@@ -121,7 +141,7 @@ impl CharacterService {
             serde_json::to_vec_pretty(&data_raw).unwrap_or_default(),
         );
         let data_raw_str = serde_json::to_string(&data_raw).unwrap_or_else(|_| "{}".into());
-        let _ = self.db.conn().execute(
+        let _ = self.db.write().execute(
             "INSERT INTO characters (id, name, chara_name, description, file_path, avatar_path, data_raw, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 BUILTIN_SYSTEM_ID,
@@ -141,14 +161,12 @@ impl CharacterService {
     /// 从 data 子对象补全并同步 description/chara_name 列。二次运行:顶层已补全 → 无变更。
     pub fn reflatten_v3_cards(&self) {
         use crate::parsing::character_card::flatten_v3_data;
-        let conn = self.db.conn();
+        let conn = self.db.write();
         let mut ids = Vec::new();
         if let Ok(mut stmt) = conn.prepare("SELECT id FROM characters") {
             if let Ok(rows) = stmt.query_map([], |row| row.get::<_, String>(0)) {
-                for r in rows {
-                    if let Ok(id) = r {
-                        ids.push(id);
-                    }
+                for id in rows.flatten() {
+                    ids.push(id);
                 }
             }
         }
@@ -235,7 +253,7 @@ impl CharacterService {
         let data_raw = serde_json::to_string(&parsed.data).unwrap_or_else(|_| "{}".into());
         let created_at = now_iso();
 
-        let conn = self.db.conn();
+        let conn = self.db.write();
         conn.execute(
             "INSERT INTO characters (id, name, chara_name, description, file_path, avatar_path, data_raw, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
@@ -264,6 +282,18 @@ impl CharacterService {
             .filter(|s| !s.is_empty())
             .map(|s| s.to_string());
         let alternate_greetings = extract_alternate_greetings(&parsed.data);
+        // 卡元数据三件套(远程资源页口令推导用)
+        let pick_str = |key: &str| {
+            parsed
+                .data
+                .get(key)
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.trim().is_empty())
+                .map(|s| s.to_string())
+        };
+        let creator = pick_str("creator");
+        let character_version = pick_str("character_version");
+        let creator_notes = pick_str("creator_notes");
         Ok(CharacterRecord {
             id,
             name,
@@ -276,6 +306,9 @@ impl CharacterService {
             alternate_greetings,
             regex_scripts,
             card_plugins: None,
+            creator,
+            character_version,
+            creator_notes,
             created_at,
         })
     }
@@ -345,7 +378,7 @@ impl CharacterService {
         let data_raw_str = serde_json::to_string(&data_raw).unwrap_or_else(|_| "{}".into());
         // 注意:conn(MutexGuard)必须在再次调用 self.get 之前释放,避免 Mutex 重入死锁
         {
-            let conn = self.db.conn();
+            let conn = self.db.write();
             let n = conn
                 .execute(
                     "UPDATE characters SET chara_name = ?1, description = ?2, data_raw = ?3 WHERE id = ?4",
@@ -397,7 +430,7 @@ impl CharacterService {
             }
         }
         let data_raw_str = serde_json::to_string(&data_raw).unwrap_or_else(|_| "{}".into());
-        let conn = self.db.conn();
+        let conn = self.db.write();
         let n = conn
             .execute(
                 "UPDATE characters SET data_raw = ?1 WHERE id = ?2",
@@ -416,7 +449,7 @@ impl CharacterService {
         let Some(rec) = self.get(id) else {
             return false;
         };
-        let conn = self.db.conn();
+        let conn = self.db.write();
         if conn
             .execute("DELETE FROM characters WHERE id = ?1", params![id])
             .map(|n| n > 0)

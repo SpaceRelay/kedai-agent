@@ -58,9 +58,7 @@ pub(crate) fn collect_world_text_grouped_with(
     history: &[crate::models::types::MessageRecord],
     ctx: &mut crate::parsing::assistant::RenderCtx<'_>,
 ) -> WorldText {
-    use crate::parsing::assistant::{
-        apply_entry_decorators, render_assistant_content_with,
-    };
+    use crate::parsing::assistant::{apply_entry_decorators, render_assistant_content_with};
     let mut world = WorldText::default();
     if entries.is_empty() {
         return world;
@@ -106,49 +104,16 @@ pub(crate) fn collect_world_text_grouped_with(
         if window.is_empty() {
             continue;
         }
-        // 命中判定:正则优先;否则 keys + 副关键词
-        let hit = if e.use_regex {
-            match e.regex.as_deref().map(regex::Regex::new) {
-                Some(Ok(pat)) => window.iter().any(|m| pat.is_match(m)),
-                _ => false,
-            }
-        } else {
-            // (needle, 是否大小写敏感);keys + 副关键词并列命中,大小写敏感按条目设置
-            let mut needles: Vec<(String, bool)> = Vec::new();
-            for k in e.keys.iter().chain(e.keys_secondary.iter()) {
-                let t = k.trim();
-                if t.is_empty() {
-                    continue;
-                }
-                if e.case_sensitive {
-                    needles.push((t.to_string(), true));
-                } else {
-                    needles.push((t.to_lowercase(), false));
-                }
-            }
-            if needles.is_empty() {
-                false
-            } else {
-                needles.iter().any(|(needle, sensitive)| {
-                    window.iter().any(|m| {
-                        if *sensitive {
-                            m.contains(needle)
-                        } else {
-                            m.to_lowercase().contains(needle)
-                        }
-                    })
-                })
-            }
-        };
+        // 命中判定(与 generate-raw 共用 entry_matches_texts):正则优先
+        // (无独立 regex 字段时 keys 按 ST 语义当正则);否则 keys + 副关键词子串
+        let owned: Vec<String> = window.iter().map(|s| (*s).clone()).collect();
+        let hit = crate::parsing::world_book::entry_matches_texts(e, &owned);
         if !hit {
             continue;
         }
         // 概率:use_probability 时按 probability% 随机决定(0 永不注入,100 恒注入)
-        if e.use_probability {
-            let roll = simple_roll();
-            if e.probability <= 0 || roll >= e.probability {
-                continue;
-            }
+        if !crate::parsing::world_book::entry_probability_pass(e, simple_roll()) {
+            continue;
         }
         if !e.content.trim().is_empty() {
             let rendered = render_assistant_content_with(&e.content, ctx);
@@ -464,6 +429,41 @@ mod tests {
         // depth=0 = 全部历史,命中
         e.depth = 0;
         assert!(collect_world_text(&[e], &history, &mut AssistantVars::new()).is_some());
+    }
+
+    /// 回归:角色卡把 depth 写在 extensions 内时,扫描窗口须按该值生效。
+    /// 赛马娘卡的【开局】/【怪奇IF】条目作者设定 depth=2,而首楼界面替换后选项文案
+    /// 会继续留在历史里;旧实现把 depth 当缺省 4,使这些条目超出作者窗口后仍命中,
+    /// 污染提示词(实测:4 条消息窗口下误注入)。
+    #[test]
+    fn extensions_depth_limits_scan_window() {
+        let raw = serde_json::json!({ "entries": [
+            { "uid": 1, "comment": "【开局】野史大学习", "keys": ["野史大学习"],
+              "content": "开局正文", "constant": false, "disable": false,
+              "extensions": { "depth": 2 } }
+        ] });
+        let entries = crate::parsing::world_book::collect_entries(&raw);
+        assert_eq!(entries[0].depth, 2, "extensions.depth 应被解析");
+
+        // 关键词只在第 1 条,其后 3 条无关 → 共 4 条用户消息
+        let history = vec![
+            message("user", "【开场场景】野史大学习"),
+            message("user", "无关消息一"),
+            message("user", "无关消息二"),
+            message("user", "无关消息三"),
+        ];
+        // depth=2 只扫最近 2 条,关键词落在窗口外 → 不命中(旧实现 depth=4 会误命中)
+        assert!(
+            collect_world_text(&entries, &history, &mut AssistantVars::new()).is_none(),
+            "extensions.depth=2 不应扫到 4 条窗口外的关键词"
+        );
+        // 关键词回到窗口内(最后一条)则命中
+        let near = vec![
+            message("user", "无关消息一"),
+            message("user", "无关消息二"),
+            message("user", "【开场场景】野史大学习"),
+        ];
+        assert!(collect_world_text(&entries, &near, &mut AssistantVars::new()).is_some());
     }
 
     /// 副关键词(keysecondary)与主关键词并列命中

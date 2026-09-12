@@ -40,7 +40,7 @@ impl UserScriptService {
     }
 
     fn get_global(&self, owner_id: &str) -> Result<Value, String> {
-        let conn = self.db.conn();
+        let conn = self.db.read()?;
         let raw: Option<String> = conn
             .query_row(
                 "SELECT data_json FROM user_scripts WHERE scope = 'global' AND owner_id = ?1",
@@ -50,9 +50,7 @@ impl UserScriptService {
             .optional()
             .map_err(|e| format!("读取全局脚本失败: {e}"))?;
         match raw {
-            Some(raw) => {
-                serde_json::from_str(&raw).map_err(|e| format!("解析全局脚本失败: {e}"))
-            }
+            Some(raw) => serde_json::from_str(&raw).map_err(|e| format!("解析全局脚本失败: {e}")),
             None => Ok(Value::Array(Vec::new())),
         }
     }
@@ -60,7 +58,7 @@ impl UserScriptService {
     fn save_global(&self, owner_id: &str, trees: &Value) -> Result<(), String> {
         let raw = serde_json::to_string(trees).map_err(|e| format!("序列化脚本失败: {e}"))?;
         let now = now_iso();
-        let conn = self.db.conn();
+        let conn = self.db.write();
         conn.execute(
             "INSERT INTO user_scripts (id, scope, owner_id, data_json, updated_at)
              VALUES (?1, 'global', ?2, ?3, ?4)
@@ -72,7 +70,7 @@ impl UserScriptService {
     }
 
     fn read_character_raw(&self, character_id: &str) -> Result<Value, String> {
-        let conn = self.db.conn();
+        let conn = self.db.read()?;
         let raw: Option<String> = conn
             .query_row(
                 "SELECT data_raw FROM characters WHERE id = ?1",
@@ -86,11 +84,10 @@ impl UserScriptService {
     }
 
     fn write_character_raw(&self, character_id: &str, raw: &Value) -> Result<(), String> {
-        let raw_str =
-            serde_json::to_string(raw).map_err(|e| format!("序列化角色卡失败: {e}"))?;
+        let raw_str = serde_json::to_string(raw).map_err(|e| format!("序列化角色卡失败: {e}"))?;
         // conn 作用域收窄:UPDATE 语句执行后立即释放锁(与 quick_reply_service 一致)
         {
-            let conn = self.db.conn();
+            let conn = self.db.write();
             conn.execute(
                 "UPDATE characters SET data_raw = ?1 WHERE id = ?2",
                 params![raw_str, character_id],
@@ -182,7 +179,9 @@ fn migrate_legacy_scripts(raw: &mut Value) -> bool {
     }
     let arr = merged.as_array_mut().expect("刚设为数组");
     for node in legacy {
-        let Some(obj) = node.as_object() else { continue };
+        let Some(obj) = node.as_object() else {
+            continue;
+        };
         let mut n = obj.clone();
         if n.get("type").is_none() {
             n.insert(
@@ -197,10 +196,7 @@ fn migrate_legacy_scripts(raw: &mut Value) -> bool {
         arr.push(Value::Object(n));
     }
     write_tavern_helper(raw, &merged);
-    if let Some(ext) = raw
-        .get_mut("extensions")
-        .and_then(|e| e.as_object_mut())
-    {
+    if let Some(ext) = raw.get_mut("extensions").and_then(|e| e.as_object_mut()) {
         ext.remove("TavernHelper_scripts");
     }
     true
@@ -225,7 +221,9 @@ fn ensure_defaults(trees: &Value) -> Value {
     let mut out = trees.clone();
     if let Some(arr) = out.as_array_mut() {
         for node in arr.iter_mut() {
-            let Some(obj) = node.as_object_mut() else { continue };
+            let Some(obj) = node.as_object_mut() else {
+                continue;
+            };
             match obj.get("type").and_then(|t| t.as_str()) {
                 Some("script") => {
                     obj.entry("enabled").or_insert(json!(true));
@@ -304,7 +302,10 @@ mod tests {
     fn write_v3_creates_data_extensions() {
         let mut card = json!({ "name": "x" });
         write_tavern_helper(&mut card, &json!([{ "type": "script" }]));
-        assert_eq!(card["data"]["extensions"]["tavern_helper"], json!([{ "type": "script" }]));
+        assert_eq!(
+            card["data"]["extensions"]["tavern_helper"],
+            json!([{ "type": "script" }])
+        );
     }
 
     #[test]

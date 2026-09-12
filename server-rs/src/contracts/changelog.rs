@@ -289,13 +289,7 @@ mod tests {
         let before = json!({ "心之所向": { "好感度": 0 } });
         let after = json!({ "心之所向": { "好感度": 150 } });
         let applied = vec![PatchOp::replace("心之所向.好感度", json!(150))];
-        let entries = entries_from_applied(
-            &before,
-            &after,
-            3,
-            &applied,
-            ChangelogSource::Agent,
-        );
+        let entries = entries_from_applied(&before, &after, 3, &applied, ChangelogSource::Agent);
         assert_eq!(entries.len(), 1);
         let e = &entries[0];
         assert_eq!(e.seq, 0, "seq 由 commit 串行器回填,生成时置 0");
@@ -331,13 +325,7 @@ mod tests {
                 rationale: None,
             },
         ];
-        let entries = entries_from_applied(
-            &before,
-            &after,
-            1,
-            &applied,
-            ChangelogSource::Agent,
-        );
+        let entries = entries_from_applied(&before, &after, 1, &applied, ChangelogSource::Agent);
         assert_eq!(entries.len(), 2);
         // add:old 取不到 → Null;置信度/理由透传
         assert_eq!(entries[0].old, Value::Null);
@@ -353,13 +341,7 @@ mod tests {
     #[test]
     fn entries_from_applied_empty() {
         let tree = json!({ "a": 1 });
-        let entries = entries_from_applied(
-            &tree,
-            &tree,
-            7,
-            &[],
-            ChangelogSource::Agent,
-        );
+        let entries = entries_from_applied(&tree, &tree, 7, &[], ChangelogSource::Agent);
         assert!(entries.is_empty());
     }
 }

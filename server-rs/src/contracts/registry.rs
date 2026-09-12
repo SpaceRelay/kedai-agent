@@ -22,10 +22,7 @@ pub struct ContractRegistry {
 }
 
 impl ContractRegistry {
-    pub fn new(
-        characters: Arc<CharacterService>,
-        world_books: Arc<WorldBookService>,
-    ) -> Self {
+    pub fn new(characters: Arc<CharacterService>, world_books: Arc<WorldBookService>) -> Self {
         ContractRegistry {
             characters,
             world_books,
@@ -74,10 +71,7 @@ impl ContractRegistry {
 
     /// 清空全部(全局世界书变更会影响所有角色的契约来源,无法定位单条)。
     pub fn clear(&self) {
-        self.cache
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clear();
+        self.cache.lock().unwrap_or_else(|e| e.into_inner()).clear();
     }
 }
 
@@ -88,7 +82,12 @@ mod tests {
     use serde_json::json;
     use std::path::PathBuf;
 
-    fn services() -> (Arc<Db>, Arc<CharacterService>, Arc<WorldBookService>, PathBuf) {
+    fn services() -> (
+        Arc<Db>,
+        Arc<CharacterService>,
+        Arc<WorldBookService>,
+        PathBuf,
+    ) {
         let dir = std::env::temp_dir().join(format!("kedai-reg-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let db = Arc::new(Db::open(&dir.join("t.db"), &dir).unwrap());
@@ -110,10 +109,9 @@ mod tests {
 
     /// 直接插入/更新带契约的角色卡(经测试自持 Db 句柄,不动生产代码)。
     fn upsert_character(db: &Db, id: &str, contract: Option<&str>) {
-        let conn = db.conn();
-        let extensions = contract.map(|c| {
-            json!({ "nlkaleido": serde_json::from_str::<serde_json::Value>(c).unwrap() })
-        });
+        let conn = db.write();
+        let extensions = contract
+            .map(|c| json!({ "nlkaleido": serde_json::from_str::<serde_json::Value>(c).unwrap() }));
         let data_raw = json!({ "name": "测试角色", "extensions": extensions });
         conn.execute(
             "INSERT INTO characters (id, name, chara_name, description, file_path, data_raw, created_at) \

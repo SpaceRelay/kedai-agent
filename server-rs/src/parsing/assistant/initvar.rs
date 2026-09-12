@@ -10,6 +10,14 @@ use super::vars::{path_set, split_path, AssistantVars};
 
 // ===================== [InitVar] 初始变量 =====================
 
+/// [InitVar] 条目判定(大小写不敏感,兼容 [InitialVariables] 别名)。
+/// 社区卡标签大小写随意(如碧蓝卡 `[initvar]变量初始化` 全小写),
+/// init-vars 端点与引擎收集必须走同一谓词,否则前端与提示词两侧变量源分叉。
+pub fn is_init_var_comment(comment: &str) -> bool {
+    let upper = comment.to_uppercase();
+    upper.contains("[INITVAR]") || upper.contains("[INITIALVARIABLES]")
+}
+
 /// 从世界书条目(角色卡内嵌 + 独立世界书)收集 [InitVar] 初始变量。
 /// 与前端 initvar.ts 约定一致:只看 comment 含 [InitVar] 的条目(不要求 enabled),
 /// 条目内容支持 _.set(...) 语句 / 整体 JSON / YAML 风格缩进;按条目顺序深度合并。
@@ -17,10 +25,7 @@ use super::vars::{path_set, split_path, AssistantVars};
 pub fn collect_init_vars(entries: &[WorldEntry]) -> AssistantVars {
     let mut tree = json!({});
     for e in entries {
-        let comment_upper = e.comment.to_uppercase();
-        let is_init_tag = comment_upper.contains("[INITVAR]")
-            || comment_upper.contains("[INITIALVARIABLES]");
-        if !is_init_tag || e.content.trim().is_empty() {
+        if !is_init_var_comment(&e.comment) || e.content.trim().is_empty() {
             continue;
         }
         if let Some(p) = parse_init_var_content(&e.content) {
@@ -128,6 +133,14 @@ fn parse_yaml_scalar(raw: &str) -> Value {
     let t = raw.trim();
     if (t.starts_with('"') && t.ends_with('"')) || (t.starts_with('\'') && t.ends_with('\'')) {
         return Value::String(t[1..t.len() - 1].to_string());
+    }
+    // 空容器标量(与前端 variables.ts parseYamlScalar 对齐):
+    // initvar 常见 `shipgirls: {}` 形态,解析成字符串会污染变量树
+    if t == "{}" {
+        return json!({});
+    }
+    if t == "[]" {
+        return json!([]);
     }
     if t == "true" {
         return json!(true);

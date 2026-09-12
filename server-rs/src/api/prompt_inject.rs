@@ -15,7 +15,12 @@ use std::sync::Arc;
 
 /// GET /api/prompt-inject:返回当前注入配置(简单模式 + 楼层列表)
 pub async fn get_prompt_inject(State(state): State<Arc<AppState>>) -> Response {
-    let cfg = state.prompt_inject.lock().unwrap_or_else(|e| e.into_inner()).get().clone();
+    let cfg = state
+        .prompt_inject
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get()
+        .clone();
     Json(json!({ "ok": true, "config": cfg })).into_response()
 }
 
@@ -30,13 +35,17 @@ pub async fn update_prompt_inject(
     State(state): State<Arc<AppState>>,
     Json(body): Json<UpdatePromptInjectBody>,
 ) -> Response {
-    let mut svc = state.prompt_inject.lock().unwrap_or_else(|e| e.into_inner());
-    match svc.set(body.config) {
-        Ok(()) => {
-            let cfg = svc.get().clone();
-            Json(json!({ "ok": true, "config": cfg })).into_response()
-        }
-        Err(e) => Json(json!({ "error": format!("保存失败: {e}") }))
+    // B-1:set 内含同步 JSON 落盘,持锁 + 写文件整体挪阻塞线程池
+    let svc = state.prompt_inject.clone();
+    let result = state
+        .db_call(move || {
+            let mut svc = svc.lock().unwrap_or_else(|e| e.into_inner());
+            svc.set(body.config).map(|()| svc.get().clone())
+        })
+        .await;
+    match result {
+        Ok(Ok(cfg)) => Json(json!({ "ok": true, "config": cfg })).into_response(),
+        Ok(Err(e)) | Err(e) => Json(json!({ "error": format!("保存失败: {e}") }))
             .into_response()
             .with_status(StatusCode::INTERNAL_SERVER_ERROR),
     }
@@ -92,33 +101,39 @@ pub async fn import(
         .map(|p| String::from_utf8_lossy(&p.content).trim().to_lowercase())
         .unwrap_or_else(|| "replace".to_string());
 
-    let mut svc = state.prompt_inject.lock().unwrap_or_else(|e| e.into_inner());
-    let mut cfg = svc.get().clone();
-    if mode == "append" {
-        // 追加:order 接续现有楼层;id 冲突时自动改名
-        let base = cfg.floors.len();
-        let mut used: std::collections::HashSet<String> =
-            cfg.floors.iter().map(|f| f.id.clone()).collect();
-        for (i, mut f) in floors.into_iter().enumerate() {
-            if used.contains(&f.id) {
-                f.id = format!("{}-import{}", f.id, i);
+    // B-1:set 内含同步 JSON 落盘;楼层合并、持锁、写文件整体挪阻塞线程池
+    let svc = state.prompt_inject.clone();
+    let result = state
+        .db_call(move || {
+            let mut svc = svc.lock().unwrap_or_else(|e| e.into_inner());
+            let mut cfg = svc.get().clone();
+            if mode == "append" {
+                // 追加:order 接续现有楼层;id 冲突时自动改名
+                let base = cfg.floors.len();
+                let mut used: std::collections::HashSet<String> =
+                    cfg.floors.iter().map(|f| f.id.clone()).collect();
+                for (i, mut f) in floors.into_iter().enumerate() {
+                    if used.contains(&f.id) {
+                        f.id = format!("{}-import{}", f.id, i);
+                    }
+                    used.insert(f.id.clone());
+                    f.order = base + i;
+                    cfg.floors.push(f);
+                }
+            } else {
+                // 替换(默认):清空现有楼层,写入预设条目
+                cfg.floors = floors;
             }
-            used.insert(f.id.clone());
-            f.order = base + i;
-            cfg.floors.push(f);
-        }
-    } else {
-        // 替换(默认):清空现有楼层,写入预设条目
-        cfg.floors = floors;
-    }
-    cfg.mode = crate::services::prompt_inject_service::InjectMode::Complex;
-    let imported = cfg.floors.len();
-    match svc.set(cfg) {
-        Ok(()) => {
-            let config = svc.get().clone();
+            cfg.mode = crate::services::prompt_inject_service::InjectMode::Complex;
+            let imported = cfg.floors.len();
+            svc.set(cfg).map(|()| (imported, svc.get().clone()))
+        })
+        .await;
+    match result {
+        Ok(Ok((imported, config))) => {
             Json(json!({ "ok": true, "imported": imported, "config": config })).into_response()
         }
-        Err(e) => Json(json!({ "error": format!("导入失败: {e}") }))
+        Ok(Err(e)) | Err(e) => Json(json!({ "error": format!("导入失败: {e}") }))
             .into_response()
             .with_status(StatusCode::INTERNAL_SERVER_ERROR),
     }

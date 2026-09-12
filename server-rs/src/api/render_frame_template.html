@@ -20,6 +20,19 @@
 let booted = false;
 const bootNonce = decodeURIComponent(location.hash.slice(1));
 location.hash = '';
+// 高度自适应兜底(实跑问题 5):面板脚本未主动上报 kd-panel-resize 时(多数角色卡
+// 状态栏都不上报),宿主 iframe 保持固定 420px,高于它的内容被 overflow:hidden 裁掉,
+// 表现为「状态栏文案显示不全」。这里在注入完成后测量实际高度并上报;ResizeObserver
+// 覆盖图片/字体加载后的二次撑高,另加两次定时测量兜底(无 ResizeObserver 的环境)。
+function reportHeight() {
+  try {
+    const h = Math.max(
+      document.documentElement ? document.documentElement.scrollHeight : 0,
+      document.body ? document.body.scrollHeight : 0,
+    );
+    if (h > 0) parent.postMessage({ channel: 'kedai-render-panel-v1', nonce: bootNonce, type: 'kd-panel-resize', height: h }, '*');
+  } catch (_e) { /* 忽略:高度上报失败不影响面板内容 */ }
+}
 addEventListener('message', function (event) {
   const m = event.data;
   if (event.source !== parent) return;
@@ -36,6 +49,14 @@ addEventListener('message', function (event) {
     const child = doc.body.childNodes[i];
     if (child.nodeType === 1) body.appendChild(document.importNode(child, true));
     else if (child.nodeType === 3 && child.textContent.trim()) body.appendChild(child.cloneNode(true));
+  }
+  // 注入后测量:同步一次 + 下一帧 + 定时兜底(脚本同步/异步撑高都要覆盖)
+  reportHeight();
+  if (typeof requestAnimationFrame === 'function') requestAnimationFrame(reportHeight);
+  setTimeout(reportHeight, 120);
+  setTimeout(reportHeight, 600);
+  if (typeof ResizeObserver === 'function') {
+    try { new ResizeObserver(reportHeight).observe(document.body); } catch (_e) { /* 忽略 */ }
   }
 });
 parent.postMessage({ channel: 'kedai-render-panel-v1', nonce: bootNonce, type: 'ready' }, '*');

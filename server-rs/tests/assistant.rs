@@ -959,7 +959,13 @@ async fn ejs_context_reads_world_quickreply_history_and_injects() {
     .await;
     assert_eq!(s2, StatusCode::OK, "更新失败: {upd}");
     assert_eq!(upd["quick_reply"]["enabled"], json!(false));
-    let (s3, _) = send_json(app, "DELETE", &format!("/api/quick-replies/{qr_id}"), json!({})).await;
+    let (s3, _) = send_json(
+        app,
+        "DELETE",
+        &format!("/api/quick-replies/{qr_id}"),
+        json!({}),
+    )
+    .await;
     assert_eq!(s3, StatusCode::NO_CONTENT, "删除应 204");
     // 删除后列表为空
     let (s4, list) = send_json(app, "GET", "/api/quick-replies?all=true", json!({})).await;

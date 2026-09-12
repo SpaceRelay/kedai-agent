@@ -2,9 +2,7 @@
 // EJS 模板渲染 + {{format_message_variable}} / {{get_message_variable}} 宏展开 +
 // <StatusPlaceHolderImpl/> 全树格式化替换 + <status_current_variable> 段标签剥离;
 // 宏层值转换(infer_value/value_to_display)供 parsing/macros.rs 使用。
-use serde_json::{json, Value};
-
-use crate::utils::logger;
+use serde_json::Value;
 
 use super::ejs;
 use super::vars::{format_scalar, AssistantVars};
@@ -33,10 +31,7 @@ pub fn render_assistant_content(text: &str, vars: &mut AssistantVars) -> String 
 pub fn render_assistant_content_with(text: &str, ctx: &mut RenderCtx<'_>) -> String {
     let (mut out, errors) = ejs::render_template_with_ctx(text, ctx, &[]);
     for e in &errors {
-        logger::warn(
-            "酒馆助手 EJS 渲染跳过部分内容",
-            &[("error", Value::String(e.clone()))],
-        );
+        tracing::warn!(error = e.clone(), "酒馆助手 EJS 渲染跳过部分内容");
     }
     // 容错降级:渲染出错且输出为空时,回退保留原文。
     // 酒馆助手角色卡(如 WuWa MVU 版)常使用词法/语法超出本解释器子集的 EJS 片段
@@ -44,9 +39,9 @@ pub fn render_assistant_content_with(text: &str, ctx: &mut RenderCtx<'_>) -> Str
     // 即使条目大部分是纯文本设定也会一并丢失。此处保证出错时内容不丢;
     // 正常渲染(含条件分支未命中输出为空、无错误)不受影响,语义保持不变。
     if !errors.is_empty() && out.is_empty() && !text.trim().is_empty() {
-        logger::warn(
-            "酒馆助手 EJS 渲染失败,已回退保留原文(内容不丢失)",
-            &[("text_len", json!(text.len()))],
+        tracing::warn!(
+            text_len = text.len(),
+            "酒馆助手 EJS 渲染失败,已回退保留原文(内容不丢失)"
         );
         out = text.to_string();
     }
@@ -62,10 +57,11 @@ pub fn render_assistant_content_with(text: &str, ctx: &mut RenderCtx<'_>) -> Str
 
 /// {{format_message_variable::path}} / {{get_message_variable::path}} 宏展开(大小写不敏感;path 可省略)
 fn expand_format_message_variable(text: &str, vars: &AssistantVars) -> String {
+    // 正则为写死字面量,编译必然成功
     let re = regex::Regex::new(
         r"(?i)\{\{\s*(?:format_message_variable|get_message_variable)\s*::\s*([^}]*?)\s*\}\}",
     )
-    .unwrap();
+    .expect("format_message_variable 宏正则为常量,编译必然成功");
     re.replace_all(text, |caps: &regex::Captures| {
         let p = caps
             .get(1)
@@ -78,7 +74,9 @@ fn expand_format_message_variable(text: &str, vars: &AssistantVars) -> String {
 
 /// 剥离 <status_current_variable> 起止标签(大小写不敏感;内部内容保留)
 fn strip_status_current_variable(text: &str) -> String {
-    let re = regex::Regex::new(r"(?i)</?\s*status_current_variable\s*>").unwrap();
+    // 正则为写死字面量,编译必然成功
+    let re = regex::Regex::new(r"(?i)</?\s*status_current_variable\s*>")
+        .expect("status_current_variable 剥离正则为常量,编译必然成功");
     re.replace_all(text, "").to_string()
 }
 

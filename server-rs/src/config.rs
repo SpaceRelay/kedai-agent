@@ -1,4 +1,5 @@
 // 配置加载:环境变量 + .env,与 Node 版语义一致
+use rusqlite::{Connection, OpenFlags};
 use std::env;
 use std::path::{Path, PathBuf};
 
@@ -65,22 +66,61 @@ fn project_root() -> PathBuf {
     env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
 }
 
+/// 用户级统一数据目录(2026-09 修复双库分叉):
+/// Windows 上为 %APPDATA%\com.kedai.app\data(与 Tauri 桌面版同一目录,见 src-tauri/lib.rs)。
+/// 仅当该目录已含用户数据时才返回 Some——空壳目录(曾启动过一次但没真正用过)不抢占。
+/// 非 Windows 或无用户数据时返回 None,回退项目根 data/。
+fn canonical_user_data_dir() -> Option<PathBuf> {
+    let appdata = env::var_os("APPDATA").filter(|v| !v.is_empty())?;
+    let dir = PathBuf::from(appdata).join("com.kedai.app").join("data");
+    if dir_has_user_data(&dir) {
+        Some(dir)
+    } else {
+        None
+    }
+}
+
+/// 「已有用户数据」判据:settings.json 存在(存过设置即生成),或 kedai.db 里有
+/// 非内置角色 / 任何会话(排除桌面版首启自动建库留下的空壳)。
+fn dir_has_user_data(dir: &Path) -> bool {
+    if dir.join("settings.json").is_file() {
+        return true;
+    }
+    let db = dir.join("kedai.db");
+    if !db.is_file() {
+        return false;
+    }
+    let Ok(conn) = Connection::open_with_flags(&db, OpenFlags::SQLITE_OPEN_READ_ONLY) else {
+        return false;
+    };
+    let has = |sql: &str| -> bool {
+        conn.query_row(sql, [], |row| row.get::<_, bool>(0))
+            .unwrap_or(false)
+    };
+    // 表可能尚不存在(全新库):查询失败按 false 处理
+    has("SELECT EXISTS(SELECT 1 FROM characters WHERE id <> 'builtin-system')")
+        || has("SELECT EXISTS(SELECT 1 FROM sessions)")
+}
+
 impl AppConfig {
     pub fn from_env() -> Self {
         let _ = dotenvy::dotenv(); // 向上搜索 .env(默认从 cwd 开始)
 
         let root = project_root();
+        // 数据目录解析顺序(2026-09 统一):DATA_DIR 环境变量 > 用户级统一目录
+        // (%APPDATA%\com.kedai.app\data,已有用户数据时) > 项目根 data/。
+        // 背景:桌面版(Tauri)强制 %APPDATA%,而直接跑 kedai-server.exe / start.ps1 曾用
+        // 项目目录,两套库并行分叉——一边写的聊天记录另一边不可见(「重进后记录丢失」主因)。
         let data_dir = match env_str("DATA_DIR") {
             Some(d) => absolutize(Path::new(&d), &root),
-            None => root.join("data"),
+            None => canonical_user_data_dir().unwrap_or_else(|| root.join("data")),
         };
         // LOG_DIR 支持环境变量(Tauri 桌面场景注入,避免写入不可写的安装目录);缺省与 data 同级
         let log_dir = match env_str("LOG_DIR") {
             Some(d) => absolutize(Path::new(&d), &root),
             None => root.join("logs"),
         };
-        let web_dist = env_str("KEDAI_WEB_DIST")
-            .map(|d| absolutize(Path::new(&d), &root));
+        let web_dist = env_str("KEDAI_WEB_DIST").map(|d| absolutize(Path::new(&d), &root));
 
         let base_url =
             env_str("OPENAI_BASE_URL").unwrap_or_else(|| "https://api.openai.com/v1".to_string());

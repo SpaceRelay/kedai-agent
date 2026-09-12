@@ -304,13 +304,15 @@ fn normalize_entry(v: &Value) -> Option<WorldEntry> {
         .unwrap_or("")
         .to_string();
     let constant = v.get("constant").and_then(|c| c.as_bool()).unwrap_or(false);
-    // 正则:regex 字符串 + use_regex(兼容 useRegex);正则无效时视为不使用正则匹配
+    // 正则:regex 字符串 + use_regex(兼容 useRegex)。
+    // ST 语义:use_regex=true 时 keys/keys_secondary 本身就是正则模式列表
+    // (角色卡条目常无独立 regex 字段,如板板鸭卡全条目 use_regex=true + keys 触发词);
+    // 独立 regex 字段优先,缺失时命中阶段把 keys 当正则编译,全无效才判不命中。
     let use_regex = v
         .get("use_regex")
         .or_else(|| v.get("useRegex"))
         .and_then(|u| u.as_bool())
-        .unwrap_or(false)
-        && regex.is_some();
+        .unwrap_or(false);
     // enabled 字段优先;其次 disable(ST 导出用 disable 表示停用);缺省视为启用
     let enabled = match v.get("enabled") {
         Some(e) => e.as_bool().unwrap_or(true),
@@ -323,9 +325,11 @@ fn normalize_entry(v: &Value) -> Option<WorldEntry> {
     let keys_secondary = read_field_list(v, &["keysecondary", "secondary_keys"]);
     // 位置:数字 0-4,或 ST 导出字符串 before_char/1/2/3/after_char
     let position = read_position(v);
-    // 扫描深度(ST depth;数字)
+    // 扫描深度(ST depth;数字)。角色卡导出常把 depth 放在 extensions 内
+    // (与 probability 同一形态,见下方),顶层优先、extensions 兜底。
     let depth = v
         .get("depth")
+        .or_else(|| v.get("extensions").and_then(|e| e.get("depth")))
         .and_then(|d| d.as_i64())
         .unwrap_or(default_depth());
     // 注入顺序:order(ST) / insertion_order(originalData);缺省 100
@@ -356,11 +360,7 @@ fn normalize_entry(v: &Value) -> Option<WorldEntry> {
         .and_then(|u| u.as_bool())
         .unwrap_or(false);
     // 注入角色(system / user / assistant;缺省 None = 按位置语义决定)
-    let role = v
-        .get("role")
-        .and_then(|r| r.as_str())
-        .map(|s| s.trim().to_string())
-        .filter(|s| s == "system" || s == "user" || s == "assistant");
+    let role = read_role(v);
     Some(WorldEntry {
         id,
         comment,
@@ -403,6 +403,28 @@ fn read_position(v: &Value) -> i64 {
     0
 }
 
+/// 读取注入角色:接受字符串 system/user/assistant,或 ST 数字 0/1/2
+/// (0=system, 1=user, 2=assistant)。角色卡导出常把 role 放在 extensions 内,
+/// 故顶层 role 优先、extensions.role 兜底;无法识别时返回 None(按位置语义取缺省角色)。
+fn read_role(v: &Value) -> Option<String> {
+    let raw = v
+        .get("role")
+        .or_else(|| v.get("extensions").and_then(|e| e.get("role")))?;
+    if let Some(s) = raw.as_str() {
+        let t = s.trim();
+        return match t {
+            "system" | "user" | "assistant" => Some(t.to_string()),
+            _ => None,
+        };
+    }
+    match raw.as_i64() {
+        Some(0) => Some("system".to_string()),
+        Some(1) => Some("user".to_string()),
+        Some(2) => Some("assistant".to_string()),
+        _ => None,
+    }
+}
+
 /// 读取字符串/数组字段(keysecondary / secondary_keys 等)
 fn read_field_list(v: &Value, fields: &[&str]) -> Vec<String> {
     for field in fields {
@@ -426,6 +448,74 @@ fn read_field_list(v: &Value, fields: &[&str]) -> Vec<String> {
         }
     }
     Vec::new()
+}
+
+/// 条目内容匹配判定(主引擎与 generate-raw 共用):
+/// 在扫描窗口 texts(已按条目 depth 截取)内任一文本命中即 true。
+/// - use_regex=true:独立 regex 字段优先;否则按 ST 语义把 keys/keys_secondary 当正则逐个编译,
+///   编译失败的模式跳过(不拖垮整条目);case_sensitive=false 时大小写不敏感
+/// - use_regex=false:keys + 副关键词子串命中,大小写敏感按条目设置
+pub fn entry_matches_texts(e: &WorldEntry, texts: &[String]) -> bool {
+    if texts.is_empty() {
+        return false;
+    }
+    if e.use_regex {
+        let mut patterns: Vec<&str> = Vec::new();
+        if let Some(r) = e.regex.as_deref() {
+            if !r.is_empty() {
+                patterns.push(r);
+            }
+        }
+        // ST 语义:无独立 regex 字段时 keys 即正则模式(吸血鬼卡 system log 条目等)
+        if patterns.is_empty() {
+            for k in e.keys.iter().chain(e.keys_secondary.iter()) {
+                let t = k.trim();
+                if !t.is_empty() {
+                    patterns.push(t);
+                }
+            }
+        }
+        return patterns.iter().any(|pat| {
+            regex::RegexBuilder::new(pat)
+                .case_insensitive(!e.case_sensitive)
+                .build()
+                .map(|re| texts.iter().any(|m| re.is_match(m)))
+                .unwrap_or(false)
+        });
+    }
+    // (needle, 是否大小写敏感);keys + 副关键词并列命中,大小写敏感按条目设置
+    let mut needles: Vec<(String, bool)> = Vec::new();
+    for k in e.keys.iter().chain(e.keys_secondary.iter()) {
+        let t = k.trim();
+        if t.is_empty() {
+            continue;
+        }
+        if e.case_sensitive {
+            needles.push((t.to_string(), true));
+        } else {
+            needles.push((t.to_lowercase(), false));
+        }
+    }
+    if needles.is_empty() {
+        return false;
+    }
+    needles.iter().any(|(needle, sensitive)| {
+        texts.iter().any(|m| {
+            if *sensitive {
+                m.contains(needle)
+            } else {
+                m.to_lowercase().contains(needle)
+            }
+        })
+    })
+}
+
+/// 命中后的概率闸(use_probability + probability%;0 永不过,100 恒过)
+pub fn entry_probability_pass(e: &WorldEntry, roll: i64) -> bool {
+    if !e.use_probability {
+        return true;
+    }
+    e.probability > 0 && roll < e.probability
 }
 
 /// WorldEntry → 编辑视图(含 position/depth/order 等,供前端展示/编辑)
@@ -748,8 +838,51 @@ mod tests {
         );
         // 大小写敏感 null → false
         assert!(!e.case_sensitive);
-        // use_regex=true 但无 regex 字段 → 视为未启用正则
-        assert!(!e.use_regex);
+        // use_regex=true 无独立 regex 字段 → 保留声明值,命中阶段 keys 按 ST 语义当正则
+        assert!(e.use_regex);
+    }
+
+    /// ST 语义:use_regex=true 且无独立 regex 字段时,keys 作为正则模式匹配
+    /// (吸血鬼板板鸭卡:全条目 use_regex=true + keys=["system log"] 触发格式规范注入)
+    #[test]
+    fn keys_act_as_regex_when_use_regex_without_regex_field() {
+        let raw = json!({
+            "entries": [
+                { "comment": "格式规范", "keys": ["system log"], "use_regex": true, "content": "<response_format_guidance>输出 JSON</response_format_guidance>", "constant": false }
+            ]
+        });
+        let entries = collect_entries(&raw);
+        assert_eq!(entries.len(), 1);
+        let e = &entries[0];
+        assert!(e.use_regex);
+        assert!(e.regex.is_none());
+        // keys 按正则命中(大小写不敏感:缺省 case_sensitive=false)
+        assert!(entry_matches_texts(
+            e,
+            &["/* system log(IGNORE the line): continue */".to_string()]
+        ));
+        assert!(entry_matches_texts(
+            e,
+            &["前缀 SYSTEM LOG 后缀".to_string()]
+        ));
+        assert!(!entry_matches_texts(e, &["普通对话没有触发词".to_string()]));
+        // 正则语法生效(通配符)
+        let raw2 = json!({
+            "entries": [
+                { "comment": "正则键", "keys": ["sys(tem)?\\s+log"], "use_regex": true, "content": "x", "constant": false }
+            ]
+        });
+        let e2 = &collect_entries(&raw2)[0];
+        assert!(entry_matches_texts(e2, &["system  log".to_string()]));
+        assert!(entry_matches_texts(e2, &["sys log".to_string()]));
+        // 无效正则模式:该模式跳过,不拖垮其他模式
+        let raw3 = json!({
+            "entries": [
+                { "comment": "混合", "keys": ["([", "hit-me"], "use_regex": true, "content": "x", "constant": false }
+            ]
+        });
+        let e3 = &collect_entries(&raw3)[0];
+        assert!(entry_matches_texts(e3, &["hit-me".to_string()]));
     }
 
     /// 顶层导出格式:depth/order/case_sensitive/sticky/cooldown/probability 全部解析
@@ -771,6 +904,61 @@ mod tests {
         assert_eq!(e.probability, 80);
         assert!(e.use_probability);
         assert_eq!(e.position, 1);
+    }
+
+    /// 角色卡导出格式:depth/role 常落在 extensions 内(顶层无同名字段)。
+    /// 回归:赛马娘卡 95 条条目全部把 depth 放在 extensions,旧实现一律取缺省 4,
+    /// 导致 depth=1/2 的剧情条目被放宽到 4 条窗口误命中。
+    #[test]
+    fn parses_depth_and_role_from_extensions() {
+        let raw = json!({
+            "entries": [
+                { "uid": 7, "comment": "ext 深度", "keys": ["关键"], "content": "内容",
+                  "constant": false, "extensions": { "depth": 2, "role": 1 } },
+                { "uid": 8, "comment": "ext 深度 0", "keys": ["关键"], "content": "内容",
+                  "constant": false, "extensions": { "depth": 0 } },
+                { "uid": 9, "comment": "无 depth", "keys": ["关键"], "content": "内容",
+                  "constant": false }
+            ]
+        });
+        let entries = collect_entries(&raw);
+        assert_eq!(entries[0].depth, 2, "extensions.depth 生效");
+        assert_eq!(entries[0].role.as_deref(), Some("user"), "extensions.role 数字 1 → user");
+        assert_eq!(entries[1].depth, 0, "extensions.depth=0(全部历史)保留");
+        assert_eq!(entries[2].depth, 4, "两者都缺省回退 4");
+    }
+
+    /// 顶层字段优先于 extensions(同一份导出两种形态并存时的优先级)
+    #[test]
+    fn top_level_depth_and_role_win_over_extensions() {
+        let raw = json!({
+            "entries": [
+                { "uid": 1, "comment": "双写", "keys": ["关键"], "content": "内容",
+                  "constant": false, "depth": 5, "role": "assistant",
+                  "extensions": { "depth": 2, "role": 0 } }
+            ]
+        });
+        let entries = collect_entries(&raw);
+        assert_eq!(entries[0].depth, 5, "顶层 depth 优先");
+        assert_eq!(entries[0].role.as_deref(), Some("assistant"), "顶层 role 优先");
+    }
+
+    /// role 字符串形态与无法识别值:合法字符串归一,非法值退回 None(按位置语义取缺省)
+    #[test]
+    fn role_string_and_invalid_forms() {
+        let raw = json!({
+            "entries": [
+                { "uid": 1, "comment": "字符串", "keys": [], "content": "x", "constant": true, "role": " assistant " },
+                { "uid": 2, "comment": "非法数字", "keys": [], "content": "x", "constant": true, "role": 9 },
+                { "uid": 3, "comment": "非法字符串", "keys": [], "content": "x", "constant": true, "role": "tool" },
+                { "uid": 4, "comment": "缺省", "keys": [], "content": "x", "constant": true }
+            ]
+        });
+        let entries = collect_entries(&raw);
+        assert_eq!(entries[0].role.as_deref(), Some("assistant"), "两侧空白归一");
+        assert!(entries[1].role.is_none(), "非法数字 → None");
+        assert!(entries[2].role.is_none(), "非法字符串 → None");
+        assert!(entries[3].role.is_none(), "缺省 → None");
     }
 
     /// view → value 往返:写回字段与 ST/角色卡兼容(disable 反转、uid/id、depth/order 等)
@@ -893,7 +1081,8 @@ mod tests {
     /// 开头连续 @@ 行被剥离为 decorators,clean_content 不含装饰器行
     #[test]
     fn parses_leading_decorators() {
-        let content = "@@if variables.affection > 50\n@@var emotion = warm\n这是正文第一行。\n这是第二行。";
+        let content =
+            "@@if variables.affection > 50\n@@var emotion = warm\n这是正文第一行。\n这是第二行。";
         let (decorators, clean) = parse_decorators(content);
         assert_eq!(
             decorators,
@@ -978,7 +1167,10 @@ mod tests {
             probability: 100,
             use_probability: false,
             role: None,
-            decorators: vec!["@@if variables.affection > 50".into(), "@@var emotion".into()],
+            decorators: vec![
+                "@@if variables.affection > 50".into(),
+                "@@var emotion".into(),
+            ],
         };
         let d = parse_entry_decorators(&e);
         assert!(d.has("@@if"));
@@ -991,7 +1183,13 @@ mod tests {
         assert_eq!(d.arg("@@missing"), None);
         // all / args 一一对应
         assert_eq!(d.all.len(), 2);
-        assert_eq!(d.args, vec!["variables.affection > 50".to_string(), "emotion".to_string()]);
+        assert_eq!(
+            d.args,
+            vec![
+                "variables.affection > 50".to_string(),
+                "emotion".to_string()
+            ]
+        );
     }
 
     /// 无装饰器条目 → 空判定;无参数装饰器 → 参数为空串

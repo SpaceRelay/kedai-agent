@@ -1,6 +1,6 @@
 // 快速回复路由:/api/quick-replies(列表/新建/更新/删除)
 use crate::api::app_state::AppState;
-use crate::api::WithStatus;
+use crate::api::{db_err, WithStatus};
 use crate::services::quick_reply_service::QuickReplyRecord;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
@@ -21,18 +21,25 @@ pub async fn list(
     Query(q): Query<ListQuery>,
 ) -> Json<serde_json::Value> {
     let only_enabled = !q.all.unwrap_or(false);
-    Json(json!({ "quick_replies": state.quick_replies.list(only_enabled) }))
+    let svc = state.quick_replies.clone();
+    let list = state
+        .db_call(move || svc.list(only_enabled))
+        .await
+        .expect("读取快速回复任务失败");
+    Json(json!({ "quick_replies": list }))
 }
 
 pub async fn create(
     State(state): State<Arc<AppState>>,
     Json(body): Json<QuickReplyRecord>,
 ) -> Response {
-    match state.quick_replies.create(body) {
-        Ok(record) => Json(json!({ "ok": true, "quick_reply": record }))
+    let svc = state.quick_replies.clone();
+    match state.db_call(move || svc.create(body)).await {
+        Err(e) => db_err(&e),
+        Ok(Ok(record)) => Json(json!({ "ok": true, "quick_reply": record }))
             .into_response()
             .with_status(StatusCode::CREATED),
-        Err(e) => Json(json!({ "error": e }))
+        Ok(Err(e)) => Json(json!({ "error": e }))
             .into_response()
             .with_status(StatusCode::BAD_REQUEST),
     }
@@ -43,20 +50,23 @@ pub async fn update(
     Path(id): Path<i64>,
     Json(body): Json<QuickReplyRecord>,
 ) -> Response {
-    match state.quick_replies.update(id, body) {
-        Some(record) => Json(json!({ "ok": true, "quick_reply": record })).into_response(),
-        None => Json(json!({ "error": "快速回复不存在" }))
+    let svc = state.quick_replies.clone();
+    match state.db_call(move || svc.update(id, body)).await {
+        Err(e) => db_err(&e),
+        Ok(Some(record)) => Json(json!({ "ok": true, "quick_reply": record })).into_response(),
+        Ok(None) => Json(json!({ "error": "快速回复不存在" }))
             .into_response()
             .with_status(StatusCode::NOT_FOUND),
     }
 }
 
 pub async fn delete(State(state): State<Arc<AppState>>, Path(id): Path<i64>) -> Response {
-    if state.quick_replies.delete(id) {
-        StatusCode::NO_CONTENT.into_response()
-    } else {
-        Json(json!({ "error": "快速回复不存在" }))
+    let svc = state.quick_replies.clone();
+    match state.db_call(move || svc.delete(id)).await {
+        Err(e) => db_err(&e),
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => Json(json!({ "error": "快速回复不存在" }))
             .into_response()
-            .with_status(StatusCode::NOT_FOUND)
+            .with_status(StatusCode::NOT_FOUND),
     }
 }

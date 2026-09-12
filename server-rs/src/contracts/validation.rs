@@ -16,7 +16,10 @@ pub fn validate_contract(c: &Contract) -> Vec<String> {
     let mut seen_paths: BTreeSet<&str> = BTreeSet::new();
     for (key, field) in &c.update_rules {
         if key != &field.path {
-            errors.push(format!("updateRules 键 {key} 与字段 path {} 不一致", field.path));
+            errors.push(format!(
+                "updateRules 键 {key} 与字段 path {} 不一致",
+                field.path
+            ));
         }
         if !seen_paths.insert(field.path.as_str()) {
             errors.push(format!("字段 path 重复: {}", field.path));
@@ -25,9 +28,7 @@ pub fn validate_contract(c: &Contract) -> Vec<String> {
 
     // 2. updateMode 约束:every_n_turns 必须给 everyN ≥ 1
     for field in c.update_rules.values() {
-        if field.update_mode == UpdateMode::EveryNTurns
-            && field.every_n.map_or(true, |n| n == 0)
-        {
+        if field.update_mode == UpdateMode::EveryNTurns && field.every_n.is_none_or(|n| n == 0) {
             errors.push(format!(
                 "字段 {} 为 every_n_turns 但未声明有效的 everyN(≥1)",
                 field.path
@@ -194,8 +195,7 @@ fn detect_cycle(adj: &BTreeMap<String, Vec<String>>) -> Option<Vec<String>> {
         None
     }
 
-    let mut marks: BTreeMap<String, Mark> =
-        adj.keys().map(|k| (k.clone(), Mark::White)).collect();
+    let mut marks: BTreeMap<String, Mark> = adj.keys().map(|k| (k.clone(), Mark::White)).collect();
     let mut stack: Vec<String> = Vec::new();
     for node in adj.keys().cloned().collect::<Vec<_>>() {
         if marks[&node] == Mark::White {
@@ -242,10 +242,7 @@ mod tests {
             "guardrails": {}
         }))
         .unwrap();
-        c.update_rules = fields
-            .into_iter()
-            .map(|f| (f.path.clone(), f))
-            .collect();
+        c.update_rules = fields.into_iter().map(|f| (f.path.clone(), f)).collect();
         c
     }
 

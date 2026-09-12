@@ -157,10 +157,7 @@ mod tests {
         assert_eq!(tree["心之所向"]["好感度"], json!(5), "已有值不动");
         assert_eq!(tree["心之所向"]["信任度"], json!(10), "null 补默认");
         assert_eq!(tree["心之所向"]["心情"], json!("平静"), "缺失补默认");
-        assert!(
-            tree.get("无默认").is_none(),
-            "无 default 的字段不造值"
-        );
+        assert!(tree.get("无默认").is_none(), "无 default 的字段不造值");
     }
 
     /// apply_contract_defaults:空树(老卡无 InitVar)也能按契约骨架建出嵌套层。

@@ -12,6 +12,7 @@ use super::meta::PendingOp;
 /// 观察层选项(§10.1 ObservationOpts)。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[derive(Default)]
 pub struct ObservationOpts {
     /// 字符串字段最大长度(超过截断,保留前缀 + 长度标记)
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -22,16 +23,6 @@ pub struct ObservationOpts {
     /// 敏感字段脱敏(string 值替换为占位,标记 masked)
     #[serde(default)]
     pub sensitive_mask: bool,
-}
-
-impl Default for ObservationOpts {
-    fn default() -> Self {
-        ObservationOpts {
-            max_field_len: None,
-            top_k: None,
-            sensitive_mask: false,
-        }
-    }
 }
 
 /// 观察层输出的单个字段。
@@ -209,7 +200,14 @@ mod tests {
         a.dependencies = Some(vec!["B".into()]);
         let c = contract_with(vec![a, field("B"), field("C")]);
         let stat = json!({ "A": 1, "B": 2, "C": 3 });
-        let obs = observe(&c, &stat, &["A".to_string()], &[], "agent", &ObservationOpts::default());
+        let obs = observe(
+            &c,
+            &stat,
+            &["A".to_string()],
+            &[],
+            "agent",
+            &ObservationOpts::default(),
+        );
         let paths: Vec<&str> = obs.fields.iter().map(|f| f.path.as_str()).collect();
         // A 是 due,B 是 A 的依赖,C 既非 due 也非依赖 → 不进
         assert_eq!(paths, vec!["A", "B"]);
@@ -226,7 +224,14 @@ mod tests {
             created_at_turn: 1,
             rationale: None,
         }];
-        let obs = observe(&c, &stat, &["A".to_string()], &pending, "agent", &ObservationOpts::default());
+        let obs = observe(
+            &c,
+            &stat,
+            &["A".to_string()],
+            &pending,
+            "agent",
+            &ObservationOpts::default(),
+        );
         let paths: Vec<&str> = obs.fields.iter().map(|f| f.path.as_str()).collect();
         assert_eq!(paths, vec!["A", "B"]);
     }
@@ -236,7 +241,14 @@ mod tests {
     fn observe_filters_unauthorized_viewer() {
         let c = contract_with(vec![field("A")]); // 默认 writers=[agent,manual]
         let stat = json!({ "A": 1 });
-        let obs = observe(&c, &stat, &["A".to_string()], &[], "dice", &ObservationOpts::default());
+        let obs = observe(
+            &c,
+            &stat,
+            &["A".to_string()],
+            &[],
+            "dice",
+            &ObservationOpts::default(),
+        );
         assert!(obs.fields.is_empty(), "dice 不是 A 的 writers");
     }
 
@@ -259,7 +271,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        assert_eq!(trunc.fields[0].masked, false);
+        assert!(!trunc.fields[0].masked);
         assert!(trunc.fields[0].value.as_str().unwrap().contains("…"));
 
         let masked = observe(
@@ -307,7 +319,14 @@ mod tests {
             render: crate::contracts::DisplayRender::Hidden,
         });
         let stat = json!({ "A": 1 });
-        let obs = observe(&c, &stat, &["A".to_string()], &[], "agent", &ObservationOpts::default());
+        let obs = observe(
+            &c,
+            &stat,
+            &["A".to_string()],
+            &[],
+            "agent",
+            &ObservationOpts::default(),
+        );
         assert!(obs.fields.is_empty());
     }
 }

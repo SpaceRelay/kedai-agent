@@ -56,11 +56,14 @@ pub(super) async fn reflect_with_llm(
                 completion_tokens,
                 total_tokens,
                 prompt_cache_hit_tokens,
+                prompt_cache_miss_tokens,
+                ..
             } => {
                 usage.prompt_tokens += prompt_tokens;
                 usage.completion_tokens += completion_tokens;
                 usage.total_tokens += total_tokens;
                 usage.prompt_cache_hit_tokens += prompt_cache_hit_tokens;
+                usage.prompt_cache_miss_tokens += prompt_cache_miss_tokens;
             }
             _ => {}
         }
@@ -84,8 +87,12 @@ pub(super) async fn reflect_with_tools(
     if *abort.borrow() {
         return None;
     }
-    // 反思可用的文本修正工具:仅取已注册的(缺失时退回无工具反思)
-    let tools: Vec<ToolDefinition> = ["censor_text", "revise_passage"]
+    // 反思可用的工具:文本修正(禁词替换/定点修订)+ 只读检索(read,
+    // 供反思时查世界书/资料佐证判定);仅取已注册的(缺失时退回无工具反思)。
+    // 常量见 tools::tool_sets(REFLECT)。
+    let mut names: Vec<&str> = crate::tools::tool_sets::REFLECT.to_vec();
+    names.push("read");
+    let tools: Vec<ToolDefinition> = names
         .iter()
         .filter_map(|name| engine.tool_registry.get(name).map(|t| t.definition))
         .collect();
@@ -126,7 +133,10 @@ pub(super) async fn reflect_with_tools(
             parallel_tool_calls: None,
         };
         let connector = engine.connector.read().await;
-        let chunks = connector.generate(&messages, params, abort.clone()).await.ok()?;
+        let chunks = connector
+            .generate(&messages, params, abort.clone())
+            .await
+            .ok()?;
         drop(connector);
 
         let mut out = String::new();
@@ -147,11 +157,14 @@ pub(super) async fn reflect_with_tools(
                     completion_tokens,
                     total_tokens,
                     prompt_cache_hit_tokens,
+                    prompt_cache_miss_tokens,
+                    ..
                 } => {
                     total_usage.prompt_tokens += prompt_tokens;
                     total_usage.completion_tokens += completion_tokens;
                     total_usage.total_tokens += total_tokens;
                     total_usage.prompt_cache_hit_tokens += prompt_cache_hit_tokens;
+                    total_usage.prompt_cache_miss_tokens += prompt_cache_miss_tokens;
                 }
                 _ => {}
             }
@@ -176,8 +189,11 @@ pub(super) async fn reflect_with_tools(
                 .execute(&call.name, &call.arguments, tool_ctx.clone())
                 .await
                 .unwrap_or_else(|e| format!("{{\"error\":\"{e}\"}}"));
-            // 文本修正类工具的输出即修正后的正文(最后一次调用胜出)
-            revised = Some(output.clone());
+            // 只有文本修正类工具的输出才是修正后的正文(read 是检索类,输出是资料,
+            // 混入会污染正文);修正类「最后一次调用胜出」。
+            if crate::tools::tool_sets::REFLECT.contains(&call.name.as_str()) {
+                revised = Some(output.clone());
+            }
             messages.push(LlmMessage {
                 role: "tool".into(),
                 content: output,
@@ -253,11 +269,14 @@ pub(super) async fn generate_reflect_advice(
                 completion_tokens,
                 total_tokens,
                 prompt_cache_hit_tokens,
+                prompt_cache_miss_tokens,
+                ..
             } => {
                 usage.prompt_tokens += prompt_tokens;
                 usage.completion_tokens += completion_tokens;
                 usage.total_tokens += total_tokens;
                 usage.prompt_cache_hit_tokens += prompt_cache_hit_tokens;
+                usage.prompt_cache_miss_tokens += prompt_cache_miss_tokens;
             }
             _ => {}
         }
@@ -278,4 +297,42 @@ fn truncate_str(s: &str, max_chars: usize) -> String {
     } else {
         trimmed.chars().take(max_chars).collect()
     }
+}
+
+// ===== 反思失败建议组装(自 engine/mod.rs 拆分迁入,纯代码移动,逻辑不变)=====
+// 原为 engine/mod.rs 私有函数,此处为 pub(super)(= 对 engine 可见),范围一致。
+/// 生成反思失败建议并拼为注入文本(位置0 内容,自动而非用户决定):
+/// 调用 LLM 产出 ≤200 token 的针对性改进建议(失败/空则仅保留用户补充说明),
+/// 可选的用户补充说明附加在其后;建议与补充均为空时返回 None(不注入)。
+/// 生成产生的 usage 累加进 total_usage。注入边(user/assistant)由构建期
+/// reflect_advice_role 决定,与本函数无关。
+pub(super) async fn build_reflect_advice(
+    engine: &AgentEngine,
+    reason: &str,
+    user_input: &str,
+    draft: &str,
+    supplement: &str,
+    abort: &watch::Receiver<bool>,
+    total_usage: &mut TokenUsage,
+) -> Option<String> {
+    let mut text = String::new();
+    if let Some((advice, u)) =
+        generate_reflect_advice(engine, reason, user_input, draft, abort).await
+    {
+        total_usage.prompt_tokens += u.prompt_tokens;
+        total_usage.completion_tokens += u.completion_tokens;
+        total_usage.total_tokens += u.total_tokens;
+        total_usage.prompt_cache_hit_tokens += u.prompt_cache_hit_tokens;
+        total_usage.prompt_cache_miss_tokens += u.prompt_cache_miss_tokens;
+        text.push_str("[反思反馈]\n");
+        text.push_str(advice.trim());
+    }
+    let supplement = supplement.trim();
+    if !supplement.is_empty() {
+        if !text.is_empty() {
+            text.push_str("\n\n[补充要求]\n");
+        }
+        text.push_str(supplement);
+    }
+    (!text.is_empty()).then_some(text)
 }

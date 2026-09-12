@@ -1,6 +1,7 @@
 // 角色卡路由:/api/characters(列表/上传/详情/更新/删除)
+// services 同步 DB 调用均经 state.db_call 挪进阻塞线程池(DB 并发改造)
 use crate::api::app_state::AppState;
-use crate::api::WithStatus;
+use crate::api::{db_err, WithStatus};
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -22,9 +23,14 @@ pub struct UpdateBody {
     pub alternate_greetings: Option<Vec<String>>,
 }
 
-pub async fn list(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
-    let chars = state.characters.list();
-    Json(json!({ "characters": chars }))
+pub async fn list(State(state): State<Arc<AppState>>) -> Response {
+    let svc = state.characters.clone();
+    // 阻塞任务失败(线程池 JoinError 等)返回 500,不 expect panic——
+    // panic 会杀掉连接,前端只能看到「网络错误」,列表永远空白且无任何可读原因
+    match state.db_call(move || svc.list()).await {
+        Ok(chars) => Json(json!({ "characters": chars })).into_response(),
+        Err(e) => db_err(&e),
+    }
 }
 
 const MAX_UPLOAD: usize = 30 * 1024 * 1024;
@@ -41,29 +47,26 @@ pub async fn upload(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
     let Some(boundary) = parse_boundary(content_type) else {
-        return Json(json!({ "error": "缺少文件字段(file)" }))
-            .into_response()
-            .with_status(StatusCode::BAD_REQUEST);
+        return err_json("缺少文件字段(file)", StatusCode::BAD_REQUEST);
     };
     let Some((file_name, file_bytes)) = parse_multipart_file(&body, &boundary) else {
-        return Json(json!({ "error": "缺少文件字段(file)" }))
-            .into_response()
-            .with_status(StatusCode::BAD_REQUEST);
+        return err_json("缺少文件字段(file)", StatusCode::BAD_REQUEST);
     };
     if file_bytes.len() > MAX_UPLOAD {
-        return Json(json!({ "error": "文件超过 30MB 上限" }))
-            .into_response()
-            .with_status(StatusCode::BAD_REQUEST);
+        return err_json("文件超过 30MB 上限", StatusCode::BAD_REQUEST);
     }
-    match state.characters.upload(&file_bytes, &file_name) {
-        Ok(c) => {
+    let svc = state.characters.clone();
+    let upload_result = state
+        .db_call(move || svc.upload(&file_bytes, &file_name))
+        .await;
+    match upload_result {
+        Err(e) => db_err(&e),
+        Ok(Ok(c)) => {
             // 契约缓存失效:上传即覆盖同名片,data_raw(契约来源)可能变化
             state.invalidate_contracts_for_character(&c.id);
             Json(c).into_response().with_status(StatusCode::CREATED)
         }
-        Err(e) => Json(json!({ "error": e }))
-            .into_response()
-            .with_status(StatusCode::BAD_REQUEST),
+        Ok(Err(e)) => err_json(e, StatusCode::BAD_REQUEST),
     }
 }
 
@@ -82,8 +85,7 @@ pub(crate) fn parse_boundary(content_type: &str) -> Option<String> {
 fn parse_multipart_file(body: &[u8], boundary: &str) -> Option<(String, Vec<u8>)> {
     parse_multipart(body, boundary)
         .into_iter()
-        .find(|p| p.filename.is_some())
-        .map(|p| (p.filename.unwrap(), p.content))
+        .find_map(|p| p.filename.map(|f| (f, p.content)))
 }
 
 /// 通用 multipart 解析:返回全部 part(字段名 / 可选文件名 / 内容),供 world_books 复用
@@ -154,8 +156,11 @@ fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 }
 
 pub async fn get(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
-    match state.characters.get(&id) {
-        Some(mut c) => {
+    let svc = state.characters.clone();
+    let found = state.db_call(move || svc.get(&id)).await;
+    match found {
+        Err(e) => db_err(&e),
+        Ok(Some(mut c)) => {
             // 角色卡内嵌插件检测(酒馆助手等):基于 data_raw 的 character_book
             if let Some(raw) = c.data_raw.as_ref() {
                 let plugins = crate::parsing::assistant::detect_card_plugins(raw);
@@ -167,9 +172,7 @@ pub async fn get(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> 
             }
             Json(c).into_response()
         }
-        None => Json(json!({ "error": "角色卡不存在" }))
-            .into_response()
-            .with_status(StatusCode::NOT_FOUND),
+        Ok(None) => err_json("角色卡不存在", StatusCode::NOT_FOUND),
     }
 }
 
@@ -178,30 +181,42 @@ pub async fn update(
     Path(id): Path<String>,
     Json(body): Json<UpdateBody>,
 ) -> Response {
-    match state.characters.update(
-        &id,
-        body.chara_name.as_deref(),
-        body.description.as_deref(),
-        body.first_mes.as_deref(),
-        body.alternate_greetings.as_deref(),
-    ) {
-        Some(c) => {
-            state.invalidate_contracts_for_character(&id);
+    let svc = state.characters.clone();
+    let updated = state
+        .db_call(move || {
+            svc.update(
+                &id,
+                body.chara_name.as_deref(),
+                body.description.as_deref(),
+                body.first_mes.as_deref(),
+                body.alternate_greetings.as_deref(),
+            )
+        })
+        .await;
+    match updated {
+        Err(e) => db_err(&e),
+        Ok(Some(c)) => {
+            state.invalidate_contracts_for_character(&c.id);
             Json(c).into_response()
         }
-        None => Json(json!({ "error": "角色卡不存在" }))
-            .into_response()
-            .with_status(StatusCode::NOT_FOUND),
+        Ok(None) => err_json("角色卡不存在", StatusCode::NOT_FOUND),
     }
 }
 
 pub async fn delete(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
-    if state.characters.delete(&id) {
-        state.invalidate_contracts_for_character(&id);
-        StatusCode::NO_CONTENT.into_response()
-    } else {
-        Json(json!({ "error": "角色卡不存在" }))
-            .into_response()
-            .with_status(StatusCode::NOT_FOUND)
+    let svc = state.characters.clone();
+    let del_id = id.clone();
+    match state.db_call(move || svc.delete(&del_id)).await {
+        Err(e) => db_err(&e),
+        Ok(true) => {
+            state.invalidate_contracts_for_character(&id);
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Ok(false) => err_json("角色卡不存在", StatusCode::NOT_FOUND),
     }
+}
+
+/// 本模块统一错误响应:按状态码自动附带结构化错误码(见 api/errors.rs)。
+fn err_json(msg: impl AsRef<str>, status: StatusCode) -> Response {
+    crate::api::err_with_code(crate::api::code_for_status(status), msg, status)
 }

@@ -92,13 +92,13 @@ pub(crate) enum Builtin {
     GetChatMessage,  // getChatMessage(idx, role) → ""
     GetChatMessages, // getChatMessages(...) → [] (空数组)
     // ===== ST-Prompt-Template 兼容:注入/JSON/嵌套渲染 =====
-    InjectPrompt,      // injectPrompt(key, prompt, order?, sticky?, uid?) → "" (静默成功)
+    InjectPrompt, // injectPrompt(key, prompt, order?, sticky?, uid?) → "" (静默成功)
     GetPromptsInjected, // getPromptsInjected(key) → "" (无注入清单)
     HasPromptsInjected, // hasPromptsInjected(key) → false
-    ParseJSON,         // parseJSON(text) → 宽松解析,失败返回原字符串
-    JsonPatch,         // jsonPatch(dest, change) → 原对象(浅克隆,容错)
-    EvalTemplate,      // evalTemplate(content) → 嵌套渲染结果,失败返回原文
-    Print,             // print(...args) → 追加输出(__kedai_out__ 语义)
+    ParseJSON,    // parseJSON(text) → 宽松解析,失败返回原字符串
+    JsonPatch,    // jsonPatch(dest, change) → 原对象(浅克隆,容错)
+    EvalTemplate, // evalTemplate(content) → 嵌套渲染结果,失败返回原文
+    Print,        // print(...args) → 追加输出(__kedai_out__ 语义)
     // ===== ST-Prompt-Template 兼容:变量别名/自增自减 =====
     IncVar, // incvar(path) → 变量 +1
     DecVar, // decvar(path) → 变量 -1
