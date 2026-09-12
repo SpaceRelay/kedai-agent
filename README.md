@@ -7,16 +7,25 @@
 因而,我们决定制作这一款软件。
 
 > 专注于**角色扮演 / 文字创作**的 Agent。原作者 **Sata1949**,本仓库为代传。
-> 当前处于**测试阶段(v0.2.0)**,功能尚未完善,可能存在恶性 Bug,欢迎直接反馈。
+> 当前处于**测试阶段(v0.2.1)**,功能尚未完善,可能存在恶性 Bug,欢迎直接反馈。
 
 **功能进度**
 
 - ✅ 基础架构
 - ✅ 角色扮演模式
 - ✅ 酒馆生态基础兼容
-- ❌ 任务模式(未完成)
+- ✅ 任务模式
 - ❌ 子 agent(未完成)
 - ❌ 更好的任务流(未完成)
+
+## 更新日志
+
+### kedai 0.2.1 beta
+
+1.加入了任务模式，现在kedai可以帮你完成文字任务了
+2.优化角色扮演模式对酒馆生态的兼容性
+3.加入向量化记忆系统
+4.提升稳定性
 
 前后端分离的 AI 角色扮演/文学创作客户端,**SillyTavern 生态原生兼容**,内置 **Agent 引擎**(计划 → 执行 → 反思),输出质量远超一次性生成。
 
@@ -36,11 +45,22 @@
   - **内嵌插件识别**:打开「插件」窗口可查看当前角色卡内嵌插件(自动检测,含特性明细:初始变量/EJS 模板/变量系统/状态注入/输出协议),kedai 内置实现无需安装
 - 🤖 **Agent 引擎**
   - 状态机驱动:`planning → executing ⇄ tool_call → reflecting → finished`,全程可观测、可中断
-  - 两种模式:`fast`(单步直接生成)、`deep`(计划 → 执行 → 反思,质量更高)
+  - 四种模式:`fast`(单步直接生成)、`deep`(计划 → 执行 → 反思,质量更高)、`agent`(工具自循环)、`custom`(自定义流程)
   - 推理链通过 SSE 流式推送到前端,实时展示思考过程
+- 🗂️ **任务模式**(与角色扮演平级的顶层模式)
+  - 独立任务引擎:六种运行模式(`legacy` 三段式 / `solo` / `multi` / `plan` / `team` / `custom`,见 [docs/任务引擎六模式.md](docs/任务引擎六模式.md));legacy 走 plan(LLM 拆解 2~5 步)→ execute(逐步派子任务)→ summarize(LLM 汇总),状态落 SQLite 五表(tasks/task_subtasks/task_usage/task_llm_calls/task_messages),全程可中断、可重跑
+  - 进度经 **SSE 实时推送**(`GET /api/tasks/events`,任务生命周期事件 created/status/plan/subtask/usage/llm_call/agent_status/approval_required/delta/deleted),前端事件驱动刷新,无轮询;断线指数退避重连 + 低频兜底
+  - 提示词与角色扮演模式**类型级隔离、按模式独立存储互不影响**,外部文本统一 `<UNTRUSTED_PROMPT_SOURCE>` 边界包裹;机制详见 [docs/模式提示词边界.md](docs/模式提示词边界.md) 与 [docs/任务模式重构-变更说明.md](docs/任务模式重构-变更说明.md)
+- 🧠 **上下文工程**(提示词缓存友好)
+  - **缓存感知压缩**:每轮 LLM usage(含 DeepSeek `prompt_cache_hit_tokens` / OpenAI `cached_tokens`)落库,`GET /api/diagnostics/cache` 报告命中率、费用估算与四级水位(soft/snip/compact/force);前端「优化」弹窗内置缓存健康面板
+  - **前缀分层**:消息组装固定为「system(静态)→ 摘要槽 → 记忆槽 → 尾部历史(只追加)」,摘要改追加式增量(旧摘要字节冻结),压缩后缓存只 miss 尾部;同会话两次构建公共前缀逐字节一致(有回归测试护航)
+  - **阶梯压缩**:LLM 摘要前先做零成本 snip(陈旧超长工具结果压占位符、错误特征保留、尾部 2 条原文保留),保留条数与 snip 阈值可配置
+  - **跨会话记忆蒸馏**:会话历史蒸馏为结构化记忆条目(`memory_entries` 表,人物关系/事件/伏笔取向),按使用次数与最近使用衰减精选,注入记忆槽;与 agent 主动写记忆(`memory_write`)同表同策略,前端记忆库面板可查看/编辑/手动蒸馏
 - 🔧 **工具系统**
   - 标准化 Tool 接口(OpenAI Function Calling 格式)
   - 内置:`calculator`(白名单解析,不使用 eval)、`memory_read/write`(会话长期记忆)
+  - **技能渐进披露**:技能清单仅预载 `name + description`(每技能几十 token),正文经 `read(type=skill)` 按需加载;支持 `allowed-tools` / `run-as-subagent` / `model` 元数据
+  - **子代理调度守卫**:递归深度(默认 2)与全局并发(默认 6)可配置,子代理结果超长自动截断为摘要回传,防上下文爆炸
 - ⚡ **流式体验**:token 逐字渲染 + Agent 步骤事件,首 Token 低延迟
 - 🔐 **隐私**:数据仅存本地(SQLite + 文件),API Key 只存服务端环境变量
 
@@ -49,14 +69,14 @@
 | 层 | 选型 |
 |---|---|
 | 桌面壳 | **Tauri 2**(窗口加载本地服务,NSIS 安装包,`src-tauri/`) |
-| 前端 | Vue 3 + Vite + Tailwind CSS v4 + Pinia(极简黑白至上主义) |
+| 前端 | Vue 3 + Vite + Tailwind CSS v4 + Pinia(淡粉画布 × 至上主义/构成主义设计系统) |
 | 后端 | **Rust + axum + tokio** |
 | 数据库 | SQLite(rusqlite,bundled 零原生依赖) |
 | 流式 | SSE(Server-Sent Events) |
 | Token 计数 | tiktoken-rs(按模型自动选分词器) |
 | 测试 | cargo test(单测 + API 集成)+ Vitest(前端单测,`npm test -w web`) |
 
-> 原 Node.js + TypeScript + Fastify 后端已重写为 Rust(见 `server-rs/`),原代码归档于 `_archive/node-server/`;原 C# 启动器被 Tauri 桌面壳取代,归档于 `_archive/csharp-launcher/`。
+> 原 Node.js + TypeScript + Fastify 后端已重写为 Rust(见 `server-rs/`);原 C# 启动器被 Tauri 桌面壳取代。历史代码不随仓库归档,需溯源请查 git 历史。
 
 ## 快速启动
 
@@ -82,14 +102,15 @@ cargo build
 #    终端 B(前端):npm run dev -w web          # 监听 http://localhost:5173
 ```
 
-> 开发模式无需先构建前端:Rust 服务启动时自动探测 `web/dist`,缺失则回退内嵌产物。
+> 开发模式无需先构建前端:Rust 服务默认使用编译期内嵌的 `web/dist`;仅显式设置环境变量 `KEDAI_WEB_DIST` 指向磁盘目录时才用磁盘版覆盖。
 
 ### Windows 便携版(正式交付)
 
 ```powershell
-# 构建前端、Tauri release,并组装独立便携目录
-npm run build:portable
-# 正式入口:dist\Kedai-portable\Kedai.exe
+# 一键双端同步构建:测试版 kedai-server.exe + 便携版 Kedai.exe(发布/交付用这条)
+.\build.ps1            # 等价 npm run build:all / build:rs
+# 正式入口(项目内双击):Kedai.lnk → 项目根 Kedai.exe 图形启动器(自带过期/漂移检测)
+# 交付产物入口:dist\Kedai-portable\Kedai.exe
 ```
 
 把整个 `dist\Kedai-portable\` 目录复制给用户即可;运行时不需要 Node.js、Rust 或项目源码。系统需要 Microsoft Edge WebView2 Runtime(Windows 10/11 通常已内置)。
@@ -106,14 +127,15 @@ npm run build:portable
 ### 浏览器模式(仅开发/调试)
 
 ```powershell
-# 一键构建:前端 web/dist + Rust release 单文件
-.\build.ps1
+# 快速迭代只构建测试版(不刷新便携版,会提示未同步):
+.\build.ps1 -TestOnly
 # 启动服务并自动打开浏览器
 .\start.ps1              # 始终使用浏览器开发/调试模式
 .\start.ps1 -NoBrowser   # 加 -NoBrowser 不自动开浏览器
 ```
 
 > 也可直接双击 `server-rs\target\release\kedai-server.exe` 启动;服务已在运行时再启动会自检并复用,不重复开端口。
+> 测试版与便携版各带构建指纹(`<exe>.build.json` + `/api/health` 的 build_id),设置中心底部可见;两端指纹一致即同步,不一致时启动器会自动双端重建。
 
 ### 配置(可选)
 
@@ -121,7 +143,7 @@ npm run build:portable
 无 Key 也能跑:将 `CONNECTOR` 设为 `mock` 使用演示模式(未配置 Key 时自动进入 mock)。
 
 > 💡 也可直接在应用内「设置」中编辑 API 地址 / Key / 模型,以及温度、Top-P、最大生成长度、最大上下文窗口;
-> 保存后写入 `data/settings.json` 并立即生效(优先级高于 `.env`,Key 仅存本地服务端、不回显明文)。Windows 使用当前用户 DPAPI 加密。非 Windows 在没有系统凭据后端时默认拒绝持久化非空 Key;只有明确接受明文风险并设置 `KEDAI_ALLOW_INSECURE_PLAINTEXT_SECRETS=1` 才允许写入 `plain:v1:` 值,更推荐通过环境变量提供 Key。
+> 保存后写入 `<数据目录>/settings.json` 并立即生效(优先级高于 `.env`,Key 仅存本地服务端、不回显明文;数据目录解析规则见「目录结构」一节)。Windows 使用当前用户 DPAPI 加密。非 Windows 在没有系统凭据后端时默认拒绝持久化非空 Key;只有明确接受明文风险并设置 `KEDAI_ALLOW_INSECURE_PLAINTEXT_SECRETS=1` 才允许写入 `plain:v1:` 值,更推荐通过环境变量提供 Key。
 
 ### 试跑演示
 
@@ -143,31 +165,36 @@ kedai/
 │   │   ├── tools/          # 工具系统(registry / calculator / memory / agent_tools)
 │   │   ├── models/         # 类型 + SQLite 表结构
 │   │   ├── parsing/        # 角色卡 V2 解析 + assistant/ejs/(mvu 变量渲染)
-│   │   ├── services/       # 角色/会话/Agent会话/Token 服务
+│   │   ├── services/       # 角色/会话/Agent会话/Token/任务引擎 等业务服务
 │   │   └── utils/          # 结构化 JSON 日志(按天归档)
 │   └── tests/              # API 集成测试
 ├── web/                    # 前端(Vue 3 + Pinia + Tailwind v4)
 │   └── src/
-│       ├── api/            # REST + SSE 流式客户端(按域拆分,index 聚合)
-│       ├── store.ts        # Pinia 全局状态
-│       ├── sseReducer.ts   # SSE 事件纯函数
-│       └── components/     # Sidebar / ChatWindow / ChatInput / AgentDock / SettingsModal
+│       ├── api/            # REST + SSE 流式客户端(按域拆分)
+│       ├── stores/         # Pinia 七子 store(chat/character/modelConn/...),store.ts 门面聚合
+│       ├── mvu/            # 变量系统 + mini-jquery 沙箱
+│       └── components/     # Sidebar / ChatWindow / TaskBoard / AgentPanel + 12 弹窗
+├── docs/                   # 协议锁定文档(活文档)与过程交接文档,索引见 docs/README.md
 ├── tools/make-icons.ps1    # 品牌图标生成(圆角 + 透明背景)
-├── launcher/               # 旧项目目录启动器源码(兼容保留,非正式入口)
-├── dist/Kedai-portable/    # 正式 Windows 便携目录(npm run build:portable 生成)
-├── start.ps1               # 浏览器开发/调试启动器
-├── build.ps1               # 后端/前端与可选 NSIS 构建
-├── tools/build-portable.ps1# 便携目录构建脚本
-├── logs/                   # 运行日志(按天归档 kedai-YYYY-MM-DD.log,自动清理 3 天前)
-├── data/                   # 运行时生成:SQLite + 角色卡原图 + avatars
-└── _archive/               # 历史物归档(node-server / csharp-launcher)
+├── launcher/               # 图形启动器源码(双击正式入口,产物为项目根 Kedai.exe)
+├── Kedai.exe / Kedai.lnk   # 图形启动器与快捷方式(过期/漂移自动询问重建,由 build.ps1 维护)
+├── dist/Kedai-portable/    # 正式 Windows 便携目录(build.ps1 默认同步产出)
+├── start.ps1               # 启动脚本:默认浏览器测试版,-Portable 启动便携版
+├── build.ps1               # 一键构建:默认双端同步(前端 + Rust release + 便携版)
+├── tools/build-portable.ps1# 便携目录构建脚本(被 build.ps1 接续调用)
+├── tools/bump-version.ps1  # 统一修改全仓库版本号(npm run version:bump -- x.y.z)
+├── tools/perf-baseline.mjs # 端点性能基线压测(npm run perf;需服务运行中,输出 p50/p95/吞吐)
+├── tools/inspect-card.mjs  # 角色卡结构检查(npm run inspect:card -- <卡片文件> [--full])
+└── logs/                   # 运行日志(按天归档 kedai-YYYY-MM-DD.log,自动清理 3 天前)
 ```
+
+> **数据目录**(不进仓库):优先级 `DATA_DIR` 环境变量 > `%APPDATA%\com.kedai.app\data\`(已含用户数据时,与桌面版同目录)> 项目根 `data\`。内容:SQLite(kedai.db)+ 角色卡原图 + avatars + JSON sidecar(settings/prompt_floors/audio/agent_flows/tool_permissions)。下文凡写 `<数据目录>` 均指此。
 
 ## 日志与维护
 
 - 运行日志双写:控制台 + `logs/kedai-YYYY-MM-DD.log`(按天归档;桌面应用场景在 `%APPDATA%\com.kedai.app\logs\`)。
 - 自动清理:启动时删除 3 天前的过期日志。
-- 数据库:`data/kedai.db`(WAL 模式,10 张表;桌面场景在 `%APPDATA%\com.kedai.app\data\`)。
+- 数据库:`<数据目录>/kedai.db`(WAL 模式,28 张表;桌面版与已有用户数据的场景固定在 `%APPDATA%\com.kedai.app\data\`)。
 
 ## API 概览
 
@@ -195,8 +222,18 @@ kedai/
 | PUT/DELETE | `/api/world-books/{id}` | 更新(启用/绑定/改名)/删除世界书 |
 | GET | `/api/world-books/{id}/entries` | 世界书条目预览 |
 | POST | `/api/agent/plan` | 预览行动计划(不执行) |
-| POST | `/api/agent/execute` | 手动执行步骤 |
+| POST | `/api/agent/execute` | 手动执行步骤(历史桩,返回 501) |
 | POST | `/api/agent/interrupt` | 中断 Agent |
+| GET/POST | `/api/tasks` | 任务列表/新建任务 |
+| GET/DELETE | `/api/tasks/{id}` | 任务详情/删除 |
+| POST | `/api/tasks/{id}/run`\|`stop`\|`approve`\|`followup`\|`plan-chat` | 运行/停止/批准/追问/计划对话 |
+| GET | `/api/tasks/{id}/calls` | 任务 LLM 调用追踪 |
+| GET | `/api/tasks/events` | **任务事件 SSE 流**(取代轮询) |
+| GET | `/api/tasks/usage-total` | 任务 token 用量汇总 |
+| GET/POST/PATCH/DELETE | `/api/memory*` | 记忆库列表/蒸馏/检索/精简/新增/编辑/删除(七端点) |
+| GET/PUT/DELETE | `/api/plugins/tools*` | 自定义工具插件管理 |
+| GET/POST/PUT/DELETE | `/api/skills*` | 技能库管理 |
+| GET | `/api/repo-index` | 仓库索引(开发辅助) |
 
 ### SSE 事件格式
 
@@ -212,23 +249,23 @@ data: {"type":"tool_result","name":"calculator","output":{"result":408}}
 data: {"type":"finish","usage":{"prompt_tokens":166,"completion_tokens":35,"total_tokens":201,"context_tokens":490},"content":"…"}
 ```
 
-事件类型:`token`(文本片段)、`step`(Agent 步骤)、`tool_call`/`tool_result`(工具调用)、`interrupted`(中断)、`finish`(结束,含 usage)。
+事件类型:`token`(文本片段)、`step`(Agent 步骤)、`tool_call`/`tool_result`(工具调用)、`tool_authorization_required`(工具未获授权,前端提供授权入口)、`vars`(变量树同步)、`interrupted`(中断)、`error`(错误终态,含 code/message/retryable)、`finish`(结束,含 usage)、`task`(任务模式事件)。
 
 ## 世界书(World Info)
 
 - **来源**:两种——独立上传(SillyTavern 导出格式,顶层 `entries` 对象/数组)与角色卡内嵌 `character_book.entries`(兼容 V2 顶层与 V3 `data.character_book` 两种布局)。
-- **注入规则**:常驻条目(`constant=true`,启用的)始终注入;非常驻条目按 `keys` 对最近 6 条用户消息做大小写不敏感子串匹配,或按条目 `regex`+`use_regex` 做正则匹配(优先于 keys),命中才注入;`enabled=false` / 非常驻且无 key 无 regex 的条目跳过。
+- **注入规则**:常驻条目(`constant=true`,启用的)始终注入;非常驻条目按 `keys` 对最近 `depth` 条用户消息做大小写不敏感子串匹配(`depth` 缺省 4,0 = 全部历史),或按条目 `regex`+`use_regex` 做正则匹配(优先于 keys),命中才注入;`enabled=false` / 非常驻且无 key 无 regex 的条目跳过。
 - **自动转换**:上传(独立世界书与角色卡内嵌)时自动规范化酒馆变体——关键词兼容 `keys/key/keywords/keyword` 字段名与逗号分隔字符串、`constant` 兼容字符串/数字形态并支持缺失时自动判定(无关键词无正则 → 常驻)、`role` 缺失即「自动」(按 常驻→system、激发→user 分配)。上传响应附带转换统计 `conversion`。
 - **自动分配机制自检**:世界书窗口「检查自动分配机制」按钮(或 `GET /api/world-books/auto-assign-check`)可一键验证条目解析、属性自动分配、转换链路是否可用。
 - **管理**:侧边栏「世界书」按钮打开管理界面——上传、查看条目(含正则标记)、绑定角色(空=全局)、启用/停用、删除。
-- **持久化**:`data/kedai.db` 的 `world_books` 表,原始 JSON 无损保留(`data_raw`)。
+- **持久化**:`<数据目录>/kedai.db` 的 `world_books` 表,原始 JSON 无损保留(`data_raw`)。
 
 ## 提示词注入
 
 - **简单模式**:字数 / 转述 / 对话 / 视角 四项,启用项按可调顺序合成一条注入提示词拼入系统提示词末尾,对所有会话生效(支持酒馆宏)。
 - **禁词库**(简单模式):自由编辑「禁词 → 替换词」映射表。输出含禁词时,**所有模式**(fast/deep/agent/custom)先注入自省提示词要求换用更得体表达;deep/agent/custom 模式另由引擎在生成收尾调用 `censor_text` 工具做同义替换兜底(替换后同时作用于落库与前端显示),fast 模式无工具、仅靠提示词预防。替换词留空 = 直接删除该词。
 - **复杂模式(楼层)**:仿 SillyTavern Prompt Manager 的楼层系统——角色/位置/深度/拖拽排序,可导入酒馆预设(`examples/presets/` 示范)。
-- **管理**:设置 → 提示词注入,或「提示词管理」弹窗;配置持久化到 `data/prompt_floors.json`。
+- **管理**:设置 → 提示词注入,或「提示词管理」弹窗;配置持久化到 `<数据目录>/prompt_floors.json`。
 
 ## 消息 HTML 渲染
 
@@ -255,24 +292,31 @@ data: {"type":"finish","usage":{"prompt_tokens":166,"completion_tokens":35,"tota
 
 ```bash
 cd server-rs
-cargo test          # 单元测试 + API 集成测试(219 个)
+cargo test          # 单元测试 + API 集成测试(825 个:654 单测 + 171 集成,2026-09-08 实测)
 cd web
-npm test            # Vitest 前端测试(62 个)
+npm test            # Vitest 前端测试(627 个 / 65 文件,2026-09-09 实测)
+npm run typecheck   # vue-tsc 模板/脚本类型检查
+npm run check       # 仓库根:一键全量检查(tools/check-all.ps1)
 ```
 
-覆盖:角色卡解析(V2/V3/未知字段/PNG tEXt/无效输入)、世界书解析(ST 导出/角色卡内嵌/正则条目/条目过滤)、世界书 API 集成(CRUD/绑定/预览)、世界书注入逻辑(常驻/关键词/正则/禁用)、正则脚本解析与占位符替换、Token 计数、状态机迁移、规划器/反思器、计算器工具、API 集成(CRUD/SSE/导入导出/Agent plan)、mvu 变量系统、EJS 渲染器、提示词注入、Agent 流程库。
+覆盖:角色卡解析(V2/V3/未知字段/PNG tEXt/无效输入)、世界书解析(ST 导出/角色卡内嵌/正则条目/条目过滤)、世界书 API 集成(CRUD/绑定/预览)、世界书注入逻辑(常驻/关键词/正则/禁用)、正则脚本解析与占位符替换、Token 计数、状态机迁移、规划器/反思器、计算器工具、API 集成(CRUD/SSE/导入导出/Agent plan)、mvu 变量系统、EJS 渲染器、提示词注入、Agent 流程库、缓存诊断与四级水位、前缀一致性回归、记忆蒸馏与衰减排序、技能渐进披露清单、子代理深度/并发/截断守卫。
 
 ## Roadmap
 
 - [x] 世界书(World Info)按 key 注入
 - [x] Tauri 桌面化(安装包 + 窗口 + 品牌图标)
 - [ ] Oobabooga / KoboldAI 连接器适配
-- [ ] 智能上下文压缩(摘要/滑动窗口)
-- [ ] LLM 原生 function calling 全链路
-- [ ] 自定义工具注册(OpenAI 格式 JSON 配置)
+- [x] 智能上下文压缩(可逆投影 + LLM 摘要,manual/auto 模式,`/api/chat/compact`)
+- [x] 缓存感知压缩管线(usage 落库 + 四级水位诊断 `/api/diagnostics/cache` + 摘要槽增量化 + snip 零成本裁剪)
+- [x] 跨会话记忆蒸馏(`memory_entries` 表 + `/api/memory/*` 七端点 + 记忆库面板)
+- [x] 技能渐进披露(name+description 预载,正文按需加载)与子代理调度守卫(深度/并发/结果截断可配置)
+- [x] 任务模式全面重构(task_service 目录模块化 + 状态枚举化 + 任务事件 SSE 实时推送取代轮询 + 提示词管线整合与双模式提示词类型级隔离,见 [docs/任务模式重构-变更说明.md](docs/任务模式重构-变更说明.md))
+- [x] 三档授权模式(严格/宽松/放行,按「操作类型 × 路径区域」判定;任务模式工具策略 `task_tool_policy`;授权管理面板可查看并撤销已授权限;见 [docs/授权模式.md](docs/授权模式.md))
+- [x] LLM 原生 function calling 全链路(角色扮演 agent/custom 与任务六模式均下发工具定义)
+- [x] 自定义工具注册(`<数据目录>/plugins/tools/*.json` 白名单脚本工具)
 - [ ] 工具执行沙箱隔离
 - [ ] 知识库向量检索工具
-- [ ] SettingsModal.vue(58KB)拆分
+- [x] SettingsModal.vue 拆分(5.8KB 薄壳;SettingsHub + components/settings/ 十 section + composables)
 
 ## 示例模板(Skill 与工具插件)
 
@@ -292,7 +336,5 @@ npm test            # Vitest 前端测试(62 个)
 - 酒馆助手(SillyTavern-Assistant)兼容层的 `<UpdateVariable><JSONPatch>` 输出协议参考 SillyTavern 社区插件生态的公开约定。
 
 ## 许可与说明
-
-本项目采用 **MIT License**。
 
 本地个人创作工具,数据不上传任何第三方(用户自定义远程后端除外)。

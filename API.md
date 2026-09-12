@@ -2,7 +2,7 @@
 
 基地址:开发模式 `http://127.0.0.1:3001`(前端经 Vite 代理 `/api`);生产模式同域。
 
-所有请求/响应均为 `application/json`(除文件上传与 SSE 流)。除 `/api/health` 外,API 请求必须携带服务启动时生成或由 `KEDAI_API_TOKEN` 固定配置的 Bearer token;非 loopback 监听还必须显式设置 `KEDAI_ALLOW_REMOTE=1`,且固定 token 至少 32 字符。运行时主 Agent 提示词统一来自 `DATA_DIR/AGENTS_RUNTIME.md`,不是仓库开发用 `AGENTS.md`。
+所有请求/响应均为 `application/json`(除文件上传与 SSE 流)。除 `/api/health`、`/api/bootstrap` 与 `/api/avatars/*` 外,API 请求必须携带服务启动时生成或由 `KEDAI_API_TOKEN` 固定配置的 Bearer token;非 loopback 监听还必须显式设置 `KEDAI_ALLOW_REMOTE=1`,且固定 token 至少 32 字符。运行时主 Agent 提示词统一来自 `DATA_DIR/AGENTS_RUNTIME.md`,不是仓库开发用 `AGENTS.md`。
 
 ---
 
@@ -121,9 +121,23 @@
 
 ### GET `/api/settings/models` — 可用模型列表
 
+响应:`{ models: string[] }`
+
 ### GET `/api/settings/info` — 当前连接信息(不含密钥)
 
-`{ connector, model, availableConnectors }`
+`{ connector, model, models, availableConnectors }`
+
+### GET `/api/settings/model` / PUT `/api/settings/model` — 获取 / 切换当前模型
+
+### POST `/api/settings/refresh-models` — 重新拉取模型列表
+
+### GET / PUT `/api/settings/agent-prompt` — 读取 / 写入运行时主 Agent 提示词(`DATA_DIR/AGENTS_RUNTIME.md`)
+
+### POST `/api/settings/prompt-preview` — 预览最终提示词(不发起生成)
+
+### GET `/api/diagnostics/cache` — 缓存命中率 / 费用估算 / 四级水位诊断
+
+### GET `/api/token/session-total` / `/api/token/global-total` — 会话级 / 全局 token 累计
 
 ---
 
@@ -287,13 +301,169 @@
 请求:`{ message, agent_mode?, session_id? }`
 响应:`{ plan, summary, tools, history? }`;`agent_mode=custom` 时 `summary` 为「自定义流程:共 N 步」,`plan.steps` 含步骤 `name`;流程未启用/非法 → 400 中文错误。
 
-### POST `/api/agent/execute` — 手动执行指定步骤
+### POST `/api/agent/execute` — 手动执行指定步骤(历史桩,返回 501 未实现)
 
 请求:`{ session_id, step? }`(MVP 阶段由引擎自动编排)
 
 ### POST `/api/agent/interrupt` — 中断当前执行
 
 请求:`{ session_id }` → `{ ok: true }`
+
+### GET / POST / DELETE `/api/agent/tool-permissions` — 工具授权查询 / 授予 / 撤销
+
+查询响应含 `tools`(每项 `name/description/risk/allowed/reason`)与 `grants`(该会话/角色的
+显式授权:`{ session: string[], role: string[] }`)。授权作用域 `scope` 仅支持 `session` 与 `role`;
+空 `scope_id`(匿名会话)会被拒绝,避免跨匿名会话串权。
+
+### POST `/api/agent/tool-permissions/resolve` — 处理「工具未授权」事件(once/session/role/deny)
+
+### 授权模式与任务工具策略(settings 字段)
+
+| 字段 | 默认 | 说明 |
+|---|---|---|
+| `authorization_mode` | `loose` | `strict` / `loose` / `bypass`;非法值 400。判定矩阵见 [docs/授权模式.md](docs/授权模式.md) |
+| `bypass_blacklist` | `[]` | 「始终需授权」清单(三档下都需授权) |
+| `tool_authorization_timeout_secs` | `300` | 授权等待超时(30..=1800) |
+| `task_tool_policy` | `deny_dangerous` | `all` / `deny_dangerous` / `allowlist`;任务模式工具集合 |
+| `task_tool_allowlist` | `[]` | `task_tool_policy=allowlist` 时的白名单 |
+| `task_persona_full` | `false` | 执行者人设:`false` 精简(description+personality)/`true` 完整;仅任务模式生效 |
+| `task_prompt_inject_enabled` | `false` | 任务模式是否继承 `prompt_floors.json` 提示词注入(2026-09-10 实跑修复):`false` 隔离(默认,避免角色扮演文章要求污染任务)/`true` 沿用旧行为 |
+| `bypass_mode` | `false` | 已废弃;`true` → `bypass`,`false` → `strict` |
+
+任务模式无 UI 授权上下文,未放行工具不进入授权等待,而是立即回灌
+`{"error": ..., "code": "tool_policy_denied"}`。
+
+---
+
+## 任务模式(task 工作台)
+
+任务运行模式为六值枚举 `TaskRunMode`:`legacy`(三段式,默认)/ `solo` / `multi` / `plan` / `team` / `custom`,语义见 [docs/任务引擎六模式.md](docs/任务引擎六模式.md)。
+
+### GET `/api/tasks` — 任务列表
+
+### POST `/api/tasks` — 新建任务
+
+### GET `/api/tasks/{id}` — 任务详情(含子任务、阶段消息)
+
+### DELETE `/api/tasks/{id}` — 删除任务
+
+### POST `/api/tasks/{id}/run` — 启动任务
+
+### POST `/api/tasks/{id}/stop` — 停止任务
+
+### POST `/api/tasks/{id}/approve` — 批准计划(plan 模式:planned 态批准后可携修改后计划,solo 续跑)
+
+### POST `/api/tasks/{id}/followup` — 终态追加指令(done/partial/error/ended 可追加,solo 续跑续写成果)
+
+请求体 `{ content, mode? }`:`mode` 缺省/空 = `append`(新产出以「追加 N」段附加进
+`result`,保留原文);`replace` = 用新产出整体替换 `result`(段标「修订 N」,用于
+「压缩/重写/改前面」类指令);未知值 400(VALIDATION)。
+
+### POST `/api/tasks/{id}/plan-chat` — 批准环节规划对话(planned 态按反馈修订计划)
+
+### GET `/api/tasks/{id}/calls` — 任务 LLM 调用追踪(「调用情况」面板)
+
+### GET `/api/tasks/events` — **任务事件 SSE 流**
+
+取代前端 REST 轮询;事件 `kind` 取值:`created` | `status` | `plan` | `subtask` | `usage` | `llm_call` | `deleted` | `agent_status` | `approval_required` | `delta`(`delta` 为流式正文增量暂态事件,不落库;权威数据以 `llm_call` 落库行 / `calls` 端点为准)。
+
+### GET `/api/tasks/usage-total` — 全部任务 token 用量累计
+
+---
+
+## 记忆库(跨会话记忆蒸馏)
+
+`memory_entries` 表按角色维度存储,十端点:
+
+### POST `/api/memory/distill` — 蒸馏指定会话(需开启 `memory_distill_enabled`)
+
+响应含 `{ ok, inserted, skipped, character_id }`。
+
+### GET `/api/memory?character_id=…` — 按角色列出全部记忆(最新在前)
+
+条目字段含 `selected`(是否参与注入)与 `pinned`(常驻置顶,最高注入优先级)。
+
+### GET `/api/memory/search?character_id=&q=&limit=` — 检索记忆条目
+
+FTS5 全文检索(BM25 排序);查询短于 3 字符时后端回退 `LIKE`(trigram 分词器限制)。
+`limit` 默认 20、上限 100。响应 `{ memories: [...] }`。
+
+### POST `/api/memory/prune` — 精简记忆条目(硬删除该角色 `selected=0` 的归档条目)
+
+请求 `{ character_id }`;响应 `{ ok, removed }`。
+
+### GET `/api/memory/embedding-status` — 向量索引状态
+
+响应 `{ enabled, model, configured_dim, status: { total, embedded, dim, dim_mismatch } }`。
+`dim_mismatch` 非空表示换过模型/维度,需调用重建。
+
+### POST `/api/memory/rebuild-embeddings` — 手动重建向量索引
+
+清空向量表后按批回填全部记忆;需先开启 `embedding_enabled` 且凭据可用。
+响应 `{ ok, embedded, dim }`;中途失败返回 `{ error, done }`(已处理条数)。
+
+### POST `/api/memory` — 手动添加(kind='manual')
+
+### PATCH `/api/memory/{id}` — 编辑 content / selected / pinned
+
+### DELETE `/api/memory/{id}` — 删除(204 无正文)
+
+### POST `/api/settings/embedding/test` — 测试向量化连接
+
+嵌入一条固定文本,验证地址/Key/模型是否可用。响应 `{ ok, dim?, latency_ms?, message }`;
+成功时回传**实际维度**(可用于回填 `embedding_dim`)。不写库、不改配置。
+
+---
+
+## 插件 / 技能 / 其他
+
+### GET / POST / DELETE `/api/plugins/tools*` — 自定义工具插件(列表 / 重载 / 上传 / 删除)
+
+### GET / POST / PUT / DELETE `/api/skills*` — 技能库(列表 / 导入 / 更新 / 删除)
+
+`SkillRecord` 含 `allowed_tools`(工具白名单)、`run_as_subagent`(是否可作为子智能体技能派发)、`model`(模型覆盖)元数据。
+
+### GET / PUT `/api/audio` — 音频播放器(bgm/ambient 双通道)
+
+### GET `/api/scripts/tree` — 用户脚本树
+
+### GET `/api/slash/commands` — slash 命令列表
+
+### POST `/api/macros/expand` — 宏展开预览
+
+### GET / POST / PATCH / DELETE `/api/quick-replies*` — 快速回复管理
+
+### GET `/api/resource/proxy` — 角色卡远程资源界面代理(https + SSRF 防护)
+
+### GET `/api/repo-index` — 仓库索引(开发辅助)
+
+---
+
+## 会话补充端点
+
+### POST `/api/chat/sessions/{id}/truncate` — 保留 anchor 消息,删除其后所有消息(编辑用户消息后重发)
+
+### POST `/api/chat/sessions/{id}/regreet` — 重新生成开场白
+
+### PUT `/api/chat/sessions/{id}/assistant-vars` — 写入酒馆助手变量树
+
+### PATCH `/api/chat/messages/{id}/variables` — 保存消息级变量
+
+### POST `/api/chat/messages/{id}/swipe` — 切换消息 swipe 版本(extra.swipes)
+
+### GET `/api/chat/init-vars` — 初始化变量
+
+### POST `/api/chat/generate-raw` — 角色卡资源页作者脚本的自由生成桥(一次性、非流式、不写会话)
+
+### POST `/api/chat/compact` — 触发上下文压缩(manual)
+
+### POST `/api/chat/compact/clear` — 清除压缩摘要
+
+### GET / PUT / PATCH `/api/variables` — 7 作用域变量(读整树 / 整树覆写 / JSON Patch 子集)
+
+### GET `/api/chat/sessions/{id}/undo` — 回退快照列表
+
+### POST `/api/undo/{id}/restore` — 按快照恢复
 
 ---
 
