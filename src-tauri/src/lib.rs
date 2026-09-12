@@ -3,26 +3,176 @@
 // → 健康检查通过后再导航并展示窗口。
 
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
+// SystemTime/UNIX_EPOCH 仅用于便携版数据迁移的时间戳标记(桌面专属)
+#[cfg(desktop)]
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use tauri::Manager;
+// 关闭确认弹窗用的 DialogExt 扩展(trait 需在作用域内才能调用 window.dialog());
+// 该确认流程仅桌面存在(Android 无 window CloseRequested 事件,见 run() 的 RunEvent 分支)
+#[cfg(desktop)]
+use tauri_plugin_dialog::DialogExt;
+
+mod native_bridge;
 
 const READY_TIMEOUT: Duration = Duration::from_secs(60);
 const READY_INTERVAL: Duration = Duration::from_millis(250);
 
+/// 实际使用的服务端口(setup 时从 config 解析并托管),退出时据此清理端口残留。
+/// 仅桌面读取(Android 无端口清理流程),故标注 desktop 以消除移动端 dead_code 警告。
+#[cfg(desktop)]
+struct ResolvedPort(u16);
+
+/// 结束占用指定端口的**其它**进程(排除自身):关闭 Kedai 时一并清理可能存在的
+/// 独立后端残留(例如上次直接运行 dist\kedai-server.exe 未退出、或旧桌面版未回收)。
+/// 桌面版的内嵌后端与本进程同 PID,会被排除,不影响正常退出路径。
+/// 实跑反馈「点退出后 kedai-server 仍在跑」的兜底修复。
+///
+/// 平台差异:依赖 netstat/taskkill,仅 Windows 桌面存在;Android 沙箱内既无这些命令,
+/// 也不存在「多个 Kedai 实例争抢固定端口」的场景(系统 launcher 保证单实例)。
+#[cfg(desktop)]
+fn terminate_other_port_owners(port: u16) {
+    let self_pid = std::process::id();
+    let out = match std::process::Command::new("netstat").arg("-ano").output() {
+        Ok(o) => o,
+        Err(_) => return,
+    };
+    let text = String::from_utf8_lossy(&out.stdout);
+    let needle = format!(":{port}");
+    for line in text.lines() {
+        // TCP    127.0.0.1:3001    0.0.0.0:0    LISTENING    8748
+        if !line.contains("LISTENING") {
+            continue;
+        }
+        let cols: Vec<&str> = line.split_whitespace().collect();
+        if cols.len() < 4 || !cols[1].ends_with(&needle) {
+            continue;
+        }
+        let pid = match cols[cols.len() - 1].parse::<u32>() {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        if pid == self_pid {
+            continue;
+        }
+        let _ = std::process::Command::new("taskkill")
+            .args(["/F", "/PID", &pid.to_string()])
+            .output();
+    }
+}
+
+/// 应用入口。
+///
+/// `mobile_entry_point` 在 Android/iOS 上生成 JNI/FFI 入口符号(`Java_<pkg>_<cls>_...`),
+/// 供 TauriActivity 在应用启动时回调;桌面端该属性被 cfg 排除,行为不变。
+/// 缺此属性时 Android 能编译通过但启动即闪退(找不到原生入口)。
+/// app_data_dir() 失败时的回退目录。
+/// - 桌面:沿用历史行为 %APPDATA%\com.kedai.app;
+/// - Android:无 %APPDATA%,返回错误由启动流程记录并退出(宁可明确报错也不写错位置)。
+#[cfg(desktop)]
+fn fallback_app_data_dir() -> Result<PathBuf, String> {
+    Ok(PathBuf::from(std::env::var("APPDATA").unwrap_or_default()).join("com.kedai.app"))
+}
+
+#[cfg(mobile)]
+fn fallback_app_data_dir() -> Result<PathBuf, String> {
+    Err("无法解析 Android 应用数据目录(app_data_dir 调用失败)".into())
+}
+
+/// JNI 入口:Android 在 `System.loadLibrary("kedai_desktop_lib")` 时调用本函数,
+/// 把 JavaVM 指针交给原生库。后端 API Key 加密与原生能力桥(外链/分享/保活)
+/// 都依赖它(见 server-rs/src/services/jni_bridge.rs)。
+///
+/// 定义在此(cdylib 根)是为了保证符号被导出 —— 依赖库内部定义的 `JNI_OnLoad`
+/// 可能被链接器丢弃。整个依赖栈中没有其它 `JNI_OnLoad`(已核查 tao/wry/tauri)。
+///
+/// # Safety
+/// 由 JVM 调用,`vm` 为其传入的合法 `JavaVM*`;返回期望的 JNI 版本。
+#[cfg(target_os = "android")]
+#[no_mangle]
+pub unsafe extern "C" fn JNI_OnLoad(vm: *mut std::ffi::c_void, _reserved: *mut std::ffi::c_void) -> i32 {
+    kedai_server::services::jni_bridge::on_load(vm)
+}
+
+/// 前端请求退出应用的事件名(Android 返回键在无处可退时触发)。
+///
+/// 为什么用事件而不是自定义命令:
+/// Tauri 2 的 IPC 对 **remote origin**(本应用页面来自 http://127.0.0.1:<port>/,
+/// 而非 tauri:// 协议)会做 ACL 校验,而框架**不会**为 `#[tauri::command]` 生成权限条目
+/// (已确认 gen/schemas 中无对应条目),实测调用自定义命令报
+/// `exit_app not allowed. Plugin not found`;
+/// `plugin:app|exit` 同样被拒(无 Rust 侧权限声明),
+/// `WebviewWindow::close()` 在 Android 上又不结束 Activity(进程仍在且 Promise 悬挂)。
+/// 而事件系统(`core:event:allow-emit`)已包含在 core:default 内,无需新增权限。
+///
+/// 语义与桌面版一致:后端与壳同进程,退出即整体结束,无残留服务。
+const EXIT_APP_EVENT: &str = "kedai://exit-app";
+
+#[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         // 导出保存对话框 + 文件写入(用户自由选择导出位置)
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
         .setup(|app| {
-            let app_data = app.path().app_data_dir().unwrap_or_else(|_| {
-                PathBuf::from(std::env::var("APPDATA").unwrap_or_default()).join("com.kedai.app")
-            });
+            // 前端请求退出(Android 返回键在无处可退时发出)。
+            // 用事件而非自定义命令的原因见 EXIT_APP_EVENT 的注释。
+            {
+                use tauri::Listener;
+                let handle = app.handle().clone();
+                app.listen(EXIT_APP_EVENT, move |_| {
+                    tracing::info!("收到前端退出请求,结束进程");
+                    handle.exit(0);
+                });
+
+                // 原生能力事件(外链/分享/保活):同样是「前端 emit → 原生执行」,
+                // 绕开 remote origin 下的自定义命令 ACL 限制。
+                // 载荷是 JSON 字符串(&str),解析失败仅记 warn 不 panic。
+                app.listen(native_bridge::OPEN_EXTERNAL_EVENT, |event| {
+                    match serde_json::from_str::<native_bridge::OpenExternalPayload>(event.payload()) {
+                        Ok(p) => {
+                            if let Err(e) = native_bridge::open_external(&p.url) {
+                                tracing::warn!(url = p.url, error = e, "打开外链失败");
+                            }
+                        }
+                        Err(e) => tracing::warn!(error = e.to_string(), "open-external 载荷解析失败"),
+                    }
+                });
+                app.listen(native_bridge::SHARE_FILE_EVENT, |event| {
+                    match serde_json::from_str::<native_bridge::ShareFilePayload>(event.payload()) {
+                        Ok(p) => {
+                            if let Err(e) = native_bridge::share_file(&p.name, &p.content) {
+                                tracing::warn!(name = p.name, error = e, "分享导出失败");
+                            }
+                        }
+                        Err(e) => tracing::warn!(error = e.to_string(), "share-file 载荷解析失败"),
+                    }
+                });
+                app.listen(native_bridge::KEEPALIVE_START_EVENT, |_| {
+                    if let Err(e) = native_bridge::keepalive_start() {
+                        tracing::warn!(error = e, "启动前台服务保活失败");
+                    }
+                });
+                app.listen(native_bridge::KEEPALIVE_STOP_EVENT, |_| {
+                    if let Err(e) = native_bridge::keepalive_stop() {
+                        tracing::warn!(error = e, "停止前台服务保活失败");
+                    }
+                });
+            }
+
+            // 数据目录:Android 上 app_data_dir() 映射到应用私有目录(/data/data/<pkg>/files),
+            // 无 %APPDATA% 可回退,故回退实现按平台分离(见 fallback_app_data_dir)。
+            let app_data = match app.path().app_data_dir() {
+                Ok(dir) => dir,
+                Err(_) => fallback_app_data_dir()?,
+            };
             let data_dir = app_data.join("data");
             let log_dir = app_data.join("logs");
 
             std::fs::create_dir_all(&log_dir)?;
+            // 便携版数据迁移仅桌面存在:靠 exe 同级向上找 data/,APK 内无此目录布局
+            #[cfg(desktop)]
             if let Some(project_data) = find_project_data_dir() {
                 if let Err(error) = migrate_data_if_needed(&project_data, &data_dir) {
                     write_start_error(&log_dir, &format!("旧数据迁移失败: {error}"));
@@ -33,10 +183,35 @@ pub fn run() {
             std::env::set_var("LOG_DIR", &log_dir);
             eprintln!("[信息] DATA_DIR={}", data_dir.display());
 
+            // Android UI 迭代加速(仅 debug 构建):前端 dist 默认编译期内嵌进二进制
+            // (server-rs/api/static_files.rs 的 include_dir),每次改样式都要重编 Rust。
+            // 若应用私有目录下存在外置 dist,则经 KEDAI_WEB_DIST 覆盖为磁盘读取,
+            // 迭代流程变成「npm build → adb push(tar 经 run-as 解包)→ 重启应用」,
+            // 无需重编 Rust。
+            //
+            // 为什么用应用私有目录而非 /sdcard/Android/data/<pkg>/files:
+            // 那个目录由 adb shell 创建时 owner 是 shell,Android 11+ 的 scoped storage
+            // 会拒绝应用读取(即使 chmod 777 也不行,权限检查在 FUSE 层)。
+            // 私有目录 owner 恒为应用自身,读写无限制;adb 侧用 `run-as` 以应用身份写入。
+            #[cfg(all(mobile, debug_assertions))]
+            {
+                let dev_dist = data_dir
+                    .parent()
+                    .map(|p| p.join("kedai-dist"))
+                    .unwrap_or_else(|| data_dir.join("kedai-dist"));
+                if dev_dist.join("index.html").is_file() {
+                    std::env::set_var("KEDAI_WEB_DIST", &dev_dist);
+                    eprintln!("[信息] 使用设备外置前端目录: {}", dev_dist.display());
+                }
+            }
+
             let config = kedai_server::config::AppConfig::from_env();
+            // 托管端口供退出清理使用(见 terminate_other_port_owners);仅桌面消费该状态
+            #[cfg(desktop)]
+            app.manage(ResolvedPort(config.port));
             let app_handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
-                if let Err(error) = start_and_wait_ready(config, app_handle.clone()).await {
+                if let Err(error) = start_and_wait_ready(config, app_handle.clone(), log_dir.clone()).await {
                     write_start_error(&log_dir, &error);
                     eprintln!("[错误] {error}");
                     app_handle.exit(1);
@@ -46,22 +221,110 @@ pub fn run() {
             Ok(())
         })
         .build(tauri::generate_context!())
-        .expect("构建 Kedai 桌面应用失败")
-        .run(|_, _| {});
+        .expect("构建 Kedai 应用失败")
+        .run(|app_handle, event| {
+            // Android 不使用 app_handle(退出无需清理端口),显式忽略以避免未使用告警
+            #[cfg(mobile)]
+            let _ = &app_handle;
+            // 关闭确认(实跑问题 8):拦截窗口关闭,弹「确定退出」确认框;
+            // 用户确认才退出进程(后端与桌面壳同进程,exit 即整体结束,无残留服务)。
+            // 注意:on_window_event 在主线程,不可用 blocking_show,走异步 show 回调。
+            //
+            // 平台差异:Android 没有 WindowEvent::CloseRequested(Activity 不会被「关闭」),
+            // 退出由系统返回键/最近任务驱动,故整段确认流程仅桌面编译。
+            #[cfg(desktop)]
+            if let tauri::RunEvent::WindowEvent {
+                event: tauri::WindowEvent::CloseRequested { api, .. },
+                ..
+            } = event
+            {
+                api.prevent_close();
+                let handle = app_handle.clone();
+                let window = app_handle.get_webview_window("main");
+                // 对话框挂到窗口(无窗口时退回 app handle 的问询对话框)
+                if let Some(window) = window {
+                    window
+                        .dialog()
+                        .message("确定要退出 Kedai 吗?")
+                        .title("Kedai")
+                        .kind(tauri_plugin_dialog::MessageDialogKind::Warning)
+                        .buttons(tauri_plugin_dialog::MessageDialogButtons::OkCancelCustom(
+                            "退出".into(),
+                            "取消".into(),
+                        ))
+                        .show(move |confirmed| {
+                            if confirmed {
+                                // 先清理端口上的其它 Kedai 残留(独立后端等),
+                                // 再退出本进程;确保「关闭 = 全部结束」。
+                                if let Some(port) = handle.try_state::<ResolvedPort>() {
+                                    terminate_other_port_owners(port.0);
+                                }
+                                handle.exit(0);
+                            }
+                        });
+                }
+            }
+
+            // Android:进程级退出前的收尾(返回键退出/系统回收)——
+            // 后端与壳同进程,无需单独 kill;此处仅留观测点便于真机排查。
+            #[cfg(mobile)]
+            if let tauri::RunEvent::ExitRequested { .. } = event {
+                tracing::info!("Kedai Android 进程退出请求");
+            }
+        });
+}
+
+/// 端口当前是否可绑定(用于确认旧实例已真正释放端口)。
+/// 直接试绑一次:成功即空闲;失败说明仍被占用。
+/// 仅桌面使用(Android 无「接管旧实例」流程)。
+#[cfg(desktop)]
+async fn port_bindable(config: &kedai_server::config::AppConfig) -> bool {
+    let addr = format!("{}:{}", config.host, config.port);
+    match tokio::net::TcpListener::bind(&addr).await {
+        Ok(listener) => {
+            drop(listener);
+            true
+        }
+        Err(_) => false,
+    }
 }
 
 async fn start_and_wait_ready(
     config: kedai_server::config::AppConfig,
     app: tauri::AppHandle,
+    log_dir: PathBuf,
 ) -> Result<(), String> {
     let service_url = service_url(&config);
 
-    // 桌面版必须使用本进程内、指向统一 AppData 的后端,不能复用项目目录中的浏览器服务。
+    // 桌面版必须使用本进程内、指向统一 AppData 的后端。端口若已被另一个 Kedai 实例
+    // 占用(最常见:上次未正常退出的旧后端/旧桌面版残留),不能让用户对着旧界面以为
+    //「新版本没生效」——先结束占用者(仅限端口上健康响应为 Kedai 的进程)再接管。
+    //
+    // 平台差异:清理手段是 netstat/taskkill,Android 不可用;且 Android 由系统 launcher
+    // 保证单实例 + 应用私有目录,不存在跨实例争抢同一端口的场景,故整段仅桌面编译。
+    // Android 若端口被占(极少见),走到下方启动逻辑后由绑定错误明确报出。
+    #[cfg(desktop)]
     if health_ok(&config).await {
-        return Err(format!(
-            "端口 {} 已有 Kedai 服务运行,请先关闭浏览器开发服务后再启动桌面版",
+        eprintln!(
+            "[信息] 端口 {} 已有旧 Kedai 实例,正在结束它以启动当前版本",
             config.port
-        ));
+        );
+        terminate_other_port_owners(config.port);
+        // 等端口释放(TCP 表更新有延迟);给 6 秒窗口
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(6);
+        while tokio::time::Instant::now() < deadline {
+            if !health_ok(&config).await && port_bindable(&config).await {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        if health_ok(&config).await {
+            return Err(format!(
+                "端口 {} 仍被其它 Kedai 实例占用,且无法自动结束。\n\
+                 请用任务管理器结束 kedai-server.exe / Kedai.exe 后重启桌面版。",
+                config.port
+            ));
+        }
     }
 
     let (server_error_tx, mut server_error_rx) = tokio::sync::oneshot::channel();
@@ -75,19 +338,35 @@ async fn start_and_wait_ready(
     let deadline = tokio::time::Instant::now() + READY_TIMEOUT;
     while tokio::time::Instant::now() < deadline {
         if let Ok(error) = server_error_rx.try_recv() {
+            // 双启动竞态(TOCTOU):health_ok 通过后另一实例抢先绑定端口,本进程 run_server
+            // 绑定失败(os error 10048)但服务实际健康 → 复用已有实例照常显示窗口,不退出。
+            if health_ok(&config).await {
+                // 复用前校验数据目录:运行中的实例若指向另一套库(如浏览器版用的项目目录),
+                // 静默复用会把桌面版挂到错误的库上——一边写的聊天另一边不可见。
+                // 旧版服务无 data_dir 字段时无法校验,维持复用(竞态的另一方几乎必为桌面版自身)。
+                // 该比较按 Windows 路径规则(大小写/分隔符)归一,故仅桌面启用;
+                // Android 单应用单实例,复用者必为本进程自身,无需路径比对。
+                #[cfg(desktop)]
+                if let Some(dir) = health_data_dir(&config).await {
+                    if !same_data_dir(&dir, &config.data_dir) {
+                        return Err(format!(
+                            "已在运行的 Kedai 实例数据目录与桌面版不一致:\n运行中实例: {dir}\n桌面版: {}\n请先关闭该实例再启动桌面版,否则聊天记录会写到另一套数据库",
+                            config.data_dir.display()
+                        ));
+                    }
+                }
+                tracing::info!(bind_error = error.as_str(), "检测到已有 Kedai 实例,直接复用");
+                eprintln!("[信息] 检测到已有 Kedai 实例,直接复用");
+                show_main_window(&app, &service_url)?;
+                clear_start_error(&log_dir);
+                return Ok(());
+            }
             return Err(format!("Kedai 后端启动失败: {error}"));
         }
         if health_ok(&config).await {
-            let window = app
-                .get_webview_window("main")
-                .ok_or_else(|| "找不到主窗口".to_string())?;
-            window
-                .navigate(url::Url::parse(&service_url).map_err(|e| format!("服务地址非法: {e}"))?)
-                .map_err(|e| format!("主窗口导航失败: {e}"))?;
-            window.show().map_err(|e| format!("主窗口显示失败: {e}"))?;
-            window
-                .set_focus()
-                .map_err(|e| format!("主窗口聚焦失败: {e}"))?;
+            show_main_window(&app, &service_url)?;
+            // 启动成功:清掉历史失败留下的陈旧错误日志,避免误导排查
+            clear_start_error(&log_dir);
             return Ok(());
         }
         tokio::time::sleep(READY_INTERVAL).await;
@@ -97,6 +376,26 @@ async fn start_and_wait_ready(
         "Kedai 后端在 {} 秒内未就绪: {service_url}",
         READY_TIMEOUT.as_secs()
     ))
+}
+
+/// 导航到服务地址并展示/聚焦主窗口(启动成功与复用已有实例两条路径共用)。
+fn show_main_window(app: &tauri::AppHandle, service_url: &str) -> Result<(), String> {
+    let window = app
+        .get_webview_window("main")
+        .ok_or_else(|| "找不到主窗口".to_string())?;
+    window
+        .navigate(url::Url::parse(service_url).map_err(|e| format!("服务地址非法: {e}"))?)
+        .map_err(|e| format!("主窗口导航失败: {e}"))?;
+    window.show().map_err(|e| format!("主窗口显示失败: {e}"))?;
+    window
+        .set_focus()
+        .map_err(|e| format!("主窗口聚焦失败: {e}"))?;
+    Ok(())
+}
+
+/// 删除陈旧的启动错误日志(仅在启动成功/复用成功后调用;失败路径由 write_start_error 重写)。
+fn clear_start_error(log_dir: &Path) {
+    let _ = std::fs::remove_file(log_dir.join("tauri-start-error.log"));
 }
 
 fn service_url(config: &kedai_server::config::AppConfig) -> String {
@@ -125,6 +424,30 @@ async fn health_ok(config: &kedai_server::config::AppConfig) -> bool {
     }
 }
 
+/// 取运行中实例的数据目录(健康响应的 data_dir 字段;旧版服务无此字段返回 None)
+/// 仅桌面使用:配合同实例数据目录一致性校验。
+#[cfg(desktop)]
+async fn health_data_dir(config: &kedai_server::config::AppConfig) -> Option<String> {
+    let url = format!("{}api/health", service_url(config));
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_millis(1200))
+        .build()
+        .ok()?;
+    let body: serde_json::Value = client.get(url).send().await.ok()?.json().await.ok()?;
+    body.get("data_dir")?.as_str().map(|s| s.to_string())
+}
+
+/// Windows 路径宽松比较:忽略大小写与正反斜杠、尾部分隔符差异
+#[cfg(desktop)]
+fn same_data_dir(a: &str, b: &Path) -> bool {
+    let norm = |s: &str| s.replace('/', "\\").trim_end_matches('\\').to_lowercase();
+    norm(a) == norm(&b.to_string_lossy())
+}
+
+/// 以下便携版数据迁移一组函数仅桌面存在:
+/// 依赖 exe 同级向上查找 data/ 与 web/ 的发行目录布局,APK 内无此结构。
+/// Android 的数据目录由系统分配,首次安装即为空,无需迁移。
+#[cfg(desktop)]
 fn find_project_data_dir() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
     let mut current = exe.parent()?.to_path_buf();
@@ -141,6 +464,7 @@ fn find_project_data_dir() -> Option<PathBuf> {
 }
 
 /// 仅当目标没有任何用户数据时执行复制。源目录始终保留,迁移可重复调用且不会覆盖目标。
+#[cfg(desktop)]
 fn migrate_data_if_needed(source: &Path, target: &Path) -> Result<usize, String> {
     if source == target || !has_migratable_data(source) || !target_is_pristine(target) {
         return Ok(0);
@@ -168,6 +492,7 @@ fn migrate_data_if_needed(source: &Path, target: &Path) -> Result<usize, String>
     Ok(copied)
 }
 
+#[cfg(desktop)]
 fn has_migratable_data(path: &Path) -> bool {
     path.join("kedai.db").is_file()
         || path.join("settings.json").is_file()
@@ -175,6 +500,7 @@ fn has_migratable_data(path: &Path) -> bool {
         || path.join("avatars").is_dir()
 }
 
+#[cfg(desktop)]
 fn target_is_pristine(path: &Path) -> bool {
     if !path.exists() {
         return true;
@@ -192,6 +518,7 @@ fn target_is_pristine(path: &Path) -> bool {
     true
 }
 
+#[cfg(desktop)]
 fn copy_tree(source: &Path, target: &Path) -> std::io::Result<usize> {
     std::fs::create_dir_all(target)?;
     let mut copied = 0;
@@ -219,6 +546,7 @@ fn copy_tree(source: &Path, target: &Path) -> std::io::Result<usize> {
     Ok(copied)
 }
 
+#[cfg(desktop)]
 fn rewrite_avatar_paths(target: &Path, old_data_dir: &Path) -> Result<(), String> {
     let database = target.join("kedai.db");
     if !database.is_file() {
@@ -259,6 +587,7 @@ fn write_start_error(log_dir: &Path, message: &str) {
 mod tests {
     use super::*;
 
+    #[cfg(desktop)]
     fn temp_dir(tag: &str) -> PathBuf {
         let stamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)

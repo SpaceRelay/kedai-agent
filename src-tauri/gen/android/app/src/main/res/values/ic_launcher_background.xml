@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 自适应图标背景色:用 Kedai 画布纸色(近白的淡粉),与图标本体的粉色logo 形成
+     同色系但可辨识的对比;纯白会显得与整体视觉无关。 -->
+<resources>
+  <color name="ic_launcher_background">#FBEFF1</color>
+</resources>

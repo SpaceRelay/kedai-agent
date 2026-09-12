@@ -12,6 +12,7 @@
     {
       "identifier": "fs:allow-write-text-file",
       "allow": [{ "path": "**" }]
-    }
+    },
+    "core:window:allow-close"
   ]
 }
