@@ -5,7 +5,8 @@ import { storeToRefs } from 'pinia';
 
 export function useAgentSettings() {
   const store = useAppStore();
-  const { agentSystemPrompt, searchEndpoint, mvuVarsPosition, reflectPrompt } = storeToRefs(store);
+  const { agentSystemPrompt, searchEndpoint, mvuVarsPosition, reflectPrompt, taskPersonaFull, taskPromptInjectEnabled } =
+    storeToRefs(store);
 
   const agentSaving = ref(false);
   const agentMsg = ref('');
@@ -26,6 +27,10 @@ export function useAgentSettings() {
         search_endpoint: searchEndpoint.value,
         mvu_vars_position: mvuVarsPosition.value,
         reflect_prompt: reflectPrompt.value,
+        // 执行者人设精简/完整(R3a):随 Agent 设置保存链路持久化,仅任务模式生效
+        task_persona_full: taskPersonaFull.value,
+        // 任务模式提示词注入继承开关(2026-09-10 实跑修复):默认隔离,仅任务模式生效
+        task_prompt_inject_enabled: taskPromptInjectEnabled.value,
       });
       agentMsg.value = 'Agent 设置已保存';
       setTimeout(() => (agentMsg.value = ''), 2500);

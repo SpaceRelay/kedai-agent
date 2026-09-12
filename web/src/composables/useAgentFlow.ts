@@ -2,6 +2,7 @@
 import { computed, ref } from 'vue';
 import { useAppStore } from '../store';
 import * as api from '../api';
+import { downloadBlob } from '../exportFile';
 import {
   cleanStepsTools,
   setStepToolMode,
@@ -175,13 +176,11 @@ export function useAgentFlow() {
       enabled: cur.enabled,
       steps: cur.steps,
     };
-    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `kedai-flow-${(flowName.value || '未命名').replace(/[\\/:*?"<>|]/g, '_')}.json`;
-    a.click();
-    URL.revokeObjectURL(url);
+    // 直接下载,不弹保存对话框;文件名净化(非法字符→下划线)留在调用方,helper 只管落盘
+    downloadBlob(
+      `kedai-flow-${(flowName.value || '未命名').replace(/[\\/:*?"<>|]/g, '_')}.json`,
+      new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' }),
+    );
   }
 
   async function saveFlowNow(): Promise<void> {

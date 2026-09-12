@@ -18,10 +18,20 @@ export default defineConfig({
     rollupOptions: {
       output: {
         manualChunks(id) {
-          if (!id.includes('node_modules')) return undefined;
-          if (id.includes('markdown-it') || id.includes('sanitize-html')) return 'content-rendering';
-          if (id.includes('vue') || id.includes('pinia')) return 'vue-vendor';
-          return 'vendor';
+          if (id.includes('node_modules')) {
+            if (id.includes('markdown-it') || id.includes('sanitize-html')) return 'content-rendering';
+            if (id.includes('vue') || id.includes('pinia')) return 'vue-vendor';
+            return 'vendor';
+          }
+          // 应用代码分组(配合 App.vue defineAsyncComponent 懒加载):大弹窗各自/分组拆 chunk,
+          // 首屏 index.js 不再内联弹窗实现。仅归组「仅被懒加载入口引用」的组件文件,
+          // 避免把首屏共享模块误划入异步 chunk 造成反向耦合。
+          if (id.includes('/components/SettingsHub') || id.includes('/components/SettingsModal')) return 'modal-settings';
+          if (id.includes('/components/PromptManager')) return 'modal-prompt';
+          if (id.includes('/components/ContractsModal')) return 'modal-contracts';
+          if (id.includes('/components/DevToolsModal')) return 'modal-devtools';
+          if (id.includes('/components/WorldBooksModal')) return 'modal-worldbooks';
+          return undefined;
         }
       }
     }

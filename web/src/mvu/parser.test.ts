@@ -69,6 +69,32 @@ describe('parseUpdateVariable', () => {
     expect(hasUpdateVariable('<UpdateVariable>x</UpdateVariable>')).toBe(true);
     expect(hasUpdateVariable('普通')).toBe(false);
   });
+
+  it('提取块内 <initvar> 段原文(开场白初始化约定)', () => {
+    // wuwa 备用开场形态:<UpdateVariable><initvar>YAML</initvar></UpdateVariable>
+    const text =
+      '开场正文\n<UpdateVariable>\n<initvar>\n当前时间: "第1年 10月13日 周日 14:00"\n好感度: 80\n</initvar>\n</UpdateVariable>\n<StatusPlaceHolderImpl/>';
+    const { cleaned, commands, initvar } = parseUpdateVariable(text);
+    expect(initvar).toContain('当前时间');
+    expect(initvar).toContain('好感度: 80');
+    expect(commands).toHaveLength(0); // initvar 段不含 _.set,不产生命令
+    expect(cleaned).not.toContain('initvar');
+    expect(cleaned).toContain('<StatusPlaceHolderImpl/>');
+  });
+
+  it('initvar 与 _.set 命令共存于同一块', () => {
+    const text =
+      '<UpdateVariable>\n<initvar>\n世界.年分: 2026\n</initvar>\n_.set("a.b", 1, 2);\n</UpdateVariable>';
+    const { commands, initvar } = parseUpdateVariable(text);
+    expect(initvar).toContain('世界.年分: 2026');
+    expect(commands).toHaveLength(1);
+    expect(commands[0].path).toBe('a.b');
+  });
+
+  it('无 initvar 时字段为 undefined', () => {
+    const { initvar } = parseUpdateVariable('<UpdateVariable>_.set("a",1,2)</UpdateVariable>');
+    expect(initvar).toBeUndefined();
+  });
 });
 
 describe('parseJsValue', () => {

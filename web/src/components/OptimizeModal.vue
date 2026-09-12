@@ -11,9 +11,13 @@ import { useAppStore } from '../store';
 import * as api from '../api';
 import { useAgentPromptEditor } from '../composables/useAgentPromptEditor';
 import { computeHitRate, computeCompactionNeed, RECOMMENDED_SETTINGS, buildRecommendedPatch, type RecommendedSetting } from '../contextStats';
+import CacheHealthPanel from './CacheHealthPanel.vue';
+import MemoryPanel from './MemoryPanel.vue';
 
 const store = useAppStore();
 const { lastUsage } = storeToRefs(store);
+// 记忆库按当前角色/会话拉取(store 字段:currentCharacterId / currentSessionId)
+const { currentCharacterId, currentSessionId } = storeToRefs(store);
 const { promptPreview, previewLoading, previewError, loadPromptPreview } = useAgentPromptEditor();
 
 /** 每层 token 估算(懒加载:预览就绪后逐层计数;失败保持 undefined 静默) */
@@ -135,7 +139,7 @@ const close = (): void => {
       <!-- 头部 -->
       <div class="sv-modal-head">
         <h2 class="flex items-center gap-2">
-          <span class="logo" /> 优化面板
+          <span class="sv-supreme pink" /> 优化面板
         </h2>
         <button class="sv-btn ghost sv-btn-square" @click="close">✕</button>
       </div>
@@ -212,9 +216,24 @@ const close = (): void => {
               <b style="font-size: 12px; width: 120px">{{ r.label }}</b>
               <span class="sv-script-meta" style="font-size: 12px">{{ r.value }}</span>
             </div>
-            <p v-if="usageRows.length === 0" class="sv-script-meta" style="font-size: 11px">最近一次请求的 token 用量将在发送消息后显示。</p>
+            <div v-if="usageRows.length === 0" class="sv-empty" style="padding: 14px 0 4px">
+              <div class="sv-empty-geo mb8">
+                <span class="sq black" />
+                <span class="sq pink" />
+                <span class="sq deep" />
+                <i class="diag" />
+              </div>
+              <p style="font-size: 12px">暂无用量数据</p>
+              <p style="font-size: 11px">最近一次请求的 token 用量将在发送消息后显示</p>
+            </div>
           </div>
         </div>
+
+        <!-- 缓存健康(近 N 轮加权命中率 / 费用估算 / 四级水位,数据来自 /api/diagnostics/cache) -->
+        <CacheHealthPanel />
+
+        <!-- 记忆库(当前角色跨会话记忆:蒸馏 / 补录 / 注入开关,数据来自 /api/memory) -->
+        <MemoryPanel :character-id="currentCharacterId" :session-id="currentSessionId" />
 
         <!-- 上下文压缩 -->
         <div class="sv-field">

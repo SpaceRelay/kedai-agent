@@ -6,6 +6,10 @@ import type { TokenUsage, RuntimeSettingsPatch } from './api';
  * 当前请求的 prompt 缓存命中率:缓存命中 token ÷ prompt token(DeepSeek 等提供商);
  * 无缓存字段(prompt_tokens 为 0 或未返回)时为 null(不显示)。
  * 原逻辑位于 ChatWindow.vue:355-360,抽为纯函数供顶栏与优化面板共用。
+ *
+ * 与 `components/cacheHealth.ts` 的 `entryHitRate(hit, miss)` 口径等价:后端
+ * `prompt_tokens = hit + miss`(见 `services/cache_diagnostics.rs`),两者只是分母写法不同;
+ * 本函数额外钳制在 100 内以容忍异常数据。
  */
 export function computeHitRate(u: TokenUsage | null | undefined): number | null {
   if (!u || !u.prompt_tokens) return null;
@@ -36,10 +40,10 @@ export const RECOMMENDED_SETTINGS: RecommendedSetting[] = [
     desc: '状态栏脚本执行前置条件:开启安全 HTML 渲染(样式作用域化 + 脚本受控执行)',
   },
   {
-    key: 'bypass_mode',
-    label: '放行模式',
-    value: true,
-    desc: '除黑名单工具外自动放行,减少工具授权打断(建议自行审阅工具清单)',
+    key: 'authorization_mode',
+    label: '授权模式:宽松',
+    value: 'loose',
+    desc: '严格=读/写/删文件都需授权;宽松=读/写放行、删需授权;放行=仅系统路径写删需授权',
   },
   {
     key: 'max_tool_rounds',
@@ -59,7 +63,9 @@ export const RECOMMENDED_SETTINGS: RecommendedSetting[] = [
 export function buildRecommendedPatch(selected: RecommendedSetting[]): RuntimeSettingsPatch {
   const patch: RuntimeSettingsPatch = {};
   for (const s of selected) {
-    patch[s.key] = s.value;
+    // key/value 类型在 RecommendedSetting 上是联合(keyof Patch × Patch[union]),
+    // TS 无法对「键-值相关联合」的写入收窄,这里按 Record 写入(运行时语义不变)。
+    (patch as Record<string, unknown>)[s.key] = s.value;
   }
   return patch;
 }

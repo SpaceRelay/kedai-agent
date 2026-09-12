@@ -259,7 +259,7 @@ async function loadWorldBooksChecked(): Promise<void> {
       <!-- 头部 -->
       <div class="sv-modal-head">
         <h2 class="flex items-center gap-2">
-          <span class="logo" /> 世界书
+          <span class="sv-supreme pink" /> 世界书
         </h2>
         <button class="sv-btn ghost sv-btn-square" @click="close">✕</button>
       </div>
@@ -315,13 +315,33 @@ async function loadWorldBooksChecked(): Promise<void> {
           </div>
           <p v-if="currentCharacterId && !charEntriesLoaded" class="sv-note">加载中…</p>
           <div v-else-if="currentCharacterId && charMsg?.kind === 'err'" class="sv-empty" style="padding: 16px 12px">
-            <p style="font-size: 12px; color: var(--sv-red)">{{ charMsg.text }}</p>
+            <div class="sv-empty-geo mb8">
+              <span class="sq black" />
+              <span class="sq pink" />
+              <span class="sq deep" />
+              <i class="diag" />
+            </div>
+            <p class="sv-note-mini err">{{ charMsg.text }}</p>
           </div>
-          <div v-else-if="currentCharacterId && charEntries.length === 0" class="sv-empty" style="padding: 16px 12px">
-            <p style="font-size: 12px">该角色卡未内嵌世界书(character_book)。</p>
+          <div v-else-if="currentCharacterId && charEntries.length === 0" class="sv-empty" style="padding: 20px 12px">
+            <div class="sv-empty-geo mb8">
+              <span class="sq black" />
+              <span class="sq pink" />
+              <span class="sq deep" />
+            <i class="diag" />
+            </div>
+            <p style="font-size: 12px">该角色卡未内嵌世界书</p>
+            <p style="font-size: 11px">在角色卡 JSON 中提供 character_book 后即可在此编辑</p>
           </div>
-          <div v-else-if="!currentCharacterId" class="sv-empty" style="padding: 16px 12px">
-            <p style="font-size: 12px">请在左侧选择一个角色以查看/编辑其内嵌世界书。</p>
+          <div v-else-if="!currentCharacterId" class="sv-empty" style="padding: 20px 12px">
+            <div class="sv-empty-geo mb8">
+              <span class="sq black" />
+              <span class="sq pink" />
+              <span class="sq deep" />
+              <i class="diag" />
+            </div>
+            <p style="font-size: 12px">请在左侧选择一个角色</p>
+            <p style="font-size: 11px">选中后可查看/编辑其内嵌世界书</p>
           </div>
           <template v-else>
             <div class="sv-wb-edit">
@@ -456,8 +476,15 @@ async function loadWorldBooksChecked(): Promise<void> {
           </div>
           <div v-if="listLoadError" class="sv-feedback err" style="margin: 8px 0">{{ listLoadError }}</div>
           <div v-else-if="listOpError" class="sv-feedback err" style="margin: 8px 0">{{ listOpError }}</div>
-          <div v-else-if="worldBooks.length === 0" class="sv-empty" style="padding: 24px 12px">
-            <p style="font-size: 12px">暂无独立世界书。上传 JSON 后即在此列出。</p>
+          <div v-else-if="worldBooks.length === 0" class="sv-empty" style="padding: 28px 12px">
+            <div class="sv-empty-geo mb10">
+              <span class="sq black" />
+              <span class="sq pink" />
+              <span class="sq deep" />
+            <i class="diag" />
+            </div>
+            <p style="font-size: 12px">暂无独立世界书</p>
+            <p style="font-size: 11px">上传 JSON 后即在此列出</p>
           </div>
           <div v-else class="sv-datalist">
             <div v-for="b in worldBooks" :key="b.id" class="sv-data-row sv-wb-row">

@@ -156,7 +156,9 @@ function makeColl(elems: Element[]): JqCollection {
   return c;
 }
 
-function queryOne(sel: string, root: Element): Element[] {
+// root 允许 Document:未 setJQueryRoot 时回退 document(既有运行时行为),
+// Document 与 Element 均实现 ParentNode.querySelectorAll,仅首个作用域可能是 Document。
+function queryOne(sel: string, root: Element | Document): Element[] {
   let s = sel.trim();
   if (!s) return [];
   const pseudo: string[] = [];
@@ -166,7 +168,7 @@ function queryOne(sel: string, root: Element): Element[] {
   });
   // 后代选择器
   const parts = s.split(/\s+/).filter(Boolean);
-  let scope: Element[] = [root];
+  let scope: Array<Element | Document> = [root];
   for (const part of parts) {
     const next: Element[] = [];
     for (const sc of scope) {
@@ -175,7 +177,9 @@ function queryOne(sel: string, root: Element): Element[] {
     }
     scope = next;
   }
-  let result = scope;
+  // scope 经 parts 迭代后只剩 Element;唯一例外是纯伪类选择器(无 parts)时仍含初始 root
+  // (可能是 document 回退),保持既有运行时语义,按 Element[] 断言返回。
+  let result: Element[] = scope as Element[];
   for (const p of pseudo) {
     if (p === ':first' && result.length > 0) result = [result[0]];
     else if (p === ':last' && result.length > 0) result = [result[result.length - 1]];
@@ -183,7 +187,8 @@ function queryOne(sel: string, root: Element): Element[] {
   return result;
 }
 
-function matchIn(part: string, scope: Element): Element[] {
+// scope 允许 Document(见 queryOne 注释);仅用 querySelectorAll,行为不变
+function matchIn(part: string, scope: Element | Document): Element[] {
   const tag = /^[a-zA-Z][\w-]*/.exec(part)?.[0] ?? '';
   const idM = /#([\w-]+)/.exec(part);
   const clsM = /\.([\w-]+)/g;

@@ -101,7 +101,9 @@ function stripNode(node: ScriptTreeNode): ScriptTreeNode {
   if (node.type === 'folder') {
     return { ...node, scripts: node.scripts.map(stripNode) };
   }
-  const stripped: ScriptNode = { ...node };
+  // export_with 语义下 content/info 被有意剥离,剥离后结构与 ScriptNode(content 必填)不再一致:
+  // 局部按 Partial 操作(delete 运算符要求可选字段),返回处断言回 ScriptNode(消费侧兼容缺 content 的不可执行节点)。
+  const stripped: Partial<ScriptNode> = { ...node };
   const ew = node.export_with;
   if (ew && ew.data === false) delete stripped.data;
   if (ew && ew.button === false) delete stripped.button;
@@ -110,5 +112,5 @@ function stripNode(node: ScriptTreeNode): ScriptTreeNode {
     delete stripped.content;
     delete stripped.info;
   }
-  return stripped;
+  return stripped as ScriptNode;
 }

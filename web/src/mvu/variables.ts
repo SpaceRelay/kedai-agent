@@ -3,6 +3,7 @@
 // MIT),支持嵌套点路径与 _.set 更新。Kedai 为独立兼容实现。
 import type { JsonValue, UpdateCommand } from './parser';
 import { parseSetStatement } from './parser';
+import { displayChange, unwrapStatLeaf } from './unwrap';
 
 export interface MvuVariables {
   stat_data: Record<string, unknown>;
@@ -61,12 +62,9 @@ export function pathSet(obj: Record<string, unknown>, path: string, value: unkno
   cur[segs[segs.length - 1]] = value;
 }
 
-/** stat_data 叶子是 [新值, 原因] 数组 → 取其 [0] 作为实际值 */
+/** stat_data 叶子是 [新值, 原因] 数组 → 取其 [0] 作为实际值(实现见 unwrap.ts) */
 export function statValue(stat: unknown): JsonValue | undefined {
-  if (Array.isArray(stat) && stat.length >= 1) {
-    return stat[0] as JsonValue;
-  }
-  return stat as JsonValue | undefined;
+  return unwrapStatLeaf(stat) as JsonValue | undefined;
 }
 
 /** 把普通值包装为 [value, reason] 存储对 */
@@ -98,14 +96,14 @@ export function applyUpdate(vars: MvuVariables, cmd: UpdateCommand): void {
     const delta = typeof cmd.newValue === 'number' ? cmd.newValue : Number(cmd.newValue ?? 0);
     const newVal = base + delta;
     pathSet(vars.stat_data, cmd.path, statPair(newVal, cmd.reason));
-    pathSet(vars.display_data, cmd.path, `${String(base)}->${String(newVal)}(${cmd.reason})`);
+    pathSet(vars.display_data, cmd.path, displayChange(base, newVal, cmd.reason));
     return;
   }
   if (cmd.op === 'remove') {
     // 与后端 remove_path 一致:stat_data 删键(逻辑值消失);
     // display_data 保留展示记录(回放时展示"曾删除"),缺失时回放镜像 stat_data
     pathDelete(vars.stat_data, cmd.path);
-    pathSet(vars.display_data, cmd.path, `->null(${cmd.reason})`);
+    pathSet(vars.display_data, cmd.path, displayChange('', null, cmd.reason));
     return;
   }
   if (cmd.op === 'move' && cmd.from) {
@@ -113,7 +111,7 @@ export function applyUpdate(vars: MvuVariables, cmd: UpdateCommand): void {
     const fromVal = statValue(pathGet(vars.stat_data, cmd.from));
     if (fromVal !== undefined) {
       pathSet(vars.stat_data, cmd.path, statPair(fromVal, cmd.reason));
-      pathSet(vars.display_data, cmd.path, `${String(fromVal)}->${String(fromVal)}(${cmd.reason})`);
+      pathSet(vars.display_data, cmd.path, displayChange(fromVal, fromVal, cmd.reason));
       pathDelete(vars.stat_data, cmd.from);
     }
     return;
@@ -122,11 +120,7 @@ export function applyUpdate(vars: MvuVariables, cmd: UpdateCommand): void {
   const oldVal = statValue(oldActual) ?? cmd.oldValue;
 
   pathSet(vars.stat_data, cmd.path, statPair(cmd.newValue, cmd.reason));
-  pathSet(
-    vars.display_data,
-    cmd.path,
-    `${String(oldVal ?? '')}->${String(cmd.newValue)}(${cmd.reason})`,
-  );
+  pathSet(vars.display_data, cmd.path, displayChange(oldVal ?? '', cmd.newValue, cmd.reason));
 }
 
 /** 批量应用命令 */
@@ -235,7 +229,7 @@ function parseIndentedYaml(content: string): Record<string, unknown> {
   return root;
 }
 
-/** 解析 YAML 标量:去引号、数字、布尔、null */
+/** 解析 YAML 标量:去引号、数字、布尔、null、空对象/空数组 */
 function parseYamlScalar(raw: string): JsonValue {
   const t = raw.trim();
   if ((t.startsWith('"') && t.endsWith('"')) || (t.startsWith("'") && t.endsWith("'"))) {
@@ -244,6 +238,8 @@ function parseYamlScalar(raw: string): JsonValue {
   if (t === 'true') return true;
   if (t === 'false') return false;
   if (t === 'null' || t === '~') return null;
+  if (t === '{}') return {};
+  if (t === '[]') return [];
   if (/^-?\d+$/.test(t)) return parseInt(t, 10);
   if (/^-?\d*\.\d+$/.test(t)) return parseFloat(t);
   return t;

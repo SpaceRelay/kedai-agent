@@ -8,6 +8,18 @@ export async function getToolPermissions(sessionId: string, characterId: string)
   return data.tools;
 }
 
+/** 该会话/角色的显式授权(session_grants / role_grants),供授权管理区展示与撤销 */
+export async function getGrants(
+  sessionId: string,
+  characterId: string,
+): Promise<{ session: string[]; role: string[] }> {
+  const query = new URLSearchParams({ session_id: sessionId, character_id: characterId });
+  const data = await request<{ grants?: { session?: string[]; role?: string[] } }>(
+    `/agent/tool-permissions?${query}`,
+  );
+  return { session: data.grants?.session ?? [], role: data.grants?.role ?? [] };
+}
+
 export async function authorizeTool(tool: string, scope: 'session' | 'role', sessionId: string): Promise<void> {
   // 10s 超时:防止请求挂起导致前端 authorizing 永久占用、授权按钮全部禁用
   await request('/agent/tool-permissions', {

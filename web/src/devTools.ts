@@ -11,7 +11,7 @@ export interface ApiEventLogEntry {
   event: SseEvent;
 }
 
-/** 事件类型 → 中文标签(9 类全覆盖;未知类型回退原样) */
+/** 事件类型 → 中文标签(未知类型回退原样) */
 export const EVENT_TYPE_LABELS: Record<string, string> = {
   token: '文本流',
   step: '步骤',
@@ -22,6 +22,7 @@ export const EVENT_TYPE_LABELS: Record<string, string> = {
   interrupted: '中断',
   error: '错误',
   finish: '完成',
+  task: '任务',
 };
 
 /** 事件类型中文标签;未知类型回退原样(便于看到新类型而非吞掉) */
@@ -32,7 +33,8 @@ export function eventTypeLabel(type: string): string {
 /** 全部事件类型清单(面板过滤下拉用;保持稳定顺序) */
 export const EVENT_TYPES: string[] = Object.keys(EVENT_TYPE_LABELS);
 
-/** 过滤事件日志:类型(空/'all' = 全部)+ 会话(空 = 全部会话) */
+/** 过滤事件日志:类型(空/'all' = 全部)+ 会话(空 = 全部会话);
+ *  任务事件(type=task)不隶属任何聊天会话,会话过滤下始终可见 */
 export function filterEventLog(
   entries: ApiEventLogEntry[],
   type: string,
@@ -41,7 +43,7 @@ export function filterEventLog(
   return entries.filter(
     (e) =>
       (type === '' || type === 'all' || e.event.type === type) &&
-      (sessionId === '' || e.session_id === sessionId),
+      (sessionId === '' || e.session_id === sessionId || e.event.type === 'task'),
   );
 }
 

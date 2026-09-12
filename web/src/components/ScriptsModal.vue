@@ -234,7 +234,7 @@ onMounted(() => {
       <!-- 头部 -->
       <div class="sv-modal-head">
         <h2 class="flex items-center gap-2">
-          <span class="logo" /> 脚本管理
+          <span class="sv-supreme pink" /> 脚本管理
         </h2>
         <!-- 导出 / 导入(阶段六 6e) -->
         <div class="flex items-center gap-2" style="margin-right: 8px">
@@ -343,7 +343,8 @@ onMounted(() => {
                   >
                     <input v-model="sub.enabled" type="checkbox" title="启用" @click.stop />
                     <span class="sv-script-name">· {{ sub.name || '(未命名)' }}</span>
-                    <span class="sv-script-meta">{{ sub.content.length }} 字</span>
+                    <!-- 子级按数据约束恒为 script(parseScriptFolder 只产出 script 节点),此处仅类型收窄 -->
+                    <span class="sv-script-meta">{{ (sub as api.ScriptNode).content.length }} 字</span>
                     <button class="sv-btn ghost sv-btn-sm" @click.stop="deleteNode(i, j)">删</button>
                   </div>
                   <button class="sv-btn ghost sv-btn-sm sv-script-addsub" @click="newSubScript(i)">＋ 新增子脚本</button>

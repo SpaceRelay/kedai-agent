@@ -90,7 +90,7 @@ const close = (): void => {
       <!-- 头部 -->
       <div class="sv-modal-head">
         <h2 class="flex items-center gap-2">
-          <span class="logo" /> 事件监控
+          <span class="sv-supreme pink" /> 事件监控
         </h2>
         <button class="sv-btn ghost sv-btn-square" @click="close">✕</button>
       </div>
@@ -101,7 +101,9 @@ const close = (): void => {
           <div class="sv-field-label"><span class="sv-supreme blue" /> 说明</div>
           <p class="sv-note" style="margin: 0; line-height: 1.8">
             SSE 事件日志:全部事件在 <code>store.onSseEvent</code> 一处采集(含本地合成事件,
-            如手动中断),<b>cap 500 条丢最旧</b>。<br />
+            如手动中断;任务模式的创建/执行/状态变化由后端 <code>/api/tasks/events</code> 实时推送
+            「任务」事件,<b>会话过滤下始终可见</b>),
+            <b>cap 500 条丢最旧</b>。<br />
             <b>刷新页面后日志清空</b>(仅当前会话期内有效);后端 recent API 留扩展位。
             长载荷(完成正文/工具输出)默认折叠,点击行展开。
           </p>
@@ -128,8 +130,15 @@ const close = (): void => {
         <!-- 事件列表 -->
         <div class="sv-field">
           <div class="sv-field-label"><span class="sv-supreme yellow" /> 事件日志</div>
-          <div v-if="shown.length === 0" class="sv-empty" style="padding: 24px 12px">
-            <p style="font-size: 12px">暂无事件。发送消息后事件将在此实时出现。</p>
+          <div v-if="shown.length === 0" class="sv-empty" style="padding: 28px 12px">
+            <div class="sv-empty-geo mb10">
+              <span class="sq black" />
+              <span class="sq pink" />
+              <span class="sq deep" />
+            <i class="diag" />
+            </div>
+            <p style="font-size: 12px">暂无事件</p>
+            <p style="font-size: 11px">发送消息后事件将在此实时出现</p>
           </div>
           <div v-else class="sv-datalist" style="max-height: 420px; overflow-y: auto">
             <div

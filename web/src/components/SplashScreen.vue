@@ -1,5 +1,5 @@
 <script setup lang="ts">
-// 启动动画:淡粉红至上主义几何方块 + Logo + 文字逐字淡入
+// 启动动画:Logo + 文字逐字淡入
 import { onMounted, ref } from 'vue';
 import { useAppStore } from '../store';
 
@@ -21,11 +21,6 @@ const letters = 'KEDAI'.split('');
 
 <template>
   <div class="sv-splash" :class="{ 'fade-out': fading }">
-    <!-- 几何装饰 -->
-    <div class="sv-splash-geo pink f1" />
-    <div class="sv-splash-geo deep f2" />
-    <div class="sv-splash-geo soft f3" />
-
     <div class="sv-splash-content">
       <img class="sv-splash-logo" src="/logo.png" alt="Kedai" draggable="false" />
       <h1 class="sv-splash-title">

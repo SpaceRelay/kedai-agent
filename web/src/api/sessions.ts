@@ -49,6 +49,30 @@ export async function fetchHistory(sessionId: string): Promise<ChatMessage[]> {
   return data.messages;
 }
 
+/** 角色扮演 Agent 记录(只读):agent_sessions.state/plan/step_index + tool_calls。
+ *  无记录时后端返回 trace: null,前端保持空闲态(实跑问题 4)。 */
+export interface AgentTrace {
+  state: string;
+  plan: string[];
+  step_index: number;
+  tool_calls: Array<{
+    id: string;
+    name: string;
+    input: unknown;
+    output: unknown;
+    duration_ms: number;
+    created_at: string;
+  }>;
+}
+
+/** GET /api/chat/sessions/{id}/agent/trace:切会话/重启后恢复右侧 Agent 面板记录 */
+export async function fetchAgentTrace(sessionId: string): Promise<AgentTrace | null> {
+  const data = await request<{ trace: AgentTrace | null }>(
+    `/chat/sessions/${encodeURIComponent(sessionId)}/agent/trace`,
+  );
+  return data.trace;
+}
+
 export async function updateMessage(sessionId: string, id: number, content: string): Promise<ChatMessage> {
   return request(`/chat/messages/${id}?session_id=${encodeURIComponent(sessionId)}`, {
     method: 'PUT',

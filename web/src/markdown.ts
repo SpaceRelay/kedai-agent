@@ -2,7 +2,8 @@
 // 安全策略:html:false(LLM 输出不可信,原始 HTML 一律转义),链接新窗口。
 // 渲染前剥离 mvu 的 <UpdateVariable> 块(其内容只用于变量更新,不展示)
 // 与 <status_current_variable> 段标签(原版 MagVarUpdate 的变量状态段标记)。
-import MarkdownIt from 'markdown-it';
+// markdown-it v15:默认导出是可调用值(仅值,不可作类型),实例类型需从命名导出取
+import MarkdownIt, { type MarkdownIt as MarkdownItInstance } from 'markdown-it';
 import { parseUpdateVariable } from './mvu/parser';
 
 /** <status_current_variable> 起止标签剥离(大小写不敏感;内容保留) */
@@ -18,18 +19,18 @@ export function stripProtocolBlocks(text: string): string {
   return t;
 }
 
-let md: MarkdownIt | null = null;
+let md: MarkdownItInstance | null = null;
 
 /** markdown 扩展插件(由插件框架注册) */
-const mdExtensions: Array<(md: MarkdownIt) => void> = [];
+const mdExtensions: Array<(md: MarkdownItInstance) => void> = [];
 
 /** 注册 markdown 扩展(插件框架调用) */
-export function registerMarkdownExtension(ext: (md: MarkdownIt) => void): void {
+export function registerMarkdownExtension(ext: (md: MarkdownItInstance) => void): void {
   mdExtensions.push(ext);
   md = null; // 触发惰性重建
 }
 
-function buildMd(): MarkdownIt {
+function buildMd(): MarkdownItInstance {
   const instance = new MarkdownIt({
     html: false,
     linkify: true,
@@ -49,7 +50,7 @@ function buildMd(): MarkdownIt {
   return instance;
 }
 
-function ensureMd(): MarkdownIt {
+function ensureMd(): MarkdownItInstance {
   if (!md) md = buildMd();
   return md;
 }
@@ -69,6 +70,6 @@ export function stripMvuBlocks(text: string): string {
 }
 
 /** 导出 md 实例(供测试/高级插件) */
-export function getMarkdownIt(): MarkdownIt {
+export function getMarkdownIt(): MarkdownItInstance {
   return ensureMd();
 }

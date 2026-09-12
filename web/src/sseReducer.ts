@@ -214,6 +214,10 @@ export function reduceSseEvent(state: SseStateSlice, event: SseEvent): SseStateC
       }
       return { generating: false, reloadHistory: droppedUserDraft };
     }
+    case 'task':
+      // 任务模式事件(WP5 起为后端 /api/tasks/events 真实 SSE 推送):任务数据刷新由
+      // task store 的订阅分发(onTaskEvent)处理;reducer 仅供事件监控面板消费,不产生任何状态变更
+      break;
     case 'vars':
       // 酒馆助手变量树同步(后端权威:已应用 <UpdateVariable> 补丁);
       // display_data 用 stat_data 镜像(后端不维护"老->新"轨迹)

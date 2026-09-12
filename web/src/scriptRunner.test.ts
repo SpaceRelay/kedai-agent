@@ -36,7 +36,9 @@ const context = {
 };
 
 function sandboxHarness() {
-  let listener: ((event: MessageEvent) => void) | undefined;
+  // 宿主 window 监听按类型分派:message(沙箱通信)与 scroll/resize(几何推送)并存,
+  // 单槽 mock 会被后注册的几何推送覆盖掉 message 监听,导致 boot 后消息全部丢失
+  const listeners = new Map<string, (event: MessageEvent) => void>();
   let iframe: HTMLIFrameElement;
   const postMessage = vi.fn();
   const childWindow = { postMessage } as unknown as Window;
@@ -54,8 +56,10 @@ function sandboxHarness() {
       body: { appendChild: vi.fn() } as unknown as HTMLElement,
     },
     window: {
-      addEventListener: (_type, callback) => { listener = callback as (event: MessageEvent) => void; },
-      removeEventListener: vi.fn(),
+      // SandboxEnvironment.window 是 Pick<Window, ...> 重载方法,对象字面量拿不到上下文
+      // 参数类型,显式标注;callback 存 listeners 时再收窄为 MessageEvent 派发
+      addEventListener: (type: string, callback: unknown) => { listeners.set(String(type), callback as (event: MessageEvent) => void); },
+      removeEventListener: (type: string) => { listeners.delete(String(type)); },
     },
     timeoutMs: 100,
   };
@@ -64,11 +68,11 @@ function sandboxHarness() {
     childWindow,
     postMessage,
     iframe: () => iframe!,
-    dispatch: (data: unknown, source: MessageEventSource | null = null) => listener?.({ data, source } as MessageEvent),
+    dispatch: (data: unknown, source: MessageEventSource | null = null) => listeners.get('message')?.({ data, source } as MessageEvent),
     /** 从 iframe URL fragment 读取 nonce,模拟 bootstrap 带回认证 ready。 */
     boot: () => {
       const nonce = new URL(iframe.src, 'https://kedai.invalid').hash.slice(1);
-      listener?.({ data: { channel: 'kedai-character-script-v1', nonce, type: 'ready' }, source: null } as MessageEvent);
+      listeners.get('message')?.({ data: { channel: 'kedai-character-script-v1', nonce, type: 'ready' }, source: null } as MessageEvent);
       return postMessage.mock.calls
         .map((call) => call[0] as { type?: string; nonce?: string; script?: string })
         .find((message) => message.type === 'boot');
@@ -77,6 +81,29 @@ function sandboxHarness() {
 }
 
 describe('ScriptRunner 强制授权与去重', () => {
+  it('initvar 小写标签参与解析,内容 {{user}}/{{char}} 宏在解析前展开', async () => {
+    const execute = vi.fn().mockResolvedValue(undefined);
+    const runner = new ScriptRunner(execute);
+    await runner.runMessageScripts(rootWithScope('s1'), 1, [{ scopeId: 's1', scripts: ['work()'] }], {
+      ...context,
+      charName: '碧蓝航线',
+      initVarEntries: {
+        '[initvar]变量初始化':
+          'user:\n  name: "{{user}}"\n  rank_title: Cadet\nshipgirls: {}\n',
+      },
+    });
+    expect(execute).toHaveBeenCalledTimes(1);
+    const vars = execute.mock.calls[0][1].variables as {
+      stat_data: Record<string, Record<string, unknown>>;
+    };
+    const user = vars.stat_data.user as Record<string, unknown>;
+    // {{user}} 展开为默认用户名「用户」,而非字面量残留
+    expect(user.name).toEqual(['用户', '初始']);
+    expect(user.rank_title).toEqual(['Cadet', '初始']);
+    // `shipgirls: {}` 空容器标量解析为空对象(字符串 "{}" 会让 _.isEmpty 判定失效)
+    expect(vars.stat_data.shipgirls).toEqual({});
+  });
+
   it('未授权时不进入脚本执行入口', async () => {
     const execute = vi.fn();
     const runner = new ScriptRunner(execute);
@@ -163,7 +190,8 @@ describe('ScriptRunner 强制授权与去重', () => {
   });
 
   it('sandbox iframe 不获得同源权限', () => {
-    expect(sandboxAttributes().sandbox).toBe('allow-scripts');
+    // allow-modals 是刻意放行(作者脚本的 alert/confirm 协议提示);同源权限仍禁止
+    expect(sandboxAttributes().sandbox).toBe('allow-scripts allow-modals');
     expect(sandboxAttributes().sandbox).not.toContain('allow-same-origin');
   });
 
@@ -205,10 +233,12 @@ describe('ScriptRunner 强制授权与去重', () => {
 
   it('沙箱文档以 fragment nonce 认证 ready 后宿主才投递 boot', () => {
     const harness = sandboxHarness();
+    // 本用例只验证 boot 投递、故意不驱动 done:harness 超时 100ms 后 promise 必然
+    // reject,预先挂 catch 吞掉,否则 vitest 按 unhandled rejection 判整轮失败(抖动)。
     void executeSandboxedCharacterScript('populate();', {
       container: { querySelector: vi.fn() } as unknown as HTMLElement,
       variables: { stat_data: {}, display_data: {} },
-    }, harness.environment);
+    }, harness.environment).catch(() => {});
     // iframe 走 src 加载服务端文档,fragment 不会进入 HTTP 请求且不需要 allow-same-origin。
     expect(harness.iframe().src).toMatch(/^\/sandbox\.html#[0-9a-f-]+$/i);
     expect(harness.iframe().srcdoc).toBeUndefined();
@@ -277,5 +307,97 @@ describe('ScriptRunner 强制授权与去重', () => {
     const cleanup = runner.cleanup();
     expect(cleanup).toBe(1);
     expect(runner.cleanup()).toBe(0);
+  });
+});
+
+describe('executeSandboxedCharacterScript(inline 事件桥宿主半)', () => {
+  it('ready/done 时为容器内 data-kd-on* 元素绑监听,触发后转发 inline-event(回归:TDZ 自遮蔽)', async () => {
+    const harness = sandboxHarness();
+    const listeners: Record<string, () => void> = {};
+    const el = {
+      getAttribute: (n: string) => (n === 'data-kd-onclick' ? 'go(this)' : null),
+      addEventListener: (name: string, fn: () => void) => { listeners[name] = fn; },
+      removeEventListener: () => {},
+      dataset: {},
+      classList: [],
+      id: '',
+      textContent: '',
+      innerHTML: '',
+    } as unknown as HTMLElement;
+    const container = {
+      querySelector: () => null,
+      // 仅 inline 降级属性选择器命中 mock 元素;表单控件采集(gatherControls)返回空
+      querySelectorAll: (selector: string) => (selector.includes('data-kd-on') ? [el] : []),
+    } as unknown as HTMLElement;
+    const execution = executeSandboxedCharacterScript('', {
+      container,
+      variables: { stat_data: {}, display_data: {} },
+    }, harness.environment);
+    const booted = harness.boot();
+    expect(listeners.click).toBeTypeOf('function');
+    // 触发 click:应向沙箱转发 inline-event,携带代码串与目标状态
+    listeners.click();
+    const forwarded = harness.postMessage.mock.calls
+      .map((call) => call[0] as { type?: string; code?: string; target?: { state?: { id?: string } } })
+      .find((m) => m.type === 'inline-event');
+    expect(forwarded?.code).toBe('go(this)');
+    expect(forwarded?.target?.state).toBeTruthy();
+    // done 二次绑定不重复(WeakMap 去重),且正常完成
+    harness.dispatch({ channel: 'kedai-character-script-v1', nonce: booted?.nonce, type: 'done' });
+    const cleanup = await execution;
+    cleanup();
+  });
+
+  it("on('scroll wheel') 多事件名拆分绑定,各自以真实事件类型转发(协议卡滚动解锁)", async () => {
+    const harness = sandboxHarness();
+    const listeners: Record<string, () => void> = {};
+    const el = {
+      addEventListener: (name: string, fn: () => void) => { listeners[name] = fn; },
+      removeEventListener: () => {},
+      dataset: {},
+      classList: [],
+      id: 'ww-agreement-card',
+      textContent: '',
+      innerHTML: '',
+      // 滚动度量:事件回包应带真值(沙箱 checkBottom 依赖)
+      scrollTop: 183,
+      scrollHeight: 564,
+      clientHeight: 380,
+    } as unknown as HTMLElement;
+    const container = {
+      querySelector: () => null,
+      querySelectorAll: (selector: string) => (selector === '#ww-agreement-card' ? [el] : []),
+      getBoundingClientRect: () => ({ top: 0, left: 0, width: 800, height: 600 }),
+    } as unknown as HTMLElement;
+    const execution = executeSandboxedCharacterScript('', {
+      container,
+      variables: { stat_data: {}, display_data: {} },
+    }, harness.environment);
+    const booted = harness.boot();
+    expect(booted?.script).toBeTruthy();
+    // 沙箱发来 on('scroll wheel') 批:宿主应拆成 scroll 与 wheel 两个监听
+    harness.dispatch({
+      channel: 'kedai-character-script-v1',
+      nonce: booted?.nonce,
+      type: 'batch',
+      id: 1,
+      ops: [{ ref: { kind: 'selector', value: '#ww-agreement-card' }, method: 'on', args: ['scroll wheel', 7] }],
+    });
+    expect(listeners.scroll).toBeTypeOf('function');
+    expect(listeners.wheel).toBeTypeOf('function');
+    // 分别触发:事件类型各自真实,jqId 保持 7,目标状态带滚动度量
+    listeners.scroll?.();
+    listeners.wheel?.();
+    const events = harness.postMessage.mock.calls
+      .map((call) => call[0] as { type?: string; jqId?: number; event?: { type?: string }; target?: { state?: Record<string, unknown> } })
+      .filter((m) => m.type === 'jq-event');
+    expect(events.map((m) => m.event?.type).sort()).toEqual(['scroll', 'wheel']);
+    expect(events.every((m) => m.jqId === 7)).toBe(true);
+    expect(events[0]?.target?.state?.scrollTop).toBe(183);
+    expect(events[0]?.target?.state?.scrollHeight).toBe(564);
+    // 收尾,避免悬挂定时器
+    harness.dispatch({ channel: 'kedai-character-script-v1', nonce: booted?.nonce, type: 'done' });
+    const cleanup = await execution;
+    cleanup();
   });
 });

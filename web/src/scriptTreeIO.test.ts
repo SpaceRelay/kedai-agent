@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { parseScriptTreeImport, stripByExportWith } from './scriptTreeIO';
+import type { ScriptTreeNode } from './api';
 
 describe('parseScriptTreeImport(导入解析 + id 重分配,6e)', () => {
   it('合法 script/folder 数组解析并递归重分配 id', () => {
@@ -73,7 +74,9 @@ describe('parseScriptTreeImport(导入解析 + id 重分配,6e)', () => {
 });
 
 describe('stripByExportWith(export_with 剥离,6e)', () => {
-  function node(over: Record<string, unknown> = {}) {
+  // 返回类型标注:既固定 type 字面量(无标注时 spread 会把它宽化成 string),
+  // 又允许 over 覆盖任意字段(含 spread 的对象字面量不做多余属性检查)
+  function node(over: Record<string, unknown> = {}): ScriptTreeNode {
     return {
       type: 'script',
       enabled: true,

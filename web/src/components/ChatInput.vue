@@ -2,7 +2,7 @@
 // 底部输入区:多行文本域,Enter 发送 / Shift+Enter 换行;
 // slash 联想(输入 / 开头时下拉补全命令)+ 快速回复(快捷填入常用消息);
 // 最底部工具栏:模式切换 + 授权模式 + 模型选择 + 文件上传
-import { ref, computed, onMounted } from 'vue';
+import { ref, computed, onMounted, watch, nextTick } from 'vue';
 import { useAppStore } from '../store';
 import { storeToRefs } from 'pinia';
 import * as api from '../api';
@@ -10,9 +10,26 @@ import type { AgentMode } from '../api';
 import { filterCommands, wordBeforeCursor } from './slashSuggest';
 
 const store = useAppStore();
-const { generating, currentCharacterId, agentMode, bypassMode, model, models } = storeToRefs(store);
+const { generating, currentCharacterId, agentMode, authorizationMode, model, models } = storeToRefs(store);
+
+/** 授权三档:严格(读/写/删都需授权)/ 宽松(读/写放行,删需授权)/ 放行(仅系统路径写删需授权) */
+const AUTH_MODES = [
+  { key: 'strict' as const, label: '严格', title: '严格:读文件、写文件、删文件都需手动授权' },
+  { key: 'loose' as const, label: '宽松', title: '宽松:读/写文件自动放行,删文件需授权' },
+  { key: 'bypass' as const, label: '放行', title: '放行:仅写/删系统路径(如 C 盘)需授权,其余自动放行' },
+];
 const text = ref('');
 const textareaRef = ref<HTMLTextAreaElement | null>(null);
+
+/** 输入框自动增高:随内容撑开,上限 160px,超出后内部滚动;清空后回落 rows=2 初始高 */
+function autoGrow(): void {
+  const el = textareaRef.value;
+  if (!el) return;
+  el.style.height = 'auto';
+  el.style.height = `${Math.min(el.scrollHeight, 160)}px`;
+}
+// watch 覆盖全部 text 变更入口(手动输入、发送清空、快速回复填入、slash 补全)
+watch(text, () => void nextTick(autoGrow));
 
 /** 四档模式按钮(自定义模式需先在设置中启用执行流程) */
 const MODES: Array<{ key: AgentMode; label: string; title: string }> = [
@@ -225,7 +242,7 @@ async function onModelChange(e: Event): Promise<void> {
     </div>
 
     <!-- 输入框 -->
-    <div class="sv-inputbox" style="position: relative">
+    <div class="sv-inputbox">
       <textarea
         ref="textareaRef"
         v-model="text"
@@ -239,8 +256,7 @@ async function onModelChange(e: Event): Promise<void> {
       <!-- slash 命令联想下拉(向上弹出) -->
       <div
         v-if="slashMenuOpen && slashFiltered.length"
-        class="sv-slash-menu"
-        style="position: absolute; bottom: calc(100% + 6px); left: 0; right: 0; z-index: 40"
+        class="sv-slash-menu sv-popover"
       >
         <button
           v-for="(c, i) in slashFiltered"
@@ -250,7 +266,7 @@ async function onModelChange(e: Event): Promise<void> {
           title="Enter/Tab 补全,↑↓ 选择,Esc 关闭"
           @mousedown.prevent="applySlash(c.name)"
         >
-          <b style="color: var(--sv-accent)">/{{ c.name }}</b>
+          <b>/{{ c.name }}</b>
           <span class="sv-slash-desc">{{ c.description }}</span>
         </button>
       </div>
@@ -258,12 +274,13 @@ async function onModelChange(e: Event): Promise<void> {
       <!-- 停止 / 发送 -->
       <button
         v-if="generating"
-        class="sv-btn-send"
-        style="background: var(--sv-red); border-color: var(--sv-red)"
+        class="sv-btn-send stop"
         title="停止生成"
         @click="store.stop()"
       >
-        ■
+        <svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor" aria-hidden="true">
+          <rect x="6" y="6" width="12" height="12" />
+        </svg>
       </button>
       <button
         v-else
@@ -272,7 +289,9 @@ async function onModelChange(e: Event): Promise<void> {
         title="发送"
         @click="send()"
       >
-        ↑
+        <svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor" aria-hidden="true">
+          <polygon points="5,3 19,12 5,21 5,3" />
+        </svg>
       </button>
     </div>
 
@@ -281,41 +300,35 @@ async function onModelChange(e: Event): Promise<void> {
       <!-- 模式选择(最左) -->
       <div class="sv-mode">
         <button
-          v-for="m in MODES"
+          v-for="(m, i) in MODES"
           :key="m.key"
           :class="{ active: agentMode === m.key }"
           :title="m.title"
           @click="store.agentMode = m.key"
         >
-          {{ m.label }}
+          <span class="sv-mode-idx">{{ (i + 1).toString().padStart(2, '0') }}</span>{{ m.label }}
         </button>
       </div>
 
-      <!-- 授权模式 -->
+      <!-- 授权模式(三档) -->
       <div class="sv-auth-mode">
         <span class="sv-auth-mode-label">授权</span>
         <div class="sv-auth-toggle">
           <button
-            :class="{ active: !bypassMode }"
-            title="授权模式:执行高位操作需手动授权"
-            @click="store.bypassMode = false"
+            v-for="m in AUTH_MODES"
+            :key="m.key"
+            :class="{ active: authorizationMode === m.key }"
+            :title="m.title"
+            @click="store.setAuthorizationMode(m.key)"
           >
-            授权
-          </button>
-          <button
-            :class="{ active: bypassMode }"
-            title="放行模式:除黑名单操作外,其他操作自动放行"
-            @click="store.bypassMode = true"
-          >
-            放行
+            {{ m.label }}
           </button>
         </div>
       </div>
 
       <!-- 模型选择 -->
       <select
-        class="sv-select"
-        style="width: auto; min-width: 120px; font-size: 12px; padding: 5px 8px"
+        class="sv-select sv-model-select"
         :value="model"
         :disabled="switchingModel"
         @change="onModelChange"
@@ -325,12 +338,12 @@ async function onModelChange(e: Event): Promise<void> {
       </select>
 
       <!-- 上下文提示 -->
-      <span class="sv-hint" style="margin-left: auto">CTX {{ store.contextTokens.toLocaleString() }} · {{ agentMode.toUpperCase() }}</span>
+      <span class="sv-hint sv-tnum sv-ml-auto">CTX {{ store.contextTokens.toLocaleString() }} · {{ agentMode.toUpperCase() }}</span>
 
       <!-- 快速回复按钮(最右,选择文件前):弹出启用列表→点击填入输入框 -->
-      <div style="position: relative">
+      <div class="sv-rel">
         <button class="sv-btn-attach" title="快速回复:选择常用回复填入输入框(不自动发送)" @click="toggleQuickMenu">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" style="width: 13px; height: 13px">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
             <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
           </svg>
           快速回复
@@ -338,8 +351,7 @@ async function onModelChange(e: Event): Promise<void> {
         <!-- 快速回复下拉(向上弹出) -->
         <div
           v-if="quickMenuOpen"
-          class="sv-slash-menu"
-          style="position: absolute; bottom: calc(100% + 6px); right: 0; left: auto; z-index: 40; min-width: 240px"
+          class="sv-slash-menu sv-popover sv-popover-right"
           @mousedown.stop.prevent
         >
           <button
@@ -349,7 +361,7 @@ async function onModelChange(e: Event): Promise<void> {
             title="点击填入输入框"
             @mousedown.prevent="fillQuickReply(r)"
           >
-            <b style="color: var(--sv-accent)">{{ r.label || r.name }}</b>
+            <b>{{ r.label || r.name }}</b>
             <span class="sv-slash-desc">{{ r.content }}</span>
           </button>
           <div v-if="enabledQuickReplies.length === 0" class="sv-slash-empty">

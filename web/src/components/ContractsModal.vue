@@ -230,7 +230,7 @@ async function onRollback(entry: ContractChangeEntry): Promise<void> {
     <div class="sv-modal lg">
       <div class="sv-modal-head">
         <h2 class="flex items-center gap-2">
-          <span class="logo" /> 契约编辑
+          <span class="sv-supreme pink" /> 契约编辑
           <span v-if="characterId" class="sv-char-desc" style="font-size: 12px">
             {{ store.currentCharacterName }}
           </span>
@@ -355,7 +355,7 @@ async function onRollback(entry: ContractChangeEntry): Promise<void> {
 }
 .sv-contract-editor:focus {
   border-color: var(--sv-pink-deep);
-  box-shadow: 3px 3px 0 rgba(232, 104, 144, 0.2);
+  box-shadow: 3px 3px 0 rgba(var(--sv-pink-deep-rgb), 0.2);
 }
 
 .sv-contract-diff {

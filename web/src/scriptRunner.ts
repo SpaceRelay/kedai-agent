@@ -9,8 +9,13 @@
 
 import type { MvuVariables } from './mvu/variables';
 import { collectInitVars, deepMerge } from './mvu/initvar';
+import { expandDisplayMacros } from './render';
 import { setMvuHostContext, flushJqReady } from './mvu/host';
-import { executeSandboxedCharacterScript, type SandboxCleanup } from './characterScriptSandbox';
+import { executeSandboxedCharacterScript, readCardGlobals, type SandboxCleanup } from './characterScriptSandbox';
+import type { SandboxExecutionContext } from './sandbox/protocol';
+
+/** 消息级沙箱 RPC 扩展点类型(= 沙箱协议里的定义,供调用方构造只读实现) */
+export type SandboxRpcExtensions = NonNullable<SandboxExecutionContext['rpcExtensions']>;
 
 export interface ScriptBlock {
   scopeId: string;
@@ -28,6 +33,16 @@ export interface ScriptRunContext {
   initVarEntries: Record<string, string>;
   /** 当前会话变量树(消息快照回放值) */
   mvuVariables: MvuVariables;
+  /** 角色名(initvar 内容 {{char}} 宏展开用;缺省不展开 char) */
+  charName?: string;
+  /**
+   * 消息级沙箱的 RPC 扩展点(世界书读取 / 聊天消息读取,只读)。
+   * 实跑问题 7 主因:此前消息级沙箱不注入扩展点,TavernHelper.getChatMessages /
+   * getLorebookEntries 发出的数据 RPC 落到 DOM 白名单分发,首参被当 CSS 选择器而
+   * 抛错;脚本 async 链尾 reject → 沙箱上送 error → 宿主 cleanup 摘除容器内全部
+   * 注入节点与监听,表现为「首楼界面渲染后按钮/弹窗/输入框全失效」。
+   */
+  rpcExtensions?: SandboxRpcExtensions;
 }
 
 /** 深拷贝(avoid structuredClone on Vue reactive Proxy) */
@@ -35,9 +50,18 @@ function deepCopy<T>(v: T): T {
   return JSON.parse(JSON.stringify(v)) as T;
 }
 
+// 执行上下文与沙箱 SandboxExecutionContext 对齐(其子集):characterId/globals 为可选,
+// 真实实现(executeSandboxedCharacterScript)消费二者做角色级全局变量持久化与同步下发。
 export type CharacterScriptExecutor = (
   code: string,
-  context: { container: HTMLElement; variables: MvuVariables },
+  context: {
+    container: HTMLElement;
+    variables: MvuVariables;
+    characterId?: string;
+    globals?: Record<string, unknown>;
+    rpcExtensions?: SandboxRpcExtensions;
+    lorebookName?: string;
+  },
 ) => Promise<unknown>;
 
 interface ActiveExecution {
@@ -59,10 +83,16 @@ export class ScriptRunner {
 
   /** [InitVar] 解析结果缓存:key = 角色 id + 条目内容指纹;角色切换/条目变化时自动失效 */
   private cachedInitVars(ctx: ScriptRunContext): MvuVariables {
-    const key = `${ctx.characterId}:${JSON.stringify(ctx.initVarEntries)}`;
+    const key = `${ctx.characterId}:${JSON.stringify(ctx.initVarEntries)}:${ctx.charName ?? ''}`;
     if (this.initVarCacheKey === key && this.initVarCache) return this.initVarCache;
+    // 宏展开:initvar 值里的 {{user}}/{{char}}(如碧蓝卡 `name: "{{user}}"`)
+    // 在解析前展开,否则变量树里存字面量、状态栏直接显示 {{user}}
+    const macroCtx = { charName: ctx.charName ?? '' };
     const vars = collectInitVars(
-      Object.entries(ctx.initVarEntries).map(([comment, content]) => ({ comment, content })),
+      Object.entries(ctx.initVarEntries).map(([comment, content]) => ({
+        comment,
+        content: expandDisplayMacros(content, macroCtx),
+      })),
     );
     this.initVarCache = { stat_data: vars.stat_data, display_data: vars.display_data };
     this.initVarCacheKey = key;
@@ -109,6 +139,7 @@ export class ScriptRunner {
 
     const execution = (async (): Promise<void> => {
       const vars = this.scriptVariables(ctx);
+      const globals = readCardGlobals(ctx.characterId);
       for (let index = 0; index < blocks.length; index += 1) {
         const block = blocks[index];
         const container = containers[index];
@@ -117,7 +148,13 @@ export class ScriptRunner {
         setMvuHostContext({ container, variables: vars });
         try {
           for (const code of block.scripts) {
-            const result = await this.execute(code, { container, variables: deepCopy(vars) });
+            const result = await this.execute(code, {
+              container,
+              variables: deepCopy(vars),
+              characterId: ctx.characterId,
+              globals,
+              rpcExtensions: ctx.rpcExtensions,
+            });
             if (typeof result === 'function') blockCleanups.push(result as SandboxCleanup);
           }
           // 保留宿主自身 ready 队列兼容,角色卡代码只通过 iframe RPC 修改白名单 DOM。

@@ -53,7 +53,7 @@ async function expandNow(): Promise<void> {
       <!-- 头部 -->
       <div class="sv-modal-head">
         <h2 class="flex items-center gap-2">
-          <span class="logo" /> 宏调试
+          <span class="sv-supreme pink" /> 宏调试
         </h2>
         <button class="sv-btn ghost sv-btn-square" @click="close">✕</button>
       </div>
@@ -77,8 +77,7 @@ async function expandNow(): Promise<void> {
           <textarea
             v-model="text"
             rows="6"
-            class="sv-input"
-            style="resize: vertical; line-height: 1.7"
+            class="sv-input sv-area"
             placeholder="如:{{char}} 对 {{user}} 说 {{getvar::好感}}"
             spellcheck="false"
           ></textarea>
@@ -99,8 +98,7 @@ async function expandNow(): Promise<void> {
           <textarea
             v-model="varsLines"
             rows="4"
-            class="sv-input"
-            style="margin-top: 6px; resize: vertical; line-height: 1.7"
+            class="sv-input sv-area mt-1.5"
             placeholder="变量(每行 键::值,如:好感::88&#10;开关::true)"
             spellcheck="false"
           ></textarea>
