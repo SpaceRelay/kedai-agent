@@ -28,7 +28,10 @@ pub async fn count(
     }
     let model = body.model.unwrap_or_else(|| state.engine.model());
     let total = {
-        let mut ts = state.token_service.lock().unwrap_or_else(|e| e.into_inner());
+        let mut ts = state
+            .token_service
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         ts.count_message_tokens(&body.messages, &model)
     };
     Json(json!({ "total": total, "model": model })).into_response()
@@ -44,7 +47,14 @@ pub async fn session_total(
     State(state): State<Arc<AppState>>,
     Query(q): Query<SessionTotalQuery>,
 ) -> Response {
-    let conn = state.db.conn();
+    let conn = match state.db.read() {
+        Ok(c) => c,
+        Err(e) => {
+            return Json(json!({ "error": e }))
+                .into_response()
+                .with_status(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    };
     let row: Option<(i64, i64, i64)> = conn
         .query_row(
             "SELECT total_prompt, total_completion, total_tokens FROM session_usage WHERE session_id = ?1",
@@ -72,7 +82,14 @@ pub async fn session_total(
 
 /// GET /api/token/global-total:返回全局累计 token
 pub async fn global_total(State(state): State<Arc<AppState>>) -> Response {
-    let conn = state.db.conn();
+    let conn = match state.db.read() {
+        Ok(c) => c,
+        Err(e) => {
+            return Json(json!({ "error": e }))
+                .into_response()
+                .with_status(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    };
     let row: Option<(i64, i64, i64)> = conn
         .query_row(
             "SELECT total_prompt, total_completion, total_tokens FROM global_usage WHERE id = 1",
@@ -94,32 +111,4 @@ pub async fn global_total(State(state): State<Arc<AppState>>) -> Response {
         }))
         .into_response(),
     }
-}
-
-/// 更新 token 累计(会话 + 全局);供 chat.rs SSE finish 事件后调用
-pub fn accumulate_usage(state: &AppState, session_id: &str, prompt: i64, completion: i64) {
-    let total = prompt + completion;
-    let now = crate::models::db::now_iso();
-    let conn = state.db.conn();
-    // 会话累计
-    let _ = conn.execute(
-        "INSERT INTO session_usage (session_id, total_prompt, total_completion, total_tokens, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5)
-         ON CONFLICT(session_id) DO UPDATE SET
-           total_prompt = total_prompt + ?2,
-           total_completion = total_completion + ?3,
-           total_tokens = total_tokens + ?4,
-           updated_at = ?5",
-        rusqlite::params![session_id, prompt, completion, total, now],
-    );
-    // 全局累计
-    let _ = conn.execute(
-        "UPDATE global_usage SET
-           total_prompt = total_prompt + ?1,
-           total_completion = total_completion + ?2,
-           total_tokens = total_tokens + ?3,
-           updated_at = ?4
-         WHERE id = 1",
-        rusqlite::params![prompt, completion, total, now],
-    );
 }

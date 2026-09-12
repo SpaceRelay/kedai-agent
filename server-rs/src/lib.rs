@@ -1,11 +1,15 @@
 // Kedai 后端库:供 main 与集成测试使用
+// 优化项 B-4:生产代码 unwrap 告警(锁中毒/None 解包等应显式处理);
+// not(test) 豁免 #[cfg(test)] 单测与 tests/ 集成测试(测试编译期 cfg(test) 生效,lint 关闭)。
+#![cfg_attr(not(test), warn(clippy::unwrap_used))]
 pub mod agents;
 pub mod api;
 pub mod config;
 pub mod connectors;
 pub mod contracts;
-pub mod models;
+pub mod mcp;
 pub mod migration;
+pub mod models;
 pub mod parsing;
 pub mod plugins;
 pub mod scripts;
@@ -70,8 +74,6 @@ fn secure_test_app(token: &str, strict_client_header: bool) -> Result<axum::Rout
 /// - Tauri 壳:`tauri::async_runtime::spawn` 本函数,进程退出即服务停止
 ///   (Windows GUI 进程收不到 Ctrl+C,serve 将持续运行,无副作用)。
 pub async fn run_server(config: config::AppConfig) -> Result<(), String> {
-    use serde_json::Value;
-
     let loopback = matches!(config.host.as_str(), "127.0.0.1" | "localhost" | "::1");
     if !loopback && !config.allow_remote {
         return Err("非 loopback 监听必须显式设置 KEDAI_ALLOW_REMOTE=1".into());
@@ -80,46 +82,51 @@ pub async fn run_server(config: config::AppConfig) -> Result<(), String> {
         return Err("非 loopback 监听要求由环境或启动器注入至少 32 字符的 KEDAI_API_TOKEN".into());
     }
 
-    // 初始化日志(双写:控制台 + logs/kedai-YYYY-MM-DD.log)
-    utils::logger::init(&config.log_level, &config.log_dir);
+    // 初始化日志(tracing,non-blocking 双写:控制台 + logs/kedai-YYYY-MM-DD.log);
+    // guard 持有到 run_server 返回,保证优雅关闭时 non-blocking 缓冲落盘
+    let _log_guards = utils::logging::init(&config.log_level, &config.log_dir);
 
-    utils::logger::info(
-        "Kedai server starting",
-        &[
-            ("version", Value::String(env!("CARGO_PKG_VERSION").into())),
-            ("host", Value::String(config.host.clone())),
-            ("port", Value::Number(config.port.into())),
-            (
-                "data_dir",
-                Value::String(config.data_dir.to_string_lossy().to_string()),
-            ),
-            ("connector", Value::String(config.connector.clone())),
-            ("model", Value::String(config.openai_model.clone())),
-        ],
+    tracing::info!(
+        version = env!("CARGO_PKG_VERSION"),
+        host = config.host.as_str(),
+        port = config.port,
+        data_dir = config.data_dir.to_string_lossy().as_ref(),
+        connector = config.connector.as_str(),
+        model = config.openai_model.as_str(),
+        "Kedai server starting"
     );
 
     let state = api::app_state::AppState::new(config).map_err(|e| {
-        utils::logger::error("初始化失败", &[("error", Value::String(e.clone()))]);
+        tracing::error!(error = e.as_str(), "初始化失败");
         format!("初始化失败: {e}")
     })?;
 
+    // MCP stdio 服务器装配(批次 6.2,L3 隔离):mcp_enabled=false 时完全跳过;
+    // 单台握手最坏 30s 超时(有界),失败仅禁用该台,不阻断启动。
+    state.start_mcp().await;
+
     let addr = format!("{}:{}", state.config.host, state.config.port);
     let listener = tokio::net::TcpListener::bind(&addr).await.map_err(|e| {
-        utils::logger::error(
-            "端口绑定失败",
-            &[
-                ("addr", Value::String(addr.clone())),
-                ("error", Value::String(e.to_string())),
-            ],
+        tracing::error!(
+            addr = addr.as_str(),
+            error = e.to_string().as_str(),
+            "端口绑定失败"
         );
         format!("无法监听 {addr}: {e}")
     })?;
 
     let router = api::build_router(state.clone());
 
-    utils::logger::info(
-        "Kedai 已启动",
-        &[("url", Value::String(format!("http://{addr}/")))],
+    // 有效模型以合并 settings 后为准(「Kedai server starting」行的 env model 可能因设置页覆盖而失真)
+    let effective_model = state
+        .model
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    tracing::info!(
+        url = format!("http://{addr}/").as_str(),
+        model = effective_model.as_str(),
+        "Kedai 已启动"
     );
     println!("[OK] Kedai 已启动 → http://{addr}/");
 
@@ -129,11 +136,15 @@ pub async fn run_server(config: config::AppConfig) -> Result<(), String> {
     )
     .with_graceful_shutdown(shutdown_signal())
     .await
-    .map_err(|e| format!("服务运行出错: {e}"))
+    .map_err(|e| format!("服务运行出错: {e}"))?;
+
+    // 优雅关闭兜底:显式关停 MCP 子进程(各句柄 kill_on_drop 双保险,防孤儿)
+    state.mcp.shutdown().await;
+    Ok(())
 }
 
 /// 优雅关闭:Ctrl+C(命令行场景)。GUI 进程无控制台信号,此 future 不会完成。
 async fn shutdown_signal() {
     let _ = tokio::signal::ctrl_c().await;
-    utils::logger::info("收到退出信号,正在关闭", &[]);
+    tracing::info!("收到退出信号,正在关闭");
 }

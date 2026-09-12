@@ -118,7 +118,11 @@ async fn global_scope_put_get_roundtrip() {
         json!({}),
     )
     .await;
-    assert_eq!(chat["data"], json!({}), "global 写入不应污染 chat 树: {chat}");
+    assert_eq!(
+        chat["data"],
+        json!({}),
+        "global 写入不应污染 chat 树: {chat}"
+    );
 }
 
 /// scope=chat 与旧 PUT assistant-vars 等价(同一存储:旧接口写、新接口读回)

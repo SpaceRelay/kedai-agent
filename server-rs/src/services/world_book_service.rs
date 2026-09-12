@@ -39,18 +39,19 @@ impl WorldBookService {
 
     /// 列表(不含 data_raw),按 created_at DESC
     pub fn list(&self) -> Vec<WorldBookRecord> {
-        let conn = self.db.conn();
+        let conn = self.db.read().expect("获取只读连接失败");
+        // SQL 为写死常量且表结构由 migration 保证,预编译必然成功
         let mut stmt = conn
-            .prepare(&format!("{LIST_SQL} ORDER BY w.created_at DESC"))
-            .unwrap();
+            .prepare_cached(&format!("{LIST_SQL} ORDER BY w.created_at DESC"))
+            .expect("世界书列表 SQL 为常量且 schema 由 migration 保证,预编译必然成功");
         stmt.query_map([], |row| row_to_record(row, false))
-            .unwrap()
+            .expect("世界书列表查询必然成功(常量 SQL + migration 保证 schema)")
             .filter_map(|r| r.ok())
             .collect()
     }
 
     pub fn get(&self, id: &str) -> Option<WorldBookRecord> {
-        let conn = self.db.conn();
+        let conn = self.db.read().ok()?;
         conn.query_row(&format!("{LIST_SQL} WHERE w.id = ?1"), params![id], |row| {
             row_to_record(row, true)
         })
@@ -76,7 +77,7 @@ impl WorldBookService {
         let created_at = now_iso();
         let character_name = character_id.and_then(|cid| self.character_name(cid));
         let record = {
-            let conn = self.db.conn();
+            let conn = self.db.write();
             conn.execute(
                 "INSERT INTO world_books (id, name, character_id, enabled, source, entry_count, data_raw, created_at) VALUES (?1, ?2, ?3, 1, 'upload', ?4, ?5, ?6)",
                 params![id, parsed.name, character_id, entry_count, data_raw_str, created_at],
@@ -101,7 +102,8 @@ impl WorldBookService {
     /// 查询角色显示名(绑定展示用)
     fn character_name(&self, character_id: &str) -> Option<String> {
         self.db
-            .conn()
+            .read()
+            .ok()?
             .query_row(
                 "SELECT chara_name FROM characters WHERE id = ?1",
                 params![character_id],
@@ -131,7 +133,7 @@ impl WorldBookService {
         let data_raw = existing.data_raw.clone();
         let created_at = existing.created_at.clone();
         {
-            let conn = self.db.conn();
+            let conn = self.db.write();
             let n = conn
                 .execute(
                     "UPDATE world_books SET enabled = ?1, character_id = ?2, name = ?3 WHERE id = ?4",
@@ -158,20 +160,25 @@ impl WorldBookService {
 
     pub fn delete(&self, id: &str) -> bool {
         self.db
-            .conn()
+            .write()
             .execute("DELETE FROM world_books WHERE id = ?1", params![id])
             .map(|n| n > 0)
             .unwrap_or(false)
     }
 
-    /// 指定角色的有效独立世界书:绑定到该角色 或 全局,且 enabled
+    /// 指定角色的有效独立世界书:绑定到该角色 或 全局,且 enabled。
+    /// 排序附带 id 作全序键(前缀缓存稳定化):created_at 相同(同批导入等)的
+    /// 多本书若无次级键,SQLite 返回顺序不确定 → 世界书注入顺序每轮可能漂移,
+    /// 破坏 system/常驻注入的前缀逐字节一致性。正常情况下 id 次级键不改变结果,
+    /// 只把原本不确定的并列顺序固定下来。
     pub fn enabled_for_character(&self, character_id: &str) -> Vec<WorldBookRecord> {
-        let conn = self.db.conn();
+        let conn = self.db.read().expect("获取只读连接失败");
+        // SQL 为写死常量且表结构由 migration 保证,预编译必然成功
         let mut stmt = conn
-            .prepare(&format!("{LIST_SQL} WHERE w.enabled = 1 AND (w.character_id = ?1 OR w.character_id IS NULL) ORDER BY w.created_at DESC"))
-            .unwrap();
+            .prepare(&format!("{LIST_SQL} WHERE w.enabled = 1 AND (w.character_id = ?1 OR w.character_id IS NULL) ORDER BY w.created_at DESC, w.id"))
+            .expect("角色有效世界书 SQL 为常量且 schema 由 migration 保证,预编译必然成功");
         stmt.query_map(params![character_id], |row| row_to_record(row, true))
-            .unwrap()
+            .expect("角色有效世界书查询必然成功(常量 SQL + migration 保证 schema)")
             .filter_map(|r| r.ok())
             .collect()
     }
@@ -443,7 +450,7 @@ impl WorldBookService {
     /// 回写 data_raw(条目编辑后落库;仅更新 entries 字段,其余原样保留)
     pub fn save_data_raw(&self, id: &str, raw: &Value) -> Option<()> {
         let data_raw_str = serde_json::to_string(raw).ok()?;
-        let conn = self.db.conn();
+        let conn = self.db.write();
         conn.execute(
             "UPDATE world_books SET data_raw = ?1 WHERE id = ?2",
             params![data_raw_str, id],
@@ -456,7 +463,8 @@ impl WorldBookService {
     pub fn character_book_views(&self, character_id: &str) -> Option<Vec<WorldBookEntryView>> {
         let raw = self
             .db
-            .conn()
+            .read()
+            .ok()?
             .query_row(
                 "SELECT data_raw FROM characters WHERE id = ?1",
                 params![character_id],
@@ -484,7 +492,8 @@ impl WorldBookService {
     ) -> Option<()> {
         let raw_str = self
             .db
-            .conn()
+            .read()
+            .ok()?
             .query_row(
                 "SELECT data_raw FROM characters WHERE id = ?1",
                 params![character_id],
@@ -503,18 +512,12 @@ impl WorldBookService {
         let entries_value = cb.as_object_mut()?.get_mut("entries")?;
         crate::parsing::world_book::merge_entries_into(entries_value, views);
         let raw_str = serde_json::to_string(&raw).ok()?;
-        let conn = self.db.conn();
+        let conn = self.db.write();
         conn.execute(
             "UPDATE characters SET data_raw = ?1 WHERE id = ?2",
             params![raw_str, character_id],
         )
         .ok()?;
         Some(())
-    }
-
-    /// 全部原始数据(供测试/调试)
-    #[allow(dead_code)]
-    pub fn raw_value(&self, id: &str) -> Option<Value> {
-        self.get(id)?.data_raw
     }
 }

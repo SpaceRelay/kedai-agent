@@ -1,4 +1,4 @@
-﻿// 酒馆助手变量(MVU)状态管理:补丁应用、首楼状态栏槽位、两步生成与 diff 状态栏
+// 酒馆助手变量(MVU)状态管理:补丁应用、首楼状态栏槽位、两步生成与 diff 状态栏
 use super::*;
 
 /// 应用 mvu <UpdateVariable> 补丁:应用到变量树 → 持久化 → SSE Vars 事件推送最新树。
@@ -18,13 +18,14 @@ pub(super) async fn apply_mvu_patches(
     }
     match assistant_vars.apply_patches(patches) {
         Ok(()) => {
-            if let Err(e) = engine.sessions.save_assistant_vars(session_id, assistant_vars) {
-                logger::warn(
-                    "酒馆助手变量树落库失败",
-                    &[
-                        ("session_id", Value::String(session_id.to_string())),
-                        ("error", Value::String(e)),
-                    ],
+            if let Err(e) = engine
+                .sessions
+                .save_assistant_vars(session_id, assistant_vars)
+            {
+                tracing::warn!(
+                    session_id = session_id.to_string(),
+                    error = e,
+                    "酒馆助手变量树落库失败"
                 );
             }
             let tree = assistant_vars.tree().clone();
@@ -40,12 +41,10 @@ pub(super) async fn apply_mvu_patches(
             Some(tree)
         }
         Err(e) => {
-            logger::warn(
-                "酒馆助手变量补丁应用失败",
-                &[
-                    ("session_id", Value::String(session_id.to_string())),
-                    ("error", Value::String(e)),
-                ],
+            tracing::warn!(
+                session_id = session_id.to_string(),
+                error = e,
+                "酒馆助手变量补丁应用失败"
             );
             None
         }
@@ -72,8 +71,9 @@ fn find_first_message_status_slot(history: &[MessageRecord]) -> Option<FirstMess
                 && m.extra.get("first_mes").and_then(|v| v.as_bool()) == Some(true)
         })
         .or_else(|| history.iter().find(|m| m.role == "assistant"))?;
+    // 正则为写死字面量,编译必然成功
     let has_placeholder = regex::Regex::new(r"(?i)<\s*StatusPlaceHolderImpl\s*\/?\s*>")
-        .unwrap()
+        .expect("StatusPlaceHolderImpl 占位符正则为常量,编译必然成功")
         .is_match(&first.content);
     let last = first
         .extra
@@ -297,12 +297,8 @@ pub(super) async fn generate_mvu_status(
     let mut p = params.clone();
     // G3:变量两步生成独立温度档。设置 mvu_temperature 非空时覆盖内置 0.3,
     // 允许与正文 default_temperature 解耦(变量调用单独降温度提高结构化遵循度)。
-    let mvu_temperature = engine
-        .settings
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .mvu_temperature
-        .unwrap_or(0.3);
+    // (设置快照:不留锁跨 await)
+    let mvu_temperature = engine.settings_snapshot().mvu_temperature.unwrap_or(0.3);
     p.temperature = mvu_temperature;
     p.tools = mvu_status_tools();
     let connector = engine.connector.read().await;
@@ -334,12 +330,10 @@ pub(super) async fn generate_mvu_status(
                         contract, &patches, "agent",
                     );
                     if !gated.rejected.is_empty() || !gated.pending.is_empty() {
-                        logger::warn(
-                            "契约门控过滤了部分变量补丁",
-                            &[
-                                ("rejected", json!(gated.rejected.len())),
-                                ("pending", json!(gated.pending.len())),
-                            ],
+                        tracing::warn!(
+                            rejected = gated.rejected.len(),
+                            pending = gated.pending.len(),
+                            "契约门控过滤了部分变量补丁"
                         );
                     }
                     if contract.is_some() && !gated.applied.is_empty() {
@@ -391,26 +385,20 @@ pub(super) async fn generate_mvu_status(
                         status_bar = apply_status_bar_update(engine, session_id, history, &text);
                     }
                 }
-                other => logger::warn(
-                    "未知的 mvu 状态工具调用",
-                    &[("name", Value::String(other.to_string()))],
-                ),
+                other => tracing::warn!(name = other.to_string(), "未知的 mvu 状态工具调用"),
             }
         }
     } else {
         // 回退:旧文本协议(<UpdateVariable> + <StatusBar>),兼容无 function calling 的模型
         let (_clean, raw_patches) = parse_update_variable(&out.text);
         // P5:契约门控(无契约原样放行)
-        let gated = crate::contracts::gate_assistant_patches_detailed(
-            contract, &raw_patches, "agent",
-        );
+        let gated =
+            crate::contracts::gate_assistant_patches_detailed(contract, &raw_patches, "agent");
         if !gated.rejected.is_empty() || !gated.pending.is_empty() {
-            logger::warn(
-                "契约门控过滤了部分文本协议补丁",
-                &[
-                    ("rejected", json!(gated.rejected.len())),
-                    ("pending", json!(gated.pending.len())),
-                ],
+            tracing::warn!(
+                rejected = gated.rejected.len(),
+                pending = gated.pending.len(),
+                "契约门控过滤了部分文本协议补丁"
             );
         }
         if contract.is_some() && !gated.applied.is_empty() {
@@ -459,7 +447,9 @@ pub(super) async fn generate_mvu_status(
 /// 提取 <StatusBar>...</StatusBar> 中的状态栏文本(容错:无匹配返回 None)
 /// 剥离正文中的 <StatusBar>…</StatusBar> 协议标签(状态栏文本由两步生成单独落库)。
 pub(super) fn strip_status_bar_tag(text: &str) -> String {
-    let re = regex::Regex::new(r"(?is)<StatusBar\b[^>]*>[\s\S]*?</StatusBar\s*>").unwrap();
+    // 正则为写死字面量,编译必然成功
+    let re = regex::Regex::new(r"(?is)<StatusBar\b[^>]*>[\s\S]*?</StatusBar\s*>")
+        .expect("StatusBar 剥离正则为常量,编译必然成功");
     re.replace_all(text, "").to_string()
 }
 
@@ -624,7 +614,8 @@ mod tests {
     /// compute_first_message_update:含占位符 → None(占位符保留给前端脚本渲染);
     /// 无占位符 + 有 last → 首处替换;无槽位 → None
     #[test]
-    fn compute_first_message_update_variants() {        // 含占位符 → None:占位符由前端脚本渲染动态状态栏,服务端不替换
+    fn compute_first_message_update_variants() {
+        // 含占位符 → None:占位符由前端脚本渲染动态状态栏,服务端不替换
         let slot = FirstMessageStatusSlot {
             id: 1,
             content: "你好 <StatusPlaceHolderImpl/> 再见".into(),

@@ -201,15 +201,18 @@ pub(crate) fn path_set(root: &mut Value, segs: &[String], v: Value) {
         }
         let next_is_idx = segs[idx + 1].parse::<usize>().is_ok() || segs[idx + 1] == "-";
         if cur.is_object() {
-            let m = cur.as_object_mut().unwrap();
+            // 上方 is_object() 判定保证为对象,as_object_mut 必然成功
+            let m = cur.as_object_mut().expect("已判定为对象,必然可取可变引用");
             if !m.contains_key(s) {
                 m.insert(s.clone(), if next_is_idx { json!([]) } else { json!({}) });
             }
-            cur = m.get_mut(s).unwrap();
+            // 键缺失时上方已 insert,必然存在
+            cur = m.get_mut(s).expect("键刚确认存在,必然可取");
             idx += 1;
         } else if cur.is_array() {
             let idx_num: usize = s.parse().unwrap_or(0);
-            let a = cur.as_array_mut().unwrap();
+            // 上方 is_array() 判定保证为数组,as_array_mut 必然成功
+            let a = cur.as_array_mut().expect("已判定为数组,必然可取可变引用");
             while a.len() <= idx_num {
                 a.push(Value::Null);
             }

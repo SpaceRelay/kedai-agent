@@ -14,6 +14,9 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
+/// 命令 handler 闭包签名:(命令名之后的原始参数, 当前作用域容器) -> 输出文本
+type SlashHandler = Box<dyn Fn(&str, &mut ScopeVars) -> String + Send + Sync>;
+
 /// 命令清单元信息(API 与前端联想用;name 不含前导 /)
 #[derive(Debug, Clone, Serialize)]
 pub struct SlashCommandMeta {
@@ -28,7 +31,7 @@ pub struct SlashCommand {
     pub name: String,
     pub description: String,
     pub params: String,
-    pub handler: Box<dyn Fn(&str, &mut ScopeVars) -> String + Send + Sync>,
+    pub handler: SlashHandler,
 }
 
 /// 全局 slash 命令注册表(engine 与 AppState 共享同一实例)。
@@ -170,7 +173,11 @@ fn cmd_get_var(args: &str, vars: &mut ScopeVars) -> String {
         return "/getvar 用法: /getvar <key>".into();
     }
     vars.view(key)
-        .map(|v| v.as_str().map(|s| s.to_string()).unwrap_or_else(|| v.to_string()))
+        .map(|v| {
+            v.as_str()
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| v.to_string())
+        })
         .unwrap_or_default()
 }
 
@@ -294,7 +301,12 @@ mod tests {
     fn parse_args_splits_whitespace_and_double_colon() {
         assert_eq!(
             parse_args("key :: hello world"),
-            vec!["key".to_string(), "::".to_string(), "hello".to_string(), "world".to_string()]
+            vec![
+                "key".to_string(),
+                "::".to_string(),
+                "hello".to_string(),
+                "world".to_string()
+            ]
         );
     }
 
@@ -317,8 +329,14 @@ mod tests {
 
     #[test]
     fn split_key_value_handles_missing_separator() {
-        assert_eq!(split_key_value(&parse_args("justkey")), ("justkey".into(), String::new()));
-        assert_eq!(split_key_value(&parse_args("")), (String::new(), String::new()));
+        assert_eq!(
+            split_key_value(&parse_args("justkey")),
+            ("justkey".into(), String::new())
+        );
+        assert_eq!(
+            split_key_value(&parse_args("")),
+            (String::new(), String::new())
+        );
     }
 
     // ---------- 内置命令 ----------
@@ -333,7 +351,10 @@ mod tests {
     fn var_writes_global_and_getvar_reads_back() {
         let r = reg();
         let mut vars = ScopeVars::new();
-        assert!(r.execute("/var level :: 42", &mut vars).unwrap().contains("已设置 level"));
+        assert!(r
+            .execute("/var level :: 42", &mut vars)
+            .unwrap()
+            .contains("已设置 level"));
         assert_eq!(r.execute("/getvar level", &mut vars).unwrap(), "42");
     }
 

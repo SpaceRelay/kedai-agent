@@ -6,10 +6,49 @@ use std::path::{Path, PathBuf};
 pub const RUNTIME_PROMPT_FILE: &str = "AGENTS_RUNTIME.md";
 pub const MAX_RUNTIME_PROMPT_BYTES: u64 = 512 * 1024;
 
+/// 主 Agent 运行时提示词的内置默认(新装/首次运行、数据目录尚无该文件时兜底)。
+///
+/// 存在意义:此前该提示词只以「用户数据文件」形态存在,全新安装(含 Android 首装)
+/// 不含此文件 → 引擎读到空 → 主 Agent 缺少角色定位/创作原则/工具使用原则/输出纪律
+/// 这段最高层约定,行为与 Win 端不一致。内置后两端开箱一致,用户仍可在设置里覆盖
+/// (保存即落盘为 AGENTS_RUNTIME.md,文件优先于本默认)。
+///
+/// 内容与 Win 端调好的版本一致:`{{char}}` 由引擎按角色名替换(见 messages/context.rs)。
+pub const DEFAULT_RUNTIME_PROMPT: &str = "\
+# 主 Agent 提示词（运行时）
+
+## 角色定位
+
+你是 Kedai 的主 Agent：以角色「{{char}}」的扮演者与文学创作者身份，与用户进行沉浸式角色扮演 / 文学创作。你的正文是小说文本而非聊天记录，以“能否被称为一段好小说”为最低验收标准。
+
+## 创作原则
+
+1. 严格以系统要求的视角与口吻输出，不出现旁白标题、“以上是回复”“作为AI”等元文本；角色设定与世界观保持一致。
+2. 用户指令优先：用户提出的字数、风格、视角、情节走向要求必须服从；用户提问必须正面回答，不回避。
+3. 不转述：用户输入的动作与对话视为已经发生，直接从其后无缝衔接继续创作。
+4. 推进节奏：一次输出不把事件推进至末尾，适当拆分、合理安排节奏，正文末尾为用户留下可互动的窗口。
+
+## 工具使用原则
+
+- 你可以通过 function calling 调用工具（可用清单由系统注入，见 system 消息末尾的【可用工具】段）。需要时再调用，不必每轮都调；工具是辅助手段，不要因调用工具而中断创作节奏。
+- 需要随机数 / 掷骰决定走向时用 `role`；需要联网查最新信息时用 `search`；需要读取世界书、角色设定、长期记忆等资料时用 `read` / `memory_read`。
+- 需要把内容写入对话气泡或角色文件时用 `write` / `replace` / `create`；需要把可并行的子任务交给后台处理时用 `agentgo`，并用 `todo` / `read` 轮询结果，用 `agentend` 结束任务。
+- 变量状态更新优先经 function calling 工具完成；仅在未走工具时才使用 `<UpdateVariable>` 文本协议作为回退。除该块外不使用任何自定义标签。
+
+## 输出纪律
+
+一次只输出角色回应本身；若需分段，使用空行，不使用 Markdown 标题。工具调用与正文创作分离：先按需调用工具获取资料或写入状态，再输出正文。
+";
+
 #[derive(Debug)]
 pub struct RuntimePromptService {
     path: PathBuf,
     legacy_path: Option<PathBuf>,
+    /// 文件与旧文件都不存在时是否回退内置默认。
+    /// 显式指定提示词目录(`KEDAI_RUNTIME_PROMPT_DIR`,测试与自定义部署用)时置 false:
+    /// 该变量语义是「只从这里读」,空目录即视为无提示词,不注入内置默认——
+    /// 测试据此隔离真实默认,避免 mock 断言被内置文本干扰。
+    builtin_default: bool,
 }
 
 impl RuntimePromptService {
@@ -17,6 +56,16 @@ impl RuntimePromptService {
         Self {
             path: data_dir.join(RUNTIME_PROMPT_FILE),
             legacy_path,
+            builtin_default: true,
+        }
+    }
+
+    /// 显式指定提示词目录(关闭内置默认回退)。来源:`KEDAI_RUNTIME_PROMPT_DIR`。
+    pub fn with_dir(dir: PathBuf, legacy_path: Option<PathBuf>) -> Self {
+        Self {
+            path: dir.join(RUNTIME_PROMPT_FILE),
+            legacy_path,
+            builtin_default: false,
         }
     }
 
@@ -26,6 +75,7 @@ impl RuntimePromptService {
 
     /// 读取 DATA_DIR 中的运行时提示词。新文件缺失时，安全读取旧文件并尝试一次性迁移；
     /// 迁移失败仍返回已校验的旧内容，避免升级后提示词突然丢失。
+    /// 文件与旧文件都不存在时回退内置默认(见 `DEFAULT_RUNTIME_PROMPT`)。
     pub fn read(&self) -> Result<String, String> {
         match read_checked(&self.path) {
             Ok(content) => return Ok(content),
@@ -33,20 +83,32 @@ impl RuntimePromptService {
             Err(e) => return Err(e.message(&self.path, "读取")),
         }
 
+        // 旧版项目根文件:仅作一次性迁移来源。不存在则继续走内置默认。
         let legacy = self
             .legacy_path
             .as_ref()
-            .filter(|p| p.as_path() != self.path.as_path())
-            .ok_or_else(|| format!("运行时提示词不存在：{}", self.path.display()))?;
-        let content = read_checked(legacy).map_err(|e| e.message(legacy, "读取旧版"))?;
-        // 不覆盖并发创建的新文件。AlreadyExists 表示其他写入者已先完成，改读新文件。
-        match self.create_if_absent(content.as_bytes()) {
-            Ok(true) => Ok(content),
-            Ok(false) => {
-                read_checked(&self.path).map_err(|e| e.message(&self.path, "读取并发迁移后的"))
+            .filter(|p| p.as_path() != self.path.as_path());
+        if let Some(legacy) = legacy {
+            match read_checked(legacy) {
+                Ok(content) => {
+                    // 不覆盖并发创建的新文件。AlreadyExists 表示其他写入者已先完成，改读新文件。
+                    return match self.create_if_absent(content.as_bytes()) {
+                        Ok(true) => Ok(content),
+                        Ok(false) => read_checked(&self.path)
+                            .map_err(|e| e.message(&self.path, "读取并发迁移后的")),
+                        Err(_) => Ok(content),
+                    };
+                }
+                Err(ReadError::NotFound) => {}
+                Err(e) => return Err(e.message(legacy, "读取旧版")),
             }
-            Err(_) => Ok(content),
         }
+
+        // 两者都不存在:回退内置默认;显式指定目录时视为无提示词(供测试/自定义部署隔离)。
+        if self.builtin_default {
+            return Ok(DEFAULT_RUNTIME_PROMPT.to_string());
+        }
+        Err(format!("运行时提示词不存在：{}", self.path.display()))
     }
 
     pub fn read_optional(&self) -> Result<Option<String>, String> {
@@ -233,9 +295,53 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    /// 全新安装(数据目录无该文件、项目根也无旧文件)回退内置默认:
+    /// Android/Win 首装开箱即含主 Agent 提示词,不再依赖用户手工放置文件。
     #[test]
-    fn rejects_oversized_and_invalid_utf8_content() {
-        let root = dir("validation");
+    fn falls_back_to_builtin_default_when_no_file() {
+        let root = dir("builtin");
+        let service = RuntimePromptService::new(root.clone(), None);
+        let content = service.read().unwrap();
+        assert!(content.contains("主 Agent 提示词"), "内置默认应含标题: {content}");
+        assert!(content.contains("工具使用原则"), "内置默认应含工具使用原则");
+        assert!(
+            content.contains("{{char}}"),
+            "内置默认保留角色宏,由引擎按角色名替换"
+        );
+        assert_eq!(
+            service.read_optional().unwrap().as_deref(),
+            Some(content.as_str()),
+            "read_optional 也应拿到内置默认(否则引擎不注入)"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// 文件优先于内置默认:用户保存过的内容不被默认覆盖
+    #[test]
+    fn file_wins_over_builtin_default() {
+        let root = dir("builtin-override");
+        let service = RuntimePromptService::new(root.clone(), None);
+        service.write("我的自定义主提示词").unwrap();
+        assert_eq!(service.read().unwrap(), "我的自定义主提示词");
+        // 空文件 = 显式不注入(read_optional 视空为 None)
+        service.write("   ").unwrap();
+        assert_eq!(service.read_optional().unwrap(), None);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// 显式指定目录(KEDAI_RUNTIME_PROMPT_DIR)关闭内置默认:
+    /// 空目录视为无提示词,测试据此隔离真实默认、避免 mock 断言被内置文本干扰。
+    #[test]
+    fn with_dir_disables_builtin_default() {
+        let root = dir("builtin-off");
+        let service = RuntimePromptService::with_dir(root.clone(), None);
+        assert!(service.read().unwrap_err().contains("不存在"));
+        assert_eq!(service.read_optional().unwrap(), None);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn rejects_oversized_and_invalid_utf8_content() {        let root = dir("validation");
         let service = RuntimePromptService::new(root.clone(), None);
         let large = "x".repeat(MAX_RUNTIME_PROMPT_BYTES as usize + 1);
         assert!(service.write(&large).unwrap_err().contains("超过上限"));

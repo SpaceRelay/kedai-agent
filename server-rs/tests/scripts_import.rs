@@ -196,7 +196,9 @@ async fn script_imports_preset_and_worldbook() {
     let books = wb["world_books"].as_array().unwrap();
     assert!(!books.is_empty(), "importRawWorldbook 应导入世界书: {wb}");
     assert!(
-        books.iter().any(|b| b["name"].as_str().map_or(false, |n| n.contains("书"))),
+        books
+            .iter()
+            .any(|b| b["name"].as_str().is_some_and(|n| n.contains("书"))),
         "世界书名称应从文件名解析: {wb}"
     );
 }

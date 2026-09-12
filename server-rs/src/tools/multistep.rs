@@ -181,6 +181,7 @@ mod tests {
         ToolContext {
             session_id: session_id.into(),
             character_id: character_id.into(),
+            agent_depth: 0,
         }
     }
 
@@ -191,7 +192,12 @@ mod tests {
         let sid = make_session(&f);
         let cid = f.characters.list()[0].id.clone();
         let tools = ToolRegistry::new();
-        register_multistep_tools(&tools, f.sessions.clone(), f.registry.clone(), f.kaleido.clone());
+        register_multistep_tools(
+            &tools,
+            f.sessions.clone(),
+            f.registry.clone(),
+            f.kaleido.clone(),
+        );
         tools
             .permissions()
             .authorize("get_state", "session", &sid)
@@ -226,7 +232,12 @@ mod tests {
         let sid = make_session(&f);
         let cid = f.characters.list()[0].id.clone();
         let tools = ToolRegistry::new();
-        register_multistep_tools(&tools, f.sessions.clone(), f.registry.clone(), f.kaleido.clone());
+        register_multistep_tools(
+            &tools,
+            f.sessions.clone(),
+            f.registry.clone(),
+            f.kaleido.clone(),
+        );
         tools
             .permissions()
             .authorize("apply_patch", "session", &sid)
@@ -246,7 +257,10 @@ mod tests {
             )
             .await
             .unwrap_err();
-        assert!(err.contains("没有有效操作") || err.contains("数字"), "err: {err}");
+        assert!(
+            err.contains("没有有效操作") || err.contains("数字"),
+            "err: {err}"
+        );
     }
 
     /// apply_patch 契约留痕(P6):混合 applied/pending/rejected 三类 op——
@@ -301,7 +315,12 @@ mod tests {
         f.sessions.save_assistant_vars(&sid, &vars).unwrap();
 
         let tools = ToolRegistry::new();
-        register_multistep_tools(&tools, f.sessions.clone(), f.registry.clone(), f.kaleido.clone());
+        register_multistep_tools(
+            &tools,
+            f.sessions.clone(),
+            f.registry.clone(),
+            f.kaleido.clone(),
+        );
         tools
             .permissions()
             .authorize("apply_patch", "session", &sid)
@@ -322,7 +341,11 @@ mod tests {
         let resp: Value = serde_json::from_str(&out).unwrap();
         assert_eq!(resp["ok"], json!(true));
         // warnings 覆盖拒绝与低置信各一条;熔断哈希 = 1 拒绝 + 1 pending
-        assert_eq!(resp["warnings"].as_array().map(Vec::len), Some(2), "resp: {resp}");
+        assert_eq!(
+            resp["warnings"].as_array().map(Vec::len),
+            Some(2),
+            "resp: {resp}"
+        );
         assert_eq!(resp["breaker_hashes"].as_array().map(Vec::len), Some(2));
 
         // 树:高置信写入生效;pending 未写;未声明保持原值
@@ -340,7 +363,11 @@ mod tests {
         assert!(entries[0].seq > 0);
 
         // meta:低置信 op 入队;契约版本推进(last_turn_id=消息数,空会话为 0 合法)
-        let (version, meta) = f.kaleido.load_meta(&sid).unwrap().expect("kaleido_state 行存在");
+        let (version, meta) = f
+            .kaleido
+            .load_meta(&sid)
+            .unwrap()
+            .expect("kaleido_state 行存在");
         assert_eq!(version, 1);
         assert_eq!(meta.last_turn_id, 0);
         assert_eq!(meta.pending.len(), 1, "pending: {:?}", meta.pending);
@@ -363,7 +390,11 @@ mod tests {
         let entries = f.kaleido.list_entries(&sid, 10).unwrap();
         assert_eq!(entries.len(), 2);
         let (_, meta) = f.kaleido.load_meta(&sid).unwrap().unwrap();
-        assert!(meta.pending.is_empty(), "同 path 成功应用应消费 pending: {:?}", meta.pending);
+        assert!(
+            meta.pending.is_empty(),
+            "同 path 成功应用应消费 pending: {:?}",
+            meta.pending
+        );
 
         // 第三轮:非法 confidence 值(大小写错误)不得静默升级为 High 绕过门控,
         // 按低置信处理进 pending(宁可错杀);唯一 op 被拦时工具整体报错
@@ -376,8 +407,17 @@ mod tests {
             .unwrap_err();
         assert!(err.contains("低置信"), "err: {err}");
         let vars = f.sessions.load_assistant_vars(&sid);
-        assert_eq!(vars.get_value("心之所向.好感度"), Some(&json!(5)), "非法置信度不应写入");
+        assert_eq!(
+            vars.get_value("心之所向.好感度"),
+            Some(&json!(5)),
+            "非法置信度不应写入"
+        );
         let (_, meta) = f.kaleido.load_meta(&sid).unwrap().unwrap();
-        assert_eq!(meta.pending.len(), 1, "非法置信度按 Low 入队: {:?}", meta.pending);
+        assert_eq!(
+            meta.pending.len(),
+            1,
+            "非法置信度按 Low 入队: {:?}",
+            meta.pending
+        );
     }
 }

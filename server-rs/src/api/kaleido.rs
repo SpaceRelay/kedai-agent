@@ -5,7 +5,7 @@
 //   GET  /api/variable/state        运行态整行(stat_data/meta/revision)
 //   GET  /api/variable/changelog    逐 op 变更流水(最新在前)
 use crate::api::app_state::AppState;
-use crate::api::WithStatus;
+use crate::api::db_err;
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -39,15 +39,16 @@ pub struct StateQuery {
 }
 
 fn bad_request(msg: &str) -> Response {
-    Json(json!({ "error": msg }))
-        .into_response()
-        .with_status(StatusCode::BAD_REQUEST)
+    err_json(msg, StatusCode::BAD_REQUEST)
 }
 
 fn not_found(msg: &str) -> Response {
-    Json(json!({ "error": msg }))
-        .into_response()
-        .with_status(StatusCode::NOT_FOUND)
+    err_json(msg, StatusCode::NOT_FOUND)
+}
+
+/// 本模块统一错误响应:按状态码自动附带结构化错误码(见 api/errors.rs)。
+fn err_json(msg: impl AsRef<str>, status: StatusCode) -> Response {
+    crate::api::err_with_code(crate::api::code_for_status(status), msg, status)
 }
 
 /// POST /api/variable/update — 契约引擎统一写入出口。
@@ -56,26 +57,31 @@ fn not_found(msg: &str) -> Response {
 /// 低置信入 pending)、kaleido_changelog 留痕、meta.pending 维护、熔断指纹。
 /// 部分被拦时 HTTP 200 + warnings(与工具的 Err 语义不同:外部调用方通常
 /// 需要拿到已生效部分,而非整批失败)。
-pub async fn update(
-    State(state): State<Arc<AppState>>,
-    Json(body): Json<UpdateBody>,
-) -> Response {
+pub async fn update(State(state): State<Arc<AppState>>, Json(body): Json<UpdateBody>) -> Response {
     if body.patches.is_empty() {
         return bad_request("patches 不能为空");
     }
-    // 会话 → 角色(契约按角色加载)
-    let Some(session) = state.sessions.get(&body.session_id) else {
-        return not_found("会话不存在");
-    };
+    // 会话 → 角色(契约按角色加载);会话读取与 apply 落库合并进同一阻塞任务(DB 并发改造)
     let apply = crate::services::variable_apply::VariableApplyService::new(
         state.sessions.clone(),
         state.contract_registry.clone(),
         state.kaleido_state.clone(),
     );
-    let writer = body.writer.unwrap_or_else(|| "external".into());
-    match apply.apply(&body.session_id, &session.character_id, &body.patches, &writer) {
-        Err(e) => bad_request(&e),
-        Ok(outcome) => {
+    let sessions = state.sessions.clone();
+    let sid = body.session_id.clone();
+    let patches = body.patches.clone();
+    let writer = body.writer.clone().unwrap_or_else(|| "external".into());
+    let applied = state
+        .db_call(move || {
+            let session = sessions.get(&sid)?;
+            Some(apply.apply(&sid, &session.character_id, &patches, &writer))
+        })
+        .await;
+    match applied {
+        Err(e) => db_err(&e),
+        Ok(None) => not_found("会话不存在"),
+        Ok(Some(Err(e))) => bad_request(&e),
+        Ok(Some(Ok(outcome))) => {
             let mut resp = json!({
                 "ok": outcome.ok,
                 "stat_data": outcome.tree,
@@ -101,30 +107,31 @@ pub async fn get_state(
     let Some(sid) = q.session_id else {
         return bad_request("缺少 session_id 查询参数");
     };
-    if state.sessions.get(&sid).is_none() {
-        return not_found("会话不存在");
-    }
-    match state.kaleido_state.load_state(&sid) {
-        Err(e) => Json(json!({ "error": e }))
-            .into_response()
-            .with_status(StatusCode::INTERNAL_SERVER_ERROR),
-        Ok(None) => not_found("该会话尚无契约运行态"),
-        Ok(Some(row)) => {
+    let sessions = state.sessions.clone();
+    let kaleido = state.kaleido_state.clone();
+    let sid_c = sid.clone();
+    let loaded = state
+        .db_call(move || {
+            sessions.get(&sid_c)?;
+            Some(kaleido.load_state(&sid_c))
+        })
+        .await;
+    match loaded {
+        Err(e) => db_err(&e),
+        Ok(None) => not_found("会话不存在"),
+        Ok(Some(Err(e))) => err_json(e, StatusCode::INTERNAL_SERVER_ERROR),
+        Ok(Some(Ok(None))) => not_found("该会话尚无契约运行态"),
+        Ok(Some(Ok(Some(row)))) => {
             // 库内 JSON 损坏属异常态,显式 500 让前端可排查(静默空对象会掩盖)
             let parse = |raw: &str, field: &str| -> Result<Value, String> {
-                serde_json::from_str(raw)
-                    .map_err(|e| format!("运行态 {field} 损坏: {e}"))
+                serde_json::from_str(raw).map_err(|e| format!("运行态 {field} 损坏: {e}"))
             };
             let (stat_data, meta) = match (
                 parse(&row.stat_data, "stat_data"),
                 parse(&row.meta_json, "meta"),
             ) {
                 (Ok(s), Ok(m)) => (s, m),
-                (Err(e), _) | (_, Err(e)) => {
-                    return Json(json!({ "error": e }))
-                        .into_response()
-                        .with_status(StatusCode::INTERNAL_SERVER_ERROR)
-                }
+                (Err(e), _) | (_, Err(e)) => return err_json(e, StatusCode::INTERNAL_SERVER_ERROR),
             };
             Json(json!({
                 "session_id": sid,
@@ -148,14 +155,21 @@ pub async fn changelog(
     let Some(sid) = q.session_id else {
         return bad_request("缺少 session_id 查询参数");
     };
-    if state.sessions.get(&sid).is_none() {
-        return not_found("会话不存在");
-    }
-    match state.kaleido_state.list_entries(&sid, q.limit.unwrap_or(50)) {
-        Err(e) => Json(json!({ "error": e }))
-            .into_response()
-            .with_status(StatusCode::INTERNAL_SERVER_ERROR),
-        Ok(entries) => {
+    let sessions = state.sessions.clone();
+    let kaleido = state.kaleido_state.clone();
+    let sid_c = sid.clone();
+    let limit = q.limit.unwrap_or(50);
+    let listed = state
+        .db_call(move || {
+            sessions.get(&sid_c)?;
+            Some(kaleido.list_entries(&sid_c, limit))
+        })
+        .await;
+    match listed {
+        Err(e) => db_err(&e),
+        Ok(None) => not_found("会话不存在"),
+        Ok(Some(Err(e))) => err_json(e, StatusCode::INTERNAL_SERVER_ERROR),
+        Ok(Some(Ok(entries))) => {
             // 单条序列化失败跳过该条而非整表清空(ChangelogEntry 实际不会失败)
             let items = entries
                 .iter()
@@ -216,7 +230,7 @@ mod tests {
         let data_raw = json!({ "extensions": { "nlkaleido": contract }, "name": "契约角色" });
         // 单连接 Mutex 非重入:insert 的守卫须在调 session 服务前释放(防死锁)
         {
-            let conn = state.db.conn();
+            let conn = state.db.write();
             conn.execute(
                 "INSERT INTO characters (id, name, chara_name, description, file_path, data_raw, created_at) \
                  VALUES (?1, ?2, ?2, '', '', ?3, ?4)",
@@ -251,7 +265,10 @@ mod tests {
             .await
             .unwrap()
             .to_bytes();
-        (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+        )
     }
 
     async fn get(router: &axum::Router, path: &str) -> (StatusCode, Value) {
@@ -271,10 +288,14 @@ mod tests {
             .await
             .unwrap()
             .to_bytes();
-        (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+        )
     }
 
-    /// 出口校验:未知会话 404、空 patches 400、缺 session_id 400。
+    /// 出口校验:未知会话 404、空 patches 400、缺 session_id 400;
+    /// 错误响应须带与状态码匹配的结构化 code(errors.rs 收尾)。
     #[tokio::test]
     async fn update_rejects_invalid_requests() {
         let (router, state) = app();
@@ -287,6 +308,7 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::NOT_FOUND, "body: {body}");
+        assert_eq!(body["code"], "NOT_FOUND", "body: {body}");
 
         let (status, body) = post(
             &router,
@@ -295,9 +317,11 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+        assert_eq!(body["code"], "VALIDATION", "body: {body}");
 
-        let (status, _) = get(&router, "/api/variable/state").await;
+        let (status, body) = get(&router, "/api/variable/state").await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["code"], "VALIDATION", "body: {body}");
     }
 
     /// 主路径:external 写者经所有权校验写入 → 留痕 → state/changelog 可读;
@@ -327,7 +351,9 @@ mod tests {
         assert_eq!(body["stat_data"]["心之所向"]["好感度"], json!(5));
         let warnings = body["warnings"].as_array().cloned().unwrap_or_default();
         assert!(
-            warnings.iter().any(|w| w.as_str().unwrap_or("").contains("not_owner")),
+            warnings
+                .iter()
+                .any(|w| w.as_str().unwrap_or("").contains("not_owner")),
             "warnings: {warnings:?}"
         );
         let entries = body["entries"].as_array().cloned().unwrap_or_default();
@@ -342,8 +368,11 @@ mod tests {
         assert_eq!(srow["meta"]["lastContractVersion"], json!(1));
 
         // changelog:一条记录,source=agent(共享层以 Agent 来源留痕)
-        let (status, log) =
-            get(&router, &format!("/api/variable/changelog?session_id={sid}")).await;
+        let (status, log) = get(
+            &router,
+            &format!("/api/variable/changelog?session_id={sid}"),
+        )
+        .await;
         assert_eq!(status, StatusCode::OK, "log: {log}");
         let log_items = log["entries"].as_array().cloned().unwrap_or_default();
         assert_eq!(log_items.len(), 1, "log: {log}");
@@ -364,7 +393,10 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "body: {body}");
         assert_eq!(body["ok"], json!(false), "低置信全拦应为 ok:false");
         let (_, srow) = get(&router, &format!("/api/variable/state?session_id={sid}")).await;
-        let pending = srow["meta"]["pending"].as_array().cloned().unwrap_or_default();
+        let pending = srow["meta"]["pending"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
         assert_eq!(pending.len(), 1, "pending 应入队: {srow}");
         assert_eq!(pending[0]["op"]["path"], json!("心之所向.好感度"));
         // 树未变
@@ -378,7 +410,7 @@ mod tests {
         let (router, state) = app();
         let cid = uuid::Uuid::new_v4().to_string();
         {
-            let conn = state.db.conn();
+            let conn = state.db.write();
             conn.execute(
                 "INSERT INTO characters (id, name, chara_name, description, file_path, data_raw, created_at) \
                  VALUES (?1, ?2, ?2, '', '', '{}', ?3)",

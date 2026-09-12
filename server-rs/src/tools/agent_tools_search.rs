@@ -36,7 +36,8 @@ pub(super) fn register_search(registry: &ToolRegistry, deps: Arc<ToolDeps>) {
                 }
                 let max_results = args.get("max_results").and_then(|v| v.as_u64()).unwrap_or(5).clamp(1, 10) as usize;
                 let endpoint = {
-                    let s = deps.settings.lock().unwrap();
+                    // 设置快照:不留锁跨 await(锁在 settings_snapshot 内即释放)
+                    let s = deps.settings_snapshot();
                     let e = s.search_endpoint.trim().to_string();
                     if e.is_empty() { DEFAULT_SEARCH_ENDPOINT.to_string() } else { e }
                 };
@@ -144,13 +145,14 @@ fn is_ipv6_link_local(ip: Ipv6Addr) -> bool {
 /// 解析 DuckDuckGo HTML 搜索结果(result__a 标题 + result__snippet 摘要)
 pub(super) fn parse_search_html(html: &str, max: usize) -> Vec<Value> {
     let mut out: Vec<Value> = Vec::new();
+    // 两个正则为写死字面量,编译必然成功
     let title_re = regex::Regex::new(
         r#"(?is)<a[^>]*class="[^"]*result__a[^"]*"[^>]*href="([^"]*)"[^>]*>(.*?)</a>"#,
     )
-    .unwrap();
+    .expect("搜索结果标题正则为常量,编译必然成功");
     let snip_re =
         regex::Regex::new(r#"(?is)<a[^>]*class="[^"]*result__snippet[^"]*"[^>]*>(.*?)</a>"#)
-            .unwrap();
+            .expect("搜索结果摘要正则为常量,编译必然成功");
     let snips: Vec<String> = snip_re
         .captures_iter(html)
         .map(|c| strip_html(&c[1]))

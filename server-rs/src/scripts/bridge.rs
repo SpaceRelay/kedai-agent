@@ -29,7 +29,8 @@ pub type GenerateHandler = dyn Fn(
 
 /// 导入处理器(阶段六 6g-2):脚本 TavernHelper.importRaw*(type, filename, content, session_id)
 /// → 引擎各 service(绕过 HTTP)。同步调用,缺省(未接线)返回「不支持」。
-pub type ImportHandler = dyn Fn(String, String, String, String) -> Result<String, String> + Send + Sync;
+pub type ImportHandler =
+    dyn Fn(String, String, String, String) -> Result<String, String> + Send + Sync;
 
 #[derive(Clone)]
 pub struct EvalBridge {
@@ -64,11 +65,6 @@ impl EvalBridge {
 
     pub fn with_character(mut self, character_id: impl Into<String>) -> Self {
         self.character_id = Some(character_id.into());
-        self
-    }
-
-    pub fn with_slash(mut self, handler: Arc<SlashHandler>) -> Self {
-        self.slash = Some(handler);
         self
     }
 
@@ -108,7 +104,8 @@ impl EvalBridge {
     pub fn build_script(&self) -> String {
         let snapshot = self.vars_snapshot().to_string();
         let script_id = serde_json::to_string(&self.script.id).unwrap_or_else(|_| "\"\"".into());
-        let script_name = serde_json::to_string(&self.script.name).unwrap_or_else(|_| "\"\"".into());
+        let script_name =
+            serde_json::to_string(&self.script.name).unwrap_or_else(|_| "\"\"".into());
         format!(
             r#"
 // —— 阶段三 TavernHelper 兼容桥(预置代码,由运行时注入)——
@@ -233,7 +230,8 @@ globalThis.TavernHelper = {{
             parallel_tool_calls: None,
         };
         let (_, abort) = tokio::sync::watch::channel(false);
-        let (text, _usage) = handler(messages, params, abort).map_err(|e| format!("生成失败: {e}"))?;
+        let (text, _usage) =
+            handler(messages, params, abort).map_err(|e| format!("生成失败: {e}"))?;
         if text.trim().is_empty() {
             Err("generate 返回空内容".to_string())
         } else {
@@ -346,7 +344,9 @@ globalThis.TavernHelper = {{
                 sv.view(arg)
                     .map(|v| {
                         // 字符串值原样返回,其余 JSON 化
-                        v.as_str().map(|s| s.to_string()).unwrap_or_else(|| v.to_string())
+                        v.as_str()
+                            .map(|s| s.to_string())
+                            .unwrap_or_else(|| v.to_string())
                     })
                     .unwrap_or_default()
             }
@@ -413,13 +413,18 @@ mod tests {
     #[test]
     fn get_variables_reads_snapshot() {
         let sv = new_vars();
-        sv.lock().unwrap().with_scope(Scope::Global, "", json!({ "hp": 100 }));
+        sv.lock()
+            .unwrap()
+            .with_scope(Scope::Global, "", json!({ "hp": 100 }));
         let bridge = EvalBridge::new(sv.clone(), script("s1", "测试", json!({})));
         let out = run_with(
             "JSON.stringify(TavernHelper.getVariables({ type: 'global' }))",
             &bridge,
         );
-        assert_eq!(out, crate::scripts::runtime::EvalOutcome::Ok("{\"hp\":100}".into()));
+        assert_eq!(
+            out,
+            crate::scripts::runtime::EvalOutcome::Ok("{\"hp\":100}".into())
+        );
     }
 
     #[test]
@@ -432,8 +437,14 @@ mod tests {
         );
         assert!(matches!(out, crate::scripts::runtime::EvalOutcome::Ok(_)));
         let s = sv.lock().unwrap();
-        assert_eq!(s.scope_data(Scope::Global, "").and_then(|d| d.get("a")), Some(&json!(1)));
-        assert_eq!(s.scope_data(Scope::Global, "").and_then(|d| d.get("b")), Some(&json!("x")));
+        assert_eq!(
+            s.scope_data(Scope::Global, "").and_then(|d| d.get("a")),
+            Some(&json!(1))
+        );
+        assert_eq!(
+            s.scope_data(Scope::Global, "").and_then(|d| d.get("b")),
+            Some(&json!("x"))
+        );
     }
 
     #[test]
@@ -444,15 +455,23 @@ mod tests {
             "JSON.stringify(TavernHelper.insertOrAssignVariables({ k: 2, n: 9 }, { type: 'script' }))",
             &bridge,
         );
-        assert_eq!(out, crate::scripts::runtime::EvalOutcome::Ok("{\"k\":2,\"n\":9}".into()));
+        assert_eq!(
+            out,
+            crate::scripts::runtime::EvalOutcome::Ok("{\"k\":2,\"n\":9}".into())
+        );
         let s = sv.lock().unwrap();
-        assert_eq!(s.scope_data(Scope::Script, "s1").and_then(|d| d.get("n")), Some(&json!(9)));
+        assert_eq!(
+            s.scope_data(Scope::Script, "s1").and_then(|d| d.get("n")),
+            Some(&json!(9))
+        );
     }
 
     #[test]
     fn delete_variable_reports_occurred() {
         let sv = new_vars();
-        sv.lock().unwrap().with_scope(Scope::Global, "", json!({ "gone": 1, "keep": 2 }));
+        sv.lock()
+            .unwrap()
+            .with_scope(Scope::Global, "", json!({ "gone": 1, "keep": 2 }));
         let bridge = EvalBridge::new(sv.clone(), script("s1", "测试", json!({})));
         let out = run_with(
             "JSON.stringify(TavernHelper.deleteVariable('gone', { type: 'global' }))",
@@ -460,7 +479,9 @@ mod tests {
         );
         assert_eq!(
             out,
-            crate::scripts::runtime::EvalOutcome::Ok("{\"variables\":{\"keep\":2},\"delete_occurred\":true}".into())
+            crate::scripts::runtime::EvalOutcome::Ok(
+                "{\"variables\":{\"keep\":2},\"delete_occurred\":true}".into()
+            )
         );
     }
 
@@ -502,7 +523,9 @@ mod tests {
         let sv = new_vars();
         let bridge = EvalBridge::new(sv.clone(), script("s1", "测试", json!({})));
         let out = run_with("TavernHelper.triggerSlash('/foo bar')", &bridge);
-        assert!(matches!(out, crate::scripts::runtime::EvalOutcome::Ok(s) if s.contains("未知 Slash 命令")));
+        assert!(
+            matches!(out, crate::scripts::runtime::EvalOutcome::Ok(s) if s.contains("未知 Slash 命令"))
+        );
     }
 
     #[test]
@@ -511,7 +534,10 @@ mod tests {
         let mut bridge = EvalBridge::new(sv.clone(), script("s1", "测试", json!({})));
         bridge.slash = Some(Arc::new(|cmd| format!("custom:{cmd}")));
         let out = run_with("TavernHelper.triggerSlash('/anything')", &bridge);
-        assert_eq!(out, crate::scripts::runtime::EvalOutcome::Ok("custom:/anything".into()));
+        assert_eq!(
+            out,
+            crate::scripts::runtime::EvalOutcome::Ok("custom:/anything".into())
+        );
     }
 
     #[test]

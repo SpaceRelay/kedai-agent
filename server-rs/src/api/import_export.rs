@@ -1,6 +1,6 @@
 // 导入导出路由:/api/export/chat、/api/import/chat(SillyTavern 兼容)
 use crate::api::app_state::AppState;
-use crate::api::WithStatus;
+use crate::api::{db_err, WithStatus};
 use crate::models::types::StMessage;
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
@@ -38,12 +38,24 @@ pub async fn export_chat(
             .into_response()
             .with_status(StatusCode::BAD_REQUEST);
     }
-    if state.sessions.get(&sid).is_none() {
-        return Json(json!({ "error": "会话不存在" }))
-            .into_response()
-            .with_status(StatusCode::NOT_FOUND);
-    }
-    let messages = state.sessions.export_chat(&sid);
+    let svc = state.sessions.clone();
+    let sid_q = sid.clone();
+    let messages = match state
+        .db_call(move || {
+            // 存在性校验 + 导出合并进同一阻塞任务(两次读取一次调度)
+            svc.get(&sid_q)?;
+            Some(svc.export_chat(&sid_q))
+        })
+        .await
+    {
+        Err(e) => return db_err(&e),
+        Ok(None) => {
+            return Json(json!({ "error": "会话不存在" }))
+                .into_response()
+                .with_status(StatusCode::NOT_FOUND)
+        }
+        Ok(Some(m)) => m,
+    };
     Json(json!({ "session_id": sid, "messages": messages })).into_response()
 }
 
@@ -62,14 +74,22 @@ pub async fn import_chat(
             .into_response()
             .with_status(StatusCode::BAD_REQUEST);
     }
-    if state.sessions.get(&sid).is_none() {
-        return Json(json!({ "error": "会话不存在" }))
+    let svc = state.sessions.clone();
+    let sid_q = sid.clone();
+    let imported = state
+        .db_call(move || {
+            // 存在性校验 + 导入合并进同一阻塞任务
+            svc.get(&sid_q)?;
+            Some(svc.import_chat(&sid_q, body.messages))
+        })
+        .await;
+    match imported {
+        Err(e) => db_err(&e),
+        Ok(None) => Json(json!({ "error": "会话不存在" }))
             .into_response()
-            .with_status(StatusCode::NOT_FOUND);
-    }
-    match state.sessions.import_chat(&sid, body.messages) {
-        Ok(imported) => Json(json!({ "ok": true, "imported": imported })).into_response(),
-        Err(e) => Json(json!({ "error": e }))
+            .with_status(StatusCode::NOT_FOUND),
+        Ok(Some(Ok(n))) => Json(json!({ "ok": true, "imported": n })).into_response(),
+        Ok(Some(Err(e))) => Json(json!({ "error": e }))
             .into_response()
             .with_status(StatusCode::BAD_REQUEST),
     }

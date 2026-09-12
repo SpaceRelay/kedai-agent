@@ -8,45 +8,114 @@
 // 本独立文档则不继承父 CSP(见 security::resource_frame_headers,script-src
 // 'unsafe-inline' 且网络放开)。收到宿主经后端代理抓取的作者页面 HTML 后,通过
 // DOM 重建触发脚本执行(document.write 会丢失 module script,appendChild 可执行)。
-// sandbox(无 allow-same-origin)下作者脚本访问 localStorage/sessionStorage 会抛
-// SecurityError,导致界面中断;这里注入内存 shim,并把注入脚本里的
-// localStorage/sessionStorage 引用替换为 shim——界面状态存内存,功能不受影响,
-// 同时保持与宿主完全隔离。
-// 只接受第一条 boot(booted 闩锁),防止重复注入。
+//
+// 自举链路(吸血鬼卡「下载资源→进游戏界面」的关键):
+//   作者页面下载完成后 location.reload() 自举——重载回来的是本宿主文档(空模板),
+//   只要 ① nonce 跨 reload 存活(window.name 持有;hash 可能被 SPA 路由改写),
+//   ② 每次文档加载都发 ready,③ 父页面监听常驻并以缓存 HTML + 存储快照重新 boot,
+//   作者脚本便会再次初始化,且命中此前下载的 Cache/localStorage 快照,直接进游戏界面。
+// sandbox(无 allow-same-origin)下作者脚本访问 localStorage/sessionStorage/caches
+// 会抛 SecurityError,这里注入内存 shim 并改写注入脚本中的引用;shim 变更经
+// postMessage 同步到父页面持久化(IndexedDB/localStorage),reload/重启 App 后可恢复。
+// 同一文档只接受第一条 boot(booted 闩锁);reload 后是新文档,闩锁自然复位。
 'use strict';
-var __kdMemoryStorage = (function () {
+
+// ---- 真实父窗口引用(顶层先抓,后文 installParentShim 会用代理遮蔽 window.parent) ----
+// 所有对宿主的 postMessage 与 message 来源校验一律走它,不依赖可被替换的 parent。
+var REAL_PARENT = window.parent;
+
+// ---- rAF 兜底:沙箱 iframe(无 allow-same-origin)在站点隔离下是独立进程,
+// 宿主窗口被遮挡/最小化或宿主 WebView 面板不可见时,rAF 会被无限期停发
+// (实测窗口前台但 WebView 面板非激活时 23 秒才触发一次)。作者页面的下载进度、
+// 解密分片、进入游戏初始化动画都挂在 rAF 上,表现为「点进入游戏后定格卡死」。
+// 映射到 setTimeout(16ms≈60fps):遮挡下仅降频不停摆,探针全流程验证无异常。
+window.requestAnimationFrame = function (cb) {
+  return setTimeout(function () { cb(performance.now()); }, 16);
+};
+window.cancelAnimationFrame = function (id) { clearTimeout(id); };
+
+// ---- resize 监护:宿主宽屏切换(fixed 撑满)改变 iframe 尺寸时,作者页不一定
+// 收到/处理 resize(实测切换后舞台仍按旧尺寸渲染,缩在左上角;需额外尺寸扰动
+// 触发 resize 才重排撑满)。轮询 innerWidth/innerHeight,变化即补发 resize,
+// 保证作者页布局跟随 iframe 实际尺寸。开销极小(每 400ms 比较两个数)。
+var __kdLastW = window.innerWidth, __kdLastH = window.innerHeight;
+setInterval(function () {
+  if (window.innerWidth !== __kdLastW || window.innerHeight !== __kdLastH) {
+    __kdLastW = window.innerWidth;
+    __kdLastH = window.innerHeight;
+    try { window.dispatchEvent(new Event('resize')); } catch (e) { /* 忽略 */ }
+  }
+}, 400);
+
+// ---- nonce 获取:hash 优先(首次加载),window.name 兜底(reload 后) ----
+var bootNonce = '';
+try { bootNonce = decodeURIComponent(location.hash.slice(1) || ''); } catch (e) { bootNonce = ''; }
+if (bootNonce) {
+  try { window.name = bootNonce; } catch (e) { /* 作者页面可能锁定 name,忽略 */ }
+  // 清掉 hash,避免作者 SPA 的 hash 路由把 nonce 误读为路由;reload 后从 window.name 恢复
+  try { location.hash = ''; } catch (e) { /* opaque origin 下忽略 */ }
+} else {
+  try { bootNonce = window.name || ''; } catch (e) { bootNonce = ''; }
+}
+
+function kdPost(msg) {
+  if (!bootNonce) return; // 无 nonce 的消息宿主一律拒收,不发也罢
+  msg.channel = 'kedai-resource-frame-v1';
+  msg.nonce = bootNonce;
+  REAL_PARENT.postMessage(msg, '*');
+}
+
+// ---- base64 工具(仅用于兼容读取旧版快照中的 base64 缓存体;新链路用结构化克隆直传) ----
+function b64ToBuf(b64) {
+  var s = atob(b64);
+  var u = new Uint8Array(s.length);
+  for (var i = 0; i < s.length; i++) u[i] = s.charCodeAt(i);
+  return u.buffer;
+}
+
+// ---- localStorage/sessionStorage 内存 shim(变更同步父页面持久化) ----
+function makeMemStorage(which) {
   var store = {};
   return {
     getItem: function (k) { return Object.prototype.hasOwnProperty.call(store, k) ? store[k] : null; },
-    setItem: function (k, v) { store[k] = String(v); },
-    removeItem: function (k) { delete store[k]; },
-    clear: function () { store = {}; },
+    setItem: function (k, v) {
+      store[k] = String(v);
+      kdPost({ type: 'store-sync', subtype: 'storage', which: which, op: 'set', key: k, value: String(v) });
+    },
+    removeItem: function (k) {
+      delete store[k];
+      kdPost({ type: 'store-sync', subtype: 'storage', which: which, op: 'remove', key: k });
+    },
+    clear: function () {
+      store = {};
+      kdPost({ type: 'store-sync', subtype: 'storage', which: which, op: 'clear' });
+    },
     key: function (i) { return Object.keys(store)[i] || null; },
-    get length() { return Object.keys(store).length; }
+    get length() { return Object.keys(store).length; },
+    __prime: function (obj) {
+      if (!obj) return;
+      store = {};
+      for (var k in obj) {
+        if (Object.prototype.hasOwnProperty.call(obj, k)) store[k] = String(obj[k]);
+      }
+    }
   };
-})();
-var __kdSessionStorage = (function () {
-  var store = {};
-  return {
-    getItem: function (k) { return Object.prototype.hasOwnProperty.call(store, k) ? store[k] : null; },
-    setItem: function (k, v) { store[k] = String(v); },
-    removeItem: function (k) { delete store[k]; },
-    clear: function () { store = {}; },
-    key: function (i) { return Object.keys(store)[i] || null; },
-    get length() { return Object.keys(store).length; }
-  };
-})();
-// Cache API 内存 shim:沙箱 iframe(无 allow-same-origin,opaque origin)读取
-// globalThis.caches 属性会直接抛 SecurityError,作者页面(Vite SPA)初始化时读取
-// 它做资源缓存与更新检查,一旦抛错便落入「重试」错误态,资源界面无法显示。
-// 注入作者脚本时把 globalThis.caches 引用重写为 __kdCaches(见下方 boot 处理)。
+}
+var __kdMemoryStorage = makeMemStorage('local');
+var __kdSessionStorage = makeMemStorage('session');
+
+// ---- Cache API 内存 shim ----
+// 沙箱 iframe(无 allow-same-origin,opaque origin)读取 globalThis.caches 会直接抛
+// SecurityError,作者页面(Vite SPA)初始化时读它做资源缓存与更新检查,一旦抛错便落入
+// 「重试」错误态。注入作者脚本时把 caches 引用重写为 __kdCaches(见下方 boot 处理)。
 //
 // 缓存语义:作者页面用 put(match) 校验资源包缓存——先读响应头(x-sha256/
 // x-expires-at)判断有效性,再 arrayBuffer() 读 body 使用。同一 Response 的
 // body 只能消费一次,若直接存/返回原 Response,二次 match 读 body 会抛
 // 「body already read」,作者走「Cache Missed」分支反复重新下载(无限循环)。
 // 因此 put 时立即把 body 读入 ArrayBuffer 存副本,match 每次返回全新的
-// Response(headers 保留、body 可重复读),下载一次后同会话内永久命中。
+// Response(headers 保留、body 可重复读);副本同时 base64 同步父页面持久化,
+// reload/重启后 boot 快照恢复,下载一次永久命中。
 var __kdCaches = (function () {
   var stores = {};
   function store(name) {
@@ -56,7 +125,9 @@ var __kdCaches = (function () {
   function keyOf(req) {
     return (typeof req === 'string') ? req : String(req && (req.url || req.href) || '');
   }
-  // 读取响应体副本:优先 arrayBuffer(可重复消费);已消费的响应回退存原样
+  // 读取响应体副本:arrayBuffer() 对新 Response 返回独立持有的 buffer,直接存即可
+  // (不要再 slice 复制——96MB 级资源包每多一份拷贝都逼近渲染进程内存上限);
+  // 已消费/读取失败的响应回退存原样
   function snapshotResponse(res) {
     var rec = { headers: {}, raw: res, bodyPromise: null };
     try {
@@ -64,16 +135,30 @@ var __kdCaches = (function () {
       if (h && typeof h.forEach === 'function') h.forEach(function (v, k) { rec.headers[k] = v; });
     } catch (e) { /* headers 不可读则留空 */ }
     try {
-      rec.bodyPromise = res.arrayBuffer().then(function (buf) { return buf.slice(0); });
+      rec.bodyPromise = res.arrayBuffer()
+        .catch(function () { return null; }); // body 已被消费等异步拒绝:回退 raw
     } catch (e) { rec.bodyPromise = null; }
     return rec;
   }
   return {
     open: function (name) {
-      var s = store(String(name));
+      var cacheName = String(name);
+      var s = store(cacheName);
       return Promise.resolve({
         put: function (req, res) {
-          s.map[keyOf(req)] = snapshotResponse(res);
+          var reqKey = keyOf(req);
+          var rec = snapshotResponse(res);
+          s.map[reqKey] = rec;
+          // 同步父页面持久化(等 body 副本就绪后携带;ArrayBuffer 经 postMessage
+          // 结构化克隆直传,不做 base64——大资源包省一次全量编解码与巨型字符串 GC)
+          var sync = function (buf) {
+            kdPost({
+              type: 'store-sync', subtype: 'cache', op: 'put', cache: cacheName, req: reqKey,
+              headers: rec.headers, bodyBuf: buf || null
+            });
+          };
+          if (rec.bodyPromise) rec.bodyPromise.then(sync);
+          else sync(null);
           return Promise.resolve();
         },
         match: function (req) {
@@ -82,12 +167,18 @@ var __kdCaches = (function () {
           if (rec.bodyPromise) {
             // 每次返回全新 Response:headers 保留、body 可重复 arrayBuffer()
             return rec.bodyPromise.then(function (buf) {
-              return new Response(new Uint8Array(buf), { headers: rec.headers });
+              if (buf) return new Response(new Uint8Array(buf), { headers: rec.headers });
+              return rec.raw || undefined;
             });
           }
           return Promise.resolve(rec.raw);
         },
-        delete: function (req) { delete s.map[keyOf(req)]; return Promise.resolve(true); },
+        delete: function (req) {
+          var reqKey = keyOf(req);
+          delete s.map[reqKey];
+          kdPost({ type: 'store-sync', subtype: 'cache', op: 'delete', cache: cacheName, req: reqKey });
+          return Promise.resolve(true);
+        },
         keys: function () { return Promise.resolve(Object.keys(s.map)); },
         has: function (req) { return Promise.resolve(Object.prototype.hasOwnProperty.call(s.map, keyOf(req))); }
       });
@@ -95,18 +186,244 @@ var __kdCaches = (function () {
     keys: function () { return Promise.resolve(Object.keys(stores)); },
     match: function () { return Promise.resolve(undefined); },
     has: function () { return Promise.resolve(false); },
-    delete: function () { return Promise.resolve(true); }
+    delete: function () { return Promise.resolve(true); },
+    // boot 快照恢复:{cacheName: {reqUrl: {headers, body:ArrayBuffer}}}——
+    // body 经 postMessage 结构化克隆直达;兼容旧格式 bodyB64(base64 字符串)
+    __prime: function (snap) {
+      if (!snap) return;
+      for (var name in snap) {
+        if (!Object.prototype.hasOwnProperty.call(snap, name)) continue;
+        var s = store(name);
+        var entries = snap[name] || {};
+        for (var reqKey in entries) {
+          if (!Object.prototype.hasOwnProperty.call(entries, reqKey)) continue;
+          var e = entries[reqKey] || {};
+          var buf = null;
+          if (e.body instanceof ArrayBuffer) {
+            buf = e.body;
+          } else if (typeof e.bodyB64 === 'string') {
+            try { buf = b64ToBuf(e.bodyB64); } catch (err) { buf = null; }
+          }
+          s.map[reqKey] = {
+            headers: e.headers || {},
+            raw: null,
+            bodyPromise: buf ? Promise.resolve(buf) : null
+          };
+        }
+      }
+    }
   };
 })();
-let booted = false;
-const bootNonce = decodeURIComponent(location.hash.slice(1));
-location.hash = '';
+
+// ---- TavernHelper 兼容 shim(酒馆助手式资源页的最小 API 面) ----
+// 作者页(吸血鬼卡等)在下载/解密资源包时调用
+// window.TavernHelper.getCharData("current").data 取卡元数据
+// (creator/character_version/creator_notes)推导 AES 口令; kedai 不是酒馆,
+// 没有 TavernHelper 全局——缺失时口令为空,解密必然 OperationError,下载完成后
+// 必然失败回退。boot 时由宿主随 charData 下发当前角色卡元数据,这里装成真实全局。
+// getVariables/insertOrAssignVariables 供作者页持久化设置与剧情变量;
+// 落在 localStorage 内存 shim 上,变更经 store-sync 桥持久化,reload/重启后恢复。
+//
+// 扩展 API 面(吸血鬼卡 v2.1 实测用到):
+//   - 世界书:getCharWorldbookNames(同步!)/getWorldbook/updateWorldbookWith。
+//     世界书数据随 boot 消息下发(宿主从角色卡 data_raw.character_book 提取),
+//     shim 读内存副本;update 只改内存(作者页用于 dark filter/模板处理,
+//     每次 boot 都会重放,幂等),不落库。
+//   - generate:作者页生成开场白/总结({user_input, injects, overrides.chat_history})。
+//     经 postMessage RPC 桥到宿主 → /api/chat/generate-raw(沙箱无 token 直连不了 API)。
+//   - getPreset/replacePreset/createWorldbookEntries/eventOn 等:返回安全空值,
+//     作者页对这些都有 typeof 检查与 try/catch 容错,缺省不崩。
+function installTavernHelper(charData, worldbook) {
+  var VAR_KEY = 'kedai.tavern-vars.v1';
+  // 预设 store(真实化):作者页依赖酒馆「使用中的预设」——读流式开关
+  // (getPreset('in_use').settings.should_stream)、写入防掉格式提示词
+  // (replacePreset 追加 prompts)。落在内存 storage 上,经 store-sync 桥持久化,
+  // reload/重启后保留;kedai 默认预设无提示词、非流式。
+  var PRESET_KEY = 'kedai.tavern-preset.v1';
+  function defaultPreset() {
+    return { name: 'kedai-in-use', settings: { should_stream: false }, prompts: [] };
+  }
+  function readPreset() {
+    try {
+      var raw = __kdMemoryStorage.getItem(PRESET_KEY);
+      var p = raw ? JSON.parse(raw) : null;
+      if (!p || typeof p !== 'object') return defaultPreset();
+      if (!p.settings || typeof p.settings !== 'object') p.settings = { should_stream: false };
+      if (typeof p.settings.should_stream !== 'boolean') p.settings.should_stream = false;
+      if (!Array.isArray(p.prompts)) p.prompts = [];
+      return p;
+    } catch (e) { return defaultPreset(); }
+  }
+  function getPresetImpl(name) {
+    if (name !== undefined && name !== 'in_use') return null;
+    return readPreset();
+  }
+  function replacePresetImpl(name, preset) {
+    if (name !== 'in_use' || !preset || typeof preset !== 'object') return Promise.resolve();
+    var p = {
+      name: typeof preset.name === 'string' ? preset.name : 'kedai-in-use',
+      settings: preset.settings && typeof preset.settings === 'object' ? preset.settings : { should_stream: false },
+      prompts: Array.isArray(preset.prompts) ? preset.prompts : [],
+    };
+    try { __kdMemoryStorage.setItem(PRESET_KEY, JSON.stringify(p)); } catch (e) { /* 序列化失败忽略 */ }
+    return Promise.resolve();
+  }
+  // 作者页优先查全局函数(typeof getPreset=="function"),再查 TavernHelper——两处都装
+  window.getPreset = getPresetImpl;
+  window.replacePreset = replacePresetImpl;
+  // 把预设中启用的提示词并入 generate 参数(角色白名单 user/system;单条 32KB/共 20 条防失控)
+  function withPresetPrompts(args) {
+    args = args || {};
+    var prompts = readPreset().prompts.filter(function (p) {
+      return p && p.enabled !== false && typeof p.content === 'string' && p.content.length > 0;
+    }).slice(0, 20).map(function (p) {
+      return { role: p.role === 'system' ? 'system' : 'user', content: String(p.content).slice(0, 32768) };
+    });
+    if (!prompts.length) return args;
+    return Object.assign({}, args, { __preset_prompts: prompts });
+  }
+  var wbName = (worldbook && worldbook.name) || null;
+  // 字段归一化:角色卡 character_book 条目名存在 comment(SillyTavern 内部格式),
+  // 酒馆助手 API 返回时归一化为 name;作者页按 m.name 查找开局/设定条目,
+  // 直接透传原始数据会导致「No enabled "start*" entry found」、开场白缺失。
+  function normalizeEntry(e) {
+    if (!e || typeof e !== 'object') return e;
+    if (typeof e.name !== 'string' || !e.name) {
+      if (typeof e.comment === 'string' && e.comment) return Object.assign({}, e, { name: e.comment });
+    }
+    return e;
+  }
+  var wbEntries = ((worldbook && worldbook.entries) || []).map(normalizeEntry);
+  function readVars() {
+    try {
+      var raw = __kdMemoryStorage.getItem(VAR_KEY);
+      return raw ? JSON.parse(raw) : {};
+    } catch (e) { return {}; }
+  }
+  window.TavernHelper = {
+    getCharData: function () { return { data: charData || null }; },
+    getVariables: function () { return readVars(); },
+    insertOrAssignVariables: function (vars) {
+      var all = readVars();
+      if (vars && typeof vars === 'object') {
+        for (var k in vars) {
+          if (Object.prototype.hasOwnProperty.call(vars, k)) all[k] = vars[k];
+        }
+      }
+      try { __kdMemoryStorage.setItem(VAR_KEY, JSON.stringify(all)); } catch (e) { /* 序列化失败忽略 */ }
+      return Promise.resolve();
+    },
+    // 世界书(数据随 boot 下发,同步接口读内存)
+    getCharWorldbookNames: function () {
+      return wbName ? { primary: wbName, additional: [] } : null;
+    },
+    getWorldbook: function (name) {
+      if (!wbName || String(name) !== wbName) return Promise.resolve(null);
+      return Promise.resolve(wbEntries.map(function (e) { return e; }));
+    },
+    updateWorldbookWith: function (name, fn) {
+      if (wbName && String(name) === wbName && typeof fn === 'function') {
+        try {
+          var next = fn(wbEntries.map(function (e) { return e; }));
+          if (next) wbEntries = next.map(normalizeEntry);
+        } catch (e) { /* 作者回调异常忽略 */ }
+      }
+      return Promise.resolve(wbEntries);
+    },
+    createWorldbookEntries: function () { return Promise.resolve(null); },
+    deleteWorldbookEntries: function () { return Promise.resolve(false); },
+    // 模型生成(经宿主 RPC 桥 → /api/chat/generate-raw)
+    // 酒馆语义:预设中 enabled 的提示词并入本次生成——作者页「注入防掉格式提示」
+    // 写入预设后,后续回合必须携带它才有效;这里把启用提示词随 RPC 一并转发。
+    generate: function (args) { return tavernCall('generate', withPresetPrompts(args)); },
+    generateRaw: function (args) { return tavernCall('generate', withPresetPrompts(args)); },
+    // 预设:真实内存 store(见上方 PRESET_KEY);事件:kedai 无酒馆事件流,返回安全空值
+    getPreset: getPresetImpl,
+    replacePreset: replacePresetImpl,
+    eventOn: function () { return function () {}; },
+    eventOff: function () {},
+    eventEmit: function () { return Promise.resolve(false); }
+  };
+}
+
+// ---- TavernHelper.generate RPC 桥(iframe → 宿主 → /api/chat/generate-raw) ----
+var __kdTavernCallSeq = 0;
+var __kdTavernCallPending = {};
+function tavernCall(method, args) {
+  return new Promise(function (resolve, reject) {
+    var callId = 'tc' + (++__kdTavernCallSeq) + '_' + Date.now();
+    __kdTavernCallPending[callId] = { resolve: resolve, reject: reject };
+    kdPost({ type: 'tavern-call', callId: callId, method: method, args: args });
+    // 超时兜底(宿主掉线/处理异常时作者页不至于永久挂起)
+    setTimeout(function () {
+      var p = __kdTavernCallPending[callId];
+      if (p) { delete __kdTavernCallPending[callId]; reject(new Error('tavern-call 超时(宿主未响应)')); }
+    }, 120000);
+  });
+}
+// 宿主回包:在 message 监听里分发(boot 监听之前注册,见下方 boot 处理)
+function handleTavernResult(m) {
+  var p = __kdTavernCallPending[m.callId];
+  if (!p) return;
+  delete __kdTavernCallPending[m.callId];
+  if (m.ok) p.resolve(m.value);
+  else p.reject(new Error(String(m.error || '生成失败')));
+}
+
+// ---- window.parent 沙箱兼容 shim ----
+// 部分作者页(吸血鬼卡等)的宽屏/游戏界面机制是为同源嵌入(酒馆)设计的:进游戏时
+// 尝试 window.parent.document 往父文档 head 注入 <style> 把自己的 iframe 撑满。
+// 沙箱 iframe(opaque origin)里该访问必抛 SecurityError,作者页 alert
+// 「宿主不允许访问父页面样式,无法进入宽屏」并停在下载完成页,游戏界面永不出现。
+// window.parent 是 [Replaceable] 属性,可直接赋值遮蔽;这里在作者脚本执行前把
+// window.parent 换成代理:
+//   - document → 自身文档:宽屏样式节点落在 iframe 内,创建/查询/卸载全部自洽,
+//     作者页正常切入宽屏态(界面出现);撑满视口由宿主侧宽屏按钮负责(卡片自带)。
+//   - postMessage → 转发真实父窗口:宿主消息桥(ready/store-sync)不受影响。
+//   - 其余成员(尺寸/事件等)优先取自身:跨源本就不可读,作者页的 try/catch 回退
+//     读取的也是自身值,语义一致。
+function installParentShim() {
+  var real = REAL_PARENT;
+  var proxy = new Proxy({}, {
+    get: function (t, p) {
+      if (p === 'document') return document;
+      if (p === 'postMessage') return function (msg, origin) { return real.postMessage(msg, origin); };
+      if (p === '__kdParentShim') return true;
+      if (typeof p === 'symbol') return undefined; // 防 Promise resolve/类型转换把代理当目标
+      var sv = window[p];
+      if (typeof sv === 'function') return sv.bind(window);
+      if (sv !== undefined) return sv;
+      try { // 白名单属性(closed/length 等跨源可读)
+        var pv = real[p];
+        return typeof pv === 'function' ? pv.bind(real) : pv;
+      } catch (e) { return undefined; }
+    },
+    set: function () { return true; }
+  });
+  try { window.parent = proxy; } catch (e) { /* 不可遮蔽则维持原行为 */ }
+}
+
+// ---- boot:接收作者页面 HTML + 存储快照,DOM 重建执行 ----
+var booted = false;
 addEventListener('message', function (event) {
   const m = event.data;
-  if (event.source !== parent) return;
-  if (!m || m.channel !== 'kedai-resource-frame-v1' || m.nonce !== bootNonce || booted) return;
+  if (event.source !== REAL_PARENT) return;
+  if (!m || m.channel !== 'kedai-resource-frame-v1') return;
+  // TavernHelper.generate 等 RPC 回包(独立于 boot 闩锁,任何时刻都可能到达)
+  if (m.type === 'tavern-result') { try { handleTavernResult(m); } catch (e) {} return; }
+  if (m.nonce !== bootNonce || !bootNonce || booted) return;
   if (m.type !== 'boot' || typeof m.html !== 'string') return;
   booted = true;
+  // 先恢复存储快照(作者初始化脚本会立即读 localStorage/caches 做下载完成判定)
+  const snap = m.snapshot || {};
+  try { __kdMemoryStorage.__prime(snap.local); } catch (e) { /* 快照损坏不阻断 boot */ }
+  try { __kdSessionStorage.__prime(snap.session); } catch (e) { /* 同上 */ }
+  try { __kdCaches.__prime(snap.caches); } catch (e) { /* 同上 */ }
+  // 再装 TavernHelper shim(作者初始化即读卡数据推导口令;变量读写落在已 prime 的存储上;
+  // worldbook 供世界书同步接口读取)
+  try { installTavernHelper(m.charData || null, m.worldbook || null); } catch (e) { /* shim 失败不阻断 boot */ }
+  // 再装 window.parent 代理(作者脚本执行前;宽屏机制读 parent.document 不再抛)
+  try { installParentShim(); } catch (e) { /* 不可遮蔽则维持原行为 */ }
   const doc = new DOMParser().parseFromString(m.html, 'text/html');
   // 先重建 body(作者脚本(React/Vue)挂载目标 #root 必须先存在),再执行 head 脚本
   const body = document.body;
@@ -117,7 +434,7 @@ addEventListener('message', function (event) {
     else if (child.nodeType === 3 && child.textContent.trim()) body.appendChild(child.cloneNode(true));
   }
   // 重建 head:脚本用 appendChild 新元素触发执行(动态插入的 module script 可执行),
-  // localStorage/sessionStorage 引用替换为内存 shim;其余节点(style/base/link)importNode 保留
+  // localStorage/sessionStorage/caches 引用替换为内存 shim;其余节点(style/base/link)importNode 保留
   const head = document.head;
   while (head.firstChild) head.removeChild(head.firstChild);
   const srcHead = doc.head;
@@ -130,16 +447,20 @@ addEventListener('message', function (event) {
       for (let a = 0; a < child.attributes.length; a++) {
         s.setAttribute(child.attributes[a].name, child.attributes[a].value);
       }
+      // \bcaches\b 同时覆盖裸 caches / window.caches / self.caches / globalThis.caches
+      // (__kdCaches 经 var 提升为全局对象属性,四种写法都解析到 shim)
       s.textContent = (child.textContent || '')
         .replace(/\blocalStorage\b/g, '__kdMemoryStorage')
         .replace(/\bsessionStorage\b/g, '__kdSessionStorage')
-        .replace(/\bglobalThis\.caches\b/g, '__kdCaches');
+        .replace(/\bcaches\b/g, '__kdCaches');
       head.appendChild(s);
     } else {
       head.appendChild(document.importNode(child, true));
     }
   }
 });
-parent.postMessage({ channel: 'kedai-resource-frame-v1', nonce: bootNonce, type: 'ready' }, '*');
+// 每次文档加载都发 ready(首次加载与 reload 都走这里),父页面监听常驻,
+// 收到 ready 即以缓存 HTML + 最新快照 boot;nonce 丢失时 ready 无 nonce,
+// 父页面识别为「nonce 丢失的重载」并重建 src 恢复。
+REAL_PARENT.postMessage({ channel: 'kedai-resource-frame-v1', nonce: bootNonce, type: 'ready' }, '*');
 </script>
-

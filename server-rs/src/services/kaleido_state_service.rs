@@ -35,21 +35,13 @@ impl KaleidoStateService {
     }
 
     /// 读取会话运行态的 meta 与契约版本;无行(尚未 commit 过)返回 None。
-    pub fn load_meta(
-        &self,
-        session_id: &str,
-    ) -> Result<Option<(u32, KaleidoMeta)>, String> {
-        let conn = self.db.conn();
+    pub fn load_meta(&self, session_id: &str) -> Result<Option<(u32, KaleidoMeta)>, String> {
+        let conn = self.db.read()?;
         let row = conn
             .query_row(
                 "SELECT contract_version, meta_json FROM kaleido_state WHERE session_id = ?1",
                 rusqlite::params![session_id],
-                |row| {
-                    Ok((
-                        row.get::<_, i64>(0)?,
-                        row.get::<_, String>(1)?,
-                    ))
-                },
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
             )
             .optional()
             .map_err(|e| format!("查询契约运行态失败: {e}"))?;
@@ -57,7 +49,10 @@ impl KaleidoStateService {
             Some((version, meta_json)) => {
                 let meta: KaleidoMeta = serde_json::from_str(&meta_json)
                     .map_err(|e| format!("解析契约运行态 meta 失败: {e}"))?;
-                Ok(Some((u32::try_from(version).map_err(|_| "契约版本越界".to_string())?, meta)))
+                Ok(Some((
+                    u32::try_from(version).map_err(|_| "契约版本越界".to_string())?,
+                    meta,
+                )))
             }
             None => Ok(None),
         }
@@ -65,11 +60,8 @@ impl KaleidoStateService {
 
     /// 读取运行态整行(P7 HTTP 出口):stat_data 快照 + meta + revision。
     /// 尚未 commit 过返回 None。
-    pub fn load_state(
-        &self,
-        session_id: &str,
-    ) -> Result<Option<KaleidoStateRow>, String> {
-        let conn = self.db.conn();
+    pub fn load_state(&self, session_id: &str) -> Result<Option<KaleidoStateRow>, String> {
+        let conn = self.db.read()?;
         let row = conn
             .query_row(
                 "SELECT contract_version, stat_data, meta_json, revision_seq, revision_hash, updated_at \
@@ -114,7 +106,7 @@ impl KaleidoStateService {
         meta: &KaleidoMeta,
         entries: &mut [ChangelogEntry],
     ) -> Result<(), String> {
-        let mut conn = self.db.conn();
+        let mut conn = self.db.write();
         let tx = conn
             .transaction()
             .map_err(|e| format!("开启契约运行态事务失败: {e}"))?;
@@ -123,7 +115,13 @@ impl KaleidoStateService {
             tx.execute(
                 "INSERT INTO kaleido_changelog (session_id, turn_id, entry_json, created_at) \
                  VALUES (?1, ?2, ?3, ?4)",
-                rusqlite::params![session_id, entry.turn_id as i64, serde_json::to_string(&entry).map_err(|e| format!("序列化变更记录失败: {e}"))?, ts],
+                rusqlite::params![
+                    session_id,
+                    entry.turn_id as i64,
+                    serde_json::to_string(&entry)
+                        .map_err(|e| format!("序列化变更记录失败: {e}"))?,
+                    ts
+                ],
             )
             .map_err(|e| format!("写入契约运行态变更记录失败: {e}"))?;
             // 回填权威 seq(表内自增主键),供回滚/重放按 seq 定位
@@ -136,7 +134,8 @@ impl KaleidoStateService {
             tx.execute(
                 "UPDATE kaleido_changelog SET entry_json = ?1 WHERE seq = ?2",
                 rusqlite::params![
-                    serde_json::to_string(&entry).map_err(|e| format!("序列化变更记录失败: {e}"))?,
+                    serde_json::to_string(&entry)
+                        .map_err(|e| format!("序列化变更记录失败: {e}"))?,
                     seq as i64
                 ],
             )
@@ -205,7 +204,7 @@ impl KaleidoStateService {
     /// 供会话删除 API 清理孤儿数据(kaleido 两表无 FK 级联,须显式清理)。
     /// 两 DELETE 同事务:半清理(日志空而 state 残留)会让 recover 重放语义失真。
     pub fn delete_for_session(&self, session_id: &str) -> Result<(), String> {
-        let mut conn = self.db.conn();
+        let mut conn = self.db.write();
         let tx = conn
             .transaction()
             .map_err(|e| format!("开启契约运行态清理事务失败: {e}"))?;
@@ -231,7 +230,7 @@ impl KaleidoStateService {
         limit: usize,
     ) -> Result<Vec<ChangelogEntry>, String> {
         let limit = limit.clamp(1, 1000) as i64;
-        let conn = self.db.conn();
+        let conn = self.db.read()?;
         let mut stmt = conn
             .prepare(
                 "SELECT entry_json FROM kaleido_changelog WHERE session_id = ?1 \
@@ -247,8 +246,7 @@ impl KaleidoStateService {
         for raw in rows {
             let raw = raw.map_err(|e| format!("读取契约运行态变更失败: {e}"))?;
             entries.push(
-                serde_json::from_str(&raw)
-                    .map_err(|e| format!("解析契约运行态变更失败: {e}"))?,
+                serde_json::from_str(&raw).map_err(|e| format!("解析契约运行态变更失败: {e}"))?,
             );
         }
         Ok(entries)

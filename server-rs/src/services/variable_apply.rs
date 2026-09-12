@@ -114,8 +114,7 @@ impl VariableApplyService {
         if !gated.pending.is_empty() {
             warnings.push(format!("{} 条操作低置信未写入", gated.pending.len()));
         }
-        let breaker_hashes =
-            crate::contracts::rejection_hashes(&gated.rejected, &gated.pending);
+        let breaker_hashes = crate::contracts::rejection_hashes(&gated.rejected, &gated.pending);
         // turn_id 用消息数推算(与 get_state/引擎收尾 len-as-turn 启发式同源)
         let turn_id = self.sessions.get_messages(session_id).len() as u64;
 
@@ -131,17 +130,25 @@ impl VariableApplyService {
                         .flatten()
                         .map(|(_, m)| m)
                         .unwrap_or_default();
-                    meta.pending =
-                        crate::contracts::merge_pending(&meta.pending, &gated.pending, &[], turn_id);
+                    meta.pending = crate::contracts::merge_pending(
+                        &meta.pending,
+                        &gated.pending,
+                        &[],
+                        turn_id,
+                    );
                     meta.last_turn_id = turn_id;
                     meta.last_contract_version = contract.version;
-                    if let Err(e) =
-                        self.kaleido
-                            .commit_turn(session_id, contract.version, &tree, &meta, &mut Vec::new())
-                    {
-                        crate::utils::logger::warn(
-                            "低置信提议入队失败(未写入任何变更)",
-                            &[("session_id", session_id.into()), ("error", e.into())],
+                    if let Err(e) = self.kaleido.commit_turn(
+                        session_id,
+                        contract.version,
+                        &tree,
+                        &meta,
+                        &mut Vec::new(),
+                    ) {
+                        tracing::warn!(
+                            session_id = session_id,
+                            error = e.as_str(),
+                            "低置信提议入队失败(未写入任何变更)"
                         );
                     }
                 }
@@ -187,8 +194,12 @@ impl VariableApplyService {
                 .flatten()
                 .map(|(_, m)| m)
                 .unwrap_or_default();
-            meta.pending =
-                crate::contracts::merge_pending(&meta.pending, &gated.pending, &applied_paths, turn_id);
+            meta.pending = crate::contracts::merge_pending(
+                &meta.pending,
+                &gated.pending,
+                &applied_paths,
+                turn_id,
+            );
             meta.last_turn_id = turn_id;
             meta.last_contract_version = contract.version;
             for e in &round_entries {
@@ -202,9 +213,10 @@ impl VariableApplyService {
                 &mut round_entries,
             ) {
                 Ok(()) => entries = round_entries,
-                Err(e) => crate::utils::logger::warn(
-                    "补丁已生效但契约留痕失败",
-                    &[("session_id", session_id.into()), ("error", e.into())],
+                Err(e) => tracing::warn!(
+                    session_id = session_id,
+                    error = e.as_str(),
+                    "补丁已生效但契约留痕失败"
                 ),
             }
         }

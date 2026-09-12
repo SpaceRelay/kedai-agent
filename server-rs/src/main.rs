@@ -1,6 +1,6 @@
 // Kedai 后端入口:Rust + axum + SQLite + SSE(命令行模式)
 // 桌面场景请使用 src-tauri(Tauri 壳复用 kedai_server::run_server)
-use kedai_server::{config, utils};
+use kedai_server::config;
 
 #[tokio::main]
 async fn main() {
@@ -8,11 +8,10 @@ async fn main() {
 
     // 启动前自检:健康检查通过说明已有实例在跑,直接复用退出;
     // 否则启动服务(bind 失败会由 run_server 明确报错,不存在 TOCTOU 竞态)。
+    // 注:此处在 run_server 之前,tracing 尚未初始化,事件与旧 logger 一样静默丢弃,
+    // 用户可见输出由下方 println 承担(与迁移前行为一致)。
     if let Some(url) = probe_existing(&config).await {
-        utils::logger::info(
-            "检测到已有 Kedai 服务在运行,直接退出",
-            &[("url", serde_json::Value::String(url.clone()))],
-        );
+        tracing::info!(url = url.as_str(), "检测到已有 Kedai 服务在运行,直接退出");
         println!("[OK] Kedai 服务已在运行 → {url}");
         return;
     }

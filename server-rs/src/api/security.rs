@@ -74,7 +74,8 @@ pub async fn guard(State(state): State<Arc<AppState>>, request: Request, next: N
         }
         // 头像接口豁免 token:<img src="/api/avatars/..." 无法携带 Authorization 头,
         // 且头像文件仅从 DATA_DIR/avatars 读取、无敏感信息;host/origin 校验仍生效。
-        let public = matches!(path, "/api/health" | "/api/bootstrap") || path.starts_with("/api/avatars/");
+        let public =
+            matches!(path, "/api/health" | "/api/bootstrap") || path.starts_with("/api/avatars/");
         if state.config.auth_required
             && !public
             && !valid_token(&state, request.headers().get(header::AUTHORIZATION))
@@ -164,6 +165,15 @@ fn is_loopback_name(host: &str) -> bool {
 }
 
 fn reject(status: StatusCode, message: &str) -> Response {
+    // 401 附带结构化错误码 UNAUTHORIZED(前端据此提示重新加载页面,见 api/errors.rs);
+    // 其余拒绝(403 loopback / 429 限频)保持裸 { error } 契约不变。
+    if status == StatusCode::UNAUTHORIZED {
+        return secure_headers(crate::api::err_with_code(
+            crate::api::ErrorCode::Unauthorized,
+            message,
+            status,
+        ));
+    }
     secure_headers((status, Json(json!({ "error": message }))).into_response())
 }
 
@@ -245,7 +255,10 @@ fn sandbox_headers(mut response: Response<Body>) -> Response<Body> {
     headers.insert(
         "content-security-policy",
         HeaderValue::from_static(
-            "default-src 'none'; script-src 'unsafe-inline'; connect-src 'none'; \
+            // 'unsafe-eval':角色卡界面 HTML 的 inline 事件处理器(onclick 等,如 WuWa
+            // 状态栏 72 处)经降级桥在沙箱内用 new Function 求值;求值对象仅限作者自己
+            // 的代码(与用户已授权执行的卡脚本同信任级),沙箱不透明来源+零网络出口不变
+            "default-src 'none'; script-src 'unsafe-inline' 'unsafe-eval'; connect-src 'none'; \
              img-src 'none'; style-src 'none'; font-src 'none'; media-src 'none'; \
              object-src 'none'; frame-src 'none'; child-src 'none'; worker-src 'none'; \
              form-action 'none'; base-uri 'none'; frame-ancestors 'self'",
@@ -309,9 +322,13 @@ fn resource_frame_headers(mut response: Response<Body>) -> Response<Body> {
     headers.insert(
         "content-security-policy",
         HeaderValue::from_static(
-            "default-src 'self'; script-src 'unsafe-inline'; connect-src https: http:; \
-             img-src https: http: data:; style-src 'self' 'unsafe-inline' https: http:; \
-             font-src 'self' https: http: data:; media-src https: http:; \
+            // img/font/media/connect 放行 blob::作者页(吸血鬼卡等)把解密后的资源包
+            // (立绘/文本/音频)经 URL.createObjectURL 生成本地 blob: URL 加载,
+            // CSP 不含 blob: 会全部拦截,表现为开场消息/立绘/数值丢失。
+            // blob: 只能由该文档自身的 opaque origin 创建,不放宽跨源边界。
+            "default-src 'self'; script-src 'unsafe-inline'; connect-src https: http: blob:; \
+             img-src https: http: data: blob:; style-src 'self' 'unsafe-inline' https: http:; \
+             font-src 'self' https: http: data: blob:; media-src https: http: blob:; \
              object-src 'none'; frame-src https: http:; child-src https: http:; \
              worker-src 'none'; form-action https: http:; base-uri 'none'; \
              frame-ancestors 'self'",

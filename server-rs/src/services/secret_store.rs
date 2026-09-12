@@ -3,19 +3,22 @@
 // Windows:使用 DPAPI(CryptProtectData / CryptUnprotectData,CRYPTPROTECT_LOCAL_MACHINE 未设置,
 // 即绑定当前用户账户)。密文经 base64 后以 `enc:v1:` 前缀写入 JSON,只有同一 Windows 用户
 // 能解密;拷走 settings.json 到别的账户/机器无法还原。
-// 非 Windows:默认拒绝持久化非空凭据。仅当显式设置
+// Android:使用 AndroidKeyStore 的 AES-256-GCM(经 JNI 调 Kotlin KeystoreBridge,见
+// services/keystore_android.rs)。密钥由系统生成且不可导出,密文同样带 `enc:v1:` 前缀。
+// 其它平台:默认拒绝持久化非空凭据。仅当显式设置
 // `KEDAI_ALLOW_INSECURE_PLAINTEXT_SECRETS=1` 时,才允许带 `plain:v1:` 前缀明文落盘。
 //
 // 兼容性:load 时无前缀的值视为旧版明文,原样读取并在下次 save 时尝试迁移。
 // 无安全存储且未显式 opt-in 时迁移会返回明确错误,不会覆盖原文件。
 
-/// 密文前缀(DPAPI + base64)
+/// 密文前缀(DPAPI / Android Keystore 共用同一前缀:两者都是「本机可解、外拷不可解」,
+/// 存储格式对上层无差异,故沿用同一标记避免迁移逻辑分叉)
 const ENC_PREFIX: &str = "enc:v1:";
 /// 明文前缀(无加密后端的平台显式标记,区别于旧版无前缀明文)
 const PLAIN_PREFIX: &str = "plain:v1:";
 
 /// 加密敏感值用于持久化:空串保持空串(表示「未配置」,不加密以便 is_empty 判断)。
-/// Windows 必须成功使用 DPAPI;非 Windows 默认拒绝明文,仅显式 opt-in 才允许。
+/// Windows 必须成功使用 DPAPI;Android 必须成功使用 Keystore;其它平台默认拒绝明文。
 pub fn protect(plain: &str) -> Result<String, String> {
     if plain.is_empty() {
         return Ok(String::new());
@@ -27,7 +30,13 @@ pub fn protect(plain: &str) -> Result<String, String> {
         let b64 = base64::engine::general_purpose::STANDARD.encode(blob);
         Ok(format!("{ENC_PREFIX}{b64}"))
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "android")]
+    {
+        // KeystoreBridge 自行处理 base64(格式为 IV长度+IV+密文),此处直接取返回值
+        let b64 = crate::services::keystore_android::encrypt(plain)?;
+        Ok(format!("{ENC_PREFIX}{b64}"))
+    }
+    #[cfg(not(any(windows, target_os = "android")))]
     {
         if std::env::var("KEDAI_ALLOW_INSECURE_PLAINTEXT_SECRETS").as_deref() == Ok("1") {
             eprintln!("[secret_store] 警告:已显式允许明文持久化 API Key");
@@ -38,7 +47,8 @@ pub fn protect(plain: &str) -> Result<String, String> {
 }
 
 /// 解密持久化的敏感值:
-/// - `enc:v1:` → DPAPI 解密(失败返回空串,视为未配置,避免把密文当 Key 发给上游)
+/// - `enc:v1:` → DPAPI(Windows) / Android Keystore(Android)解密;失败返回空串,
+///   视为未配置,避免把密文当 Key 发给上游
 /// - `plain:v1:` → 去前缀
 /// - 其他(含空串)→ 旧版明文,原样返回
 pub fn unprotect(stored: &str) -> String {
@@ -63,10 +73,21 @@ pub fn unprotect(stored: &str) -> String {
                 }
             }
         }
-        #[cfg(not(windows))]
+        #[cfg(target_os = "android")]
+        {
+            return match crate::services::keystore_android::decrypt(b64.trim()) {
+                Ok(plain) => plain,
+                Err(e) => {
+                    // 换设备/重装应用后 Keystore 中的密钥不再存在,旧密文无法解开
+                    eprintln!("[secret_store] Android Keystore 解密失败(换设备或重装应用?请在设置页重填 API Key):{e}");
+                    String::new()
+                }
+            };
+        }
+        #[cfg(not(any(windows, target_os = "android")))]
         {
             let _ = b64;
-            eprintln!("[secret_store] 当前平台无 DPAPI,无法解密 enc:v1 值;请在设置页重填 API Key");
+            eprintln!("[secret_store] 当前平台无安全凭据存储,无法解密 enc:v1 值;请在设置页重填 API Key");
             return String::new();
         }
     }
@@ -197,13 +218,22 @@ mod tests {
         assert_eq!(unprotect(""), "");
     }
 
-    /// 非 Windows 默认拒绝新增明文凭据持久化
-    #[cfg(not(windows))]
+    /// 其它平台(非 Windows、非 Android)默认拒绝新增明文凭据持久化。
+    /// Android 已由 Keystore 承接,不在此列。
+    #[cfg(not(any(windows, target_os = "android")))]
     #[test]
     fn non_windows_rejects_plaintext_by_default() {
         std::env::remove_var("KEDAI_ALLOW_INSECURE_PLAINTEXT_SECRETS");
         let error = protect("sk-test").expect_err("默认必须拒绝明文 API Key");
         assert!(error.contains("拒绝持久化明文 API Key"));
+    }
+
+    /// Android:enc:v1: 前缀语义与桌面一致(is_protected 判定不因平台分叉)
+    #[test]
+    fn enc_prefix_is_recognized_on_all_platforms() {
+        assert!(is_protected("enc:v1:AAAA"));
+        assert!(!is_protected("plain:v1:xxxx"));
+        assert!(!is_protected("sk-legacy"));
     }
 
     /// 旧版无前缀明文可直接读取(向后兼容)

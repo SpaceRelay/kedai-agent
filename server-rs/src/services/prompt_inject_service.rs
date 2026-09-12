@@ -1,8 +1,6 @@
 // 提示词注入服务:简单模式(字数/转述/对话/视角)+ 复杂模式楼层系统
 // 持久化到 data/prompt_floors.json;全局作用域,所有会话生效。
-use crate::utils::logger;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use std::path::{Path, PathBuf};
 
 /// 简单模式「字数要求」→ 输出预算下限(纯函数,供 chat/send 协调 max_tokens):
@@ -55,17 +53,21 @@ fn validate_config(_cfg: &PromptInjectConfig) -> Result<(), String> {
 }
 
 /// 楼层注入位置(与 SillyTavern Prompt Manager 语义对齐)
+///
+/// **注意**:引擎注入路径已统一归位「系统提示词内」——`Before`/`After`/`Depth`
+/// 不再参与注入(见 `agents/engine/messages/build.rs` 位置4 注释)。三个变体仅保留
+/// 解析能力,用于兼容导入的酒馆预设(`parsing/preset.rs`),新配置应一律用 `System`。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum FloorPosition {
     /// 拼入系统提示词末尾
     #[default]
     System,
-    /// 对话历史最前(开场白之前)
+    /// 对话历史最前(开场白之前)——已废弃,不参与注入
     Before,
-    /// 对话历史最后(最新消息之后)
+    /// 对话历史最后(最新消息之后)——已废弃,不参与注入
     After,
-    /// 深度:从历史末尾往前数第 N 条之后插入(0 = 最新消息后)
+    /// 深度:从历史末尾往前数第 N 条之后插入(0 = 最新消息后)——已废弃,不参与注入
     Depth,
 }
 
@@ -285,18 +287,18 @@ impl PromptInjectConfig {
             Ok(text) => match serde_json::from_str::<PromptInjectConfig>(&text) {
                 Ok(cfg) => cfg,
                 Err(e) => {
-                    logger::error(
-                        "提示词注入配置解析失败,已回退默认配置",
-                        &[("error", Value::String(e.to_string()))],
+                    tracing::error!(
+                        error = e.to_string(),
+                        "提示词注入配置解析失败,已回退默认配置"
                     );
                     PromptInjectConfig::default()
                 }
             },
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => PromptInjectConfig::default(),
             Err(e) => {
-                logger::error(
-                    "提示词注入配置读取失败,已回退默认配置",
-                    &[("error", Value::String(e.to_string()))],
+                tracing::error!(
+                    error = e.to_string(),
+                    "提示词注入配置读取失败,已回退默认配置"
                 );
                 PromptInjectConfig::default()
             }
@@ -328,11 +330,11 @@ impl PromptInjectConfig {
         }
     }
 
-    /// 持久化到 data/prompt_floors.json
+    /// 持久化到 data/prompt_floors.json(原子写:崩溃不留半截 JSON)
     pub fn save(&self, data_dir: &Path) -> Result<(), String> {
-        let _ = std::fs::create_dir_all(data_dir);
         let text = serde_json::to_string_pretty(self).map_err(|e| e.to_string())?;
-        std::fs::write(data_dir.join("prompt_floors.json"), text).map_err(|e| e.to_string())
+        crate::utils::fs_atomic::write_atomic(&data_dir.join("prompt_floors.json"), text.as_bytes())
+            .map_err(|e| e.to_string())
     }
 
     /// 简单模式:合成注入提示词文本(按 order 顺序拼接启用项;空 = 无注入)

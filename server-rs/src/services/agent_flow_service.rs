@@ -3,7 +3,6 @@
 // 支持多流程库:可新建/复制/选择/删除/导入/导出流程,当前选中流程决定 custom 模式行为。
 // 与提示词注入服务同构:全局作用域、内存缓存配置、全量读写。
 use crate::models::types::PlanStep;
-use crate::utils::logger;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeSet;
@@ -82,11 +81,14 @@ impl AgentFlowService {
         self.save_library()
     }
 
-    /// 持久化流程库到 data/agent_flows.json
+    /// 持久化流程库到 data/agent_flows.json(原子写:崩溃不留半截 JSON)
     fn save_library(&self) -> Result<(), String> {
-        let _ = std::fs::create_dir_all(&self.data_dir);
         let text = serde_json::to_string_pretty(&self.library).map_err(|e| e.to_string())?;
-        std::fs::write(self.data_dir.join("agent_flows.json"), text).map_err(|e| e.to_string())
+        crate::utils::fs_atomic::write_atomic(
+            &self.data_dir.join("agent_flows.json"),
+            text.as_bytes(),
+        )
+        .map_err(|e| e.to_string())
     }
 }
 
@@ -133,9 +135,9 @@ impl AgentFlowLibrary {
                 let value: Value = match serde_json::from_str(&text) {
                     Ok(v) => v,
                     Err(e) => {
-                        logger::error(
-                            "自定义流程配置解析失败,已回退默认配置",
-                            &[("error", Value::String(e.to_string()))],
+                        tracing::error!(
+                            error = e.to_string(),
+                            "自定义流程配置解析失败,已回退默认配置"
                         );
                         return AgentFlowLibrary::default();
                     }
@@ -144,9 +146,9 @@ impl AgentFlowLibrary {
                     match serde_json::from_value::<AgentFlowLibrary>(value) {
                         Ok(lib) => finalize_library(lib),
                         Err(e) => {
-                            logger::error(
-                                "自定义流程配置解析失败,已回退默认配置",
-                                &[("error", Value::String(e.to_string()))],
+                            tracing::error!(
+                                error = e.to_string(),
+                                "自定义流程配置解析失败,已回退默认配置"
                             );
                             AgentFlowLibrary::default()
                         }
@@ -155,7 +157,7 @@ impl AgentFlowLibrary {
                     // 旧版单流程格式 → 迁移为流程库
                     match serde_json::from_value::<AgentFlowConfig>(value) {
                         Ok(mut old) => {
-                            logger::info("检测到旧版单流程配置,已迁移为流程库", &[]);
+                            tracing::info!("检测到旧版单流程配置,已迁移为流程库");
                             if old.id.trim().is_empty() {
                                 old.id = Uuid::new_v4().to_string();
                             }
@@ -171,14 +173,14 @@ impl AgentFlowLibrary {
                                 flows: vec![old],
                             };
                             if let Err(e) = lib.save(data_dir) {
-                                logger::error("旧配置迁移写入失败", &[("error", Value::String(e))]);
+                                tracing::error!(error = e, "旧配置迁移写入失败");
                             }
                             lib
                         }
                         Err(e) => {
-                            logger::error(
-                                "自定义流程配置解析失败,已回退默认配置",
-                                &[("error", Value::String(e.to_string()))],
+                            tracing::error!(
+                                error = e.to_string(),
+                                "自定义流程配置解析失败,已回退默认配置"
                             );
                             AgentFlowLibrary::default()
                         }
@@ -195,20 +197,20 @@ impl AgentFlowLibrary {
                 lib
             }
             Err(e) => {
-                logger::error(
-                    "自定义流程配置读取失败,已回退默认配置",
-                    &[("error", Value::String(e.to_string()))],
+                tracing::error!(
+                    error = e.to_string(),
+                    "自定义流程配置读取失败,已回退默认配置"
                 );
                 AgentFlowLibrary::default()
             }
         }
     }
 
-    /// 持久化流程库到 data/agent_flows.json
+    /// 持久化流程库到 data/agent_flows.json(原子写:崩溃不留半截 JSON)
     pub fn save(&self, data_dir: &Path) -> Result<(), String> {
-        let _ = std::fs::create_dir_all(data_dir);
         let text = serde_json::to_string_pretty(self).map_err(|e| e.to_string())?;
-        std::fs::write(data_dir.join("agent_flows.json"), text).map_err(|e| e.to_string())
+        crate::utils::fs_atomic::write_atomic(&data_dir.join("agent_flows.json"), text.as_bytes())
+            .map_err(|e| e.to_string())
     }
 }
 

@@ -20,7 +20,9 @@ pub fn collect_enabled_scripts(trees: &Value) -> Vec<LoadedScript> {
     };
     let mut out = Vec::new();
     for node in arr {
-        let Some(obj) = node.as_object() else { continue };
+        let Some(obj) = node.as_object() else {
+            continue;
+        };
         match obj.get("type").and_then(|t| t.as_str()) {
             Some("script") => {
                 if let Some(s) = script_from_obj(obj) {
@@ -57,10 +59,21 @@ fn script_from_obj(obj: &serde_json::Map<String, Value>) -> Option<LoadedScript>
         return None;
     }
     Some(LoadedScript {
-        id: obj.get("id").and_then(|i| i.as_str()).unwrap_or("").to_string(),
-        name: obj.get("name").and_then(|n| n.as_str()).unwrap_or("").to_string(),
+        id: obj
+            .get("id")
+            .and_then(|i| i.as_str())
+            .unwrap_or("")
+            .to_string(),
+        name: obj
+            .get("name")
+            .and_then(|n| n.as_str())
+            .unwrap_or("")
+            .to_string(),
         content: content.to_string(),
-        data: obj.get("data").cloned().unwrap_or(Value::Object(Default::default())),
+        data: obj
+            .get("data")
+            .cloned()
+            .unwrap_or(Value::Object(Default::default())),
     })
 }
 

@@ -80,12 +80,6 @@ pub struct ValidationOutcome {
     pub rejected: Vec<RejectedOp>,
 }
 
-impl ValidationOutcome {
-    pub fn rejected_count(&self) -> usize {
-        self.rejected.len()
-    }
-}
-
 /// 置信度门控(§4.2/§7-F4)。
 ///
 /// 语义:guardrails.minConfidence 是「最低可写置信度」——Low 最宽松(默认,开箱即用),
@@ -130,7 +124,10 @@ pub fn validate_ops(
     let mut grouped: std::collections::BTreeMap<&str, Vec<PatchOp>> =
         std::collections::BTreeMap::new();
     for op in &accepted {
-        grouped.entry(op.path.as_str()).or_default().push(op.clone());
+        grouped
+            .entry(op.path.as_str())
+            .or_default()
+            .push(op.clone());
     }
     let mut merged: Vec<PatchOp> = Vec::new();
     for (path, group) in grouped {
@@ -226,7 +223,8 @@ pub fn check_invariants(contract: &super::Contract, stat_data: &Value) -> Vec<St
                 }
             }
             // range/require_if 留待谓词引擎(§17.8),P1 不判定
-            super::invariant::InvariantKind::Range | super::invariant::InvariantKind::RequireIf => {}
+            super::invariant::InvariantKind::Range | super::invariant::InvariantKind::RequireIf => {
+            }
         }
     }
     violations
@@ -252,13 +250,14 @@ pub fn apply_ops(tree: &mut Value, ops: &[PatchOp]) -> Result<(), String> {
 pub fn from_assistant_patch(p: &crate::parsing::assistant::PatchOp) -> PatchOp {
     // 契约 updateRules 键与所有权校验用点分路径;解析层协议(JSON Patch 工具调用/
     // <JSONPatch> 文本)允许斜杠路径,在此统一归一化,避免 /a/b 全部落 unknown_field。
-    let norm = |path: &str| {
-        crate::parsing::assistant::split_path(path)
-            .join(".")
-    };
+    let norm = |path: &str| crate::parsing::assistant::split_path(path).join(".");
     use crate::parsing::assistant::PatchOp as AP;
     match p {
-        AP::Replace { path, value, reason } => PatchOp {
+        AP::Replace {
+            path,
+            value,
+            reason,
+        } => PatchOp {
             op: OpKind::Replace,
             path: norm(path),
             from: None,
@@ -266,7 +265,11 @@ pub fn from_assistant_patch(p: &crate::parsing::assistant::PatchOp) -> PatchOp {
             confidence: None,
             rationale: reason.clone(),
         },
-        AP::Delta { path, value, reason } => PatchOp {
+        AP::Delta {
+            path,
+            value,
+            reason,
+        } => PatchOp {
             op: OpKind::Delta,
             path: norm(path),
             from: None,
@@ -295,11 +298,9 @@ pub fn from_assistant_patch(p: &crate::parsing::assistant::PatchOp) -> PatchOp {
 
 /// 契约层 op → 解析层 op(apply_mvu_patches 等既有应用路径只收解析层)。
 pub fn to_assistant_patch(op: &PatchOp) -> crate::parsing::assistant::PatchOp {
-    convert_to_assistant_patch(op).unwrap_or_else(|e| {
-        crate::parsing::assistant::PatchOp::Remove {
-            path: op.path.clone(),
-            reason: Some(format!("转换失败({e})")),
-        }
+    convert_to_assistant_patch(op).unwrap_or_else(|e| crate::parsing::assistant::PatchOp::Remove {
+        path: op.path.clone(),
+        reason: Some(format!("转换失败({e})")),
     })
 }
 
@@ -478,7 +479,10 @@ mod tests {
         assert_eq!(gate_confidence(&c, &op), GateDecision::Apply);
 
         // 未声明置信度 → 视为 High
-        let no_conf = PatchOp { confidence: None, ..op.clone() };
+        let no_conf = PatchOp {
+            confidence: None,
+            ..op.clone()
+        };
         assert_eq!(gate_confidence(&c, &no_conf), GateDecision::Apply);
     }
 
@@ -640,16 +644,31 @@ mod tests {
         let mut c = contract_with(vec![num_field("a")]);
         c.guardrails.min_confidence = Confidence::High;
         let patches = vec![
-            AP::Replace { path: "a".into(), value: json!(1), reason: Some("第一次".into()) },
-            AP::Replace { path: "a".into(), value: json!(2), reason: None },
+            AP::Replace {
+                path: "a".into(),
+                value: json!(1),
+                reason: Some("第一次".into()),
+            },
+            AP::Replace {
+                path: "a".into(),
+                value: json!(2),
+                reason: None,
+            },
             // 未声明字段 → rejected
-            AP::Replace { path: "未声明".into(), value: json!(3), reason: None },
+            AP::Replace {
+                path: "未声明".into(),
+                value: json!(3),
+                reason: None,
+            },
         ];
         let gated = gate_assistant_patches_detailed(Some(&c), &patches, "agent");
         // 未声明置信度视为 High → 通过;同 path 两条按 last_write 合并为一条
         assert_eq!(gated.applied.len(), 1, "同 path 合并后应只剩一条");
         assert_eq!(gated.rejected.len(), 1);
-        assert_eq!(gated.rejected[0].op.path, "未声明", "rejected 保留契约层 op 原样");
+        assert_eq!(
+            gated.rejected[0].op.path, "未声明",
+            "rejected 保留契约层 op 原样"
+        );
         assert_eq!(gated.pending.len(), 0);
 
         // 无契约 → applied 原样放行(不合并),两列表空
@@ -667,13 +686,20 @@ mod tests {
         let mut c = contract_with(vec![num_field("a"), num_field("b")]);
         c.guardrails.min_confidence = Confidence::Medium;
         let patches = vec![
-            AP::Replace { path: "a".into(), value: json!(1), reason: None },
-            AP::Replace { path: "b".into(), value: json!(2), reason: None },
+            AP::Replace {
+                path: "a".into(),
+                value: json!(1),
+                reason: None,
+            },
+            AP::Replace {
+                path: "b".into(),
+                value: json!(2),
+                reason: None,
+            },
         ];
         let mut overrides = BTreeMap::new();
         overrides.insert("a".to_string(), Confidence::Low);
-        let gated =
-            gate_assistant_patches_overrides(Some(&c), &patches, &overrides, "agent");
+        let gated = gate_assistant_patches_overrides(Some(&c), &patches, &overrides, "agent");
         assert_eq!(gated.applied.len(), 1, "未覆盖的 b 正常通过");
         assert_eq!(gated.applied_ops[0].path, "b");
         assert_eq!(gated.pending.len(), 1, "覆盖 low 的 a 进 pending");
@@ -699,13 +725,20 @@ mod tests {
         let mut c = contract_with(vec![field]);
         c.guardrails.min_confidence = Confidence::Medium;
         let patches = vec![
-            AP::Delta { path: "a".into(), value: 1.0, reason: None },
-            AP::Delta { path: "a".into(), value: 2.0, reason: None },
+            AP::Delta {
+                path: "a".into(),
+                value: 1.0,
+                reason: None,
+            },
+            AP::Delta {
+                path: "a".into(),
+                value: 2.0,
+                reason: None,
+            },
         ];
         let mut overrides = BTreeMap::new();
         overrides.insert("a".to_string(), Confidence::Low);
-        let gated =
-            gate_assistant_patches_overrides(Some(&c), &patches, &overrides, "agent");
+        let gated = gate_assistant_patches_overrides(Some(&c), &patches, &overrides, "agent");
         assert!(
             gated.applied.is_empty(),
             "两条 low delta 合并后不得直接 Apply: {:?}",

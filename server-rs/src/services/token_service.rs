@@ -57,17 +57,17 @@ impl TokenService {
         if let Some(bpe) = self.cache.get(name) {
             return Some(bpe.clone());
         }
-        // 用该编码对应的代表性模型加载
-        let model_for_enc = match name {
-            "o200k_base" => "gpt-4o",
-            "p50k_base" => "text-davinci-003",
-            _ => "gpt-4",
-        };
+        // 用编码对应的直接构造器加载(tiktoken-rs 0.12:get_bpe_from_model 已废弃,
+        // 替代 API bpe_for_model 走 &'static 单例、下载失败会 panic,不符合降级语义,故不用)。
         // BPE 词表首次加载需联网(tiktoken-rs 下载);失败不 panic,降级为估算计数。
         // 失败结果不缓存(None 直接返回),下次调用仍会重试,避免永久降级。
-        let bpe = tiktoken_rs::get_bpe_from_model(model_for_enc)
-            .or_else(|_| tiktoken_rs::cl100k_base())
-            .ok()?;
+        let bpe = match name {
+            "o200k_base" => tiktoken_rs::o200k_base(),
+            "p50k_base" => tiktoken_rs::p50k_base(),
+            _ => tiktoken_rs::cl100k_base(),
+        }
+        .or_else(|_| tiktoken_rs::cl100k_base())
+        .ok()?;
         let bpe = std::sync::Arc::new(bpe);
         self.cache.insert(name.to_string(), bpe.clone());
         Some(bpe)

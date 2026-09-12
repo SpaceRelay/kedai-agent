@@ -11,10 +11,25 @@ use serde_json::Value;
 /// Insert 已并入 Replace(前端 replace/set/insert 统一映射为 set,两者语义相同)。
 #[derive(Debug, Clone, PartialEq)]
 pub enum PatchOp {
-    Replace { path: String, value: Value, reason: Option<String> },
-    Delta { path: String, value: f64, reason: Option<String> },
-    Remove { path: String, reason: Option<String> },
-    Move { from: String, to: String, reason: Option<String> },
+    Replace {
+        path: String,
+        value: Value,
+        reason: Option<String>,
+    },
+    Delta {
+        path: String,
+        value: f64,
+        reason: Option<String>,
+    },
+    Remove {
+        path: String,
+        reason: Option<String>,
+    },
+    Move {
+        from: String,
+        to: String,
+        reason: Option<String>,
+    },
 }
 
 impl PatchOp {
@@ -38,8 +53,9 @@ impl PatchOp {
 ///   2. MagVarUpdate 格式:_.set('path', old, new);//原因
 pub fn parse_update_variable(text: &str) -> (String, Vec<PatchOp>) {
     let mut ops = Vec::new();
-    let re =
-        regex::Regex::new(r"(?is)<UpdateVariable\b[^>]*>([\s\S]*?)</UpdateVariable\s*>").unwrap();
+    // 正则为写死字面量,编译必然成功
+    let re = regex::Regex::new(r"(?is)<UpdateVariable\b[^>]*>([\s\S]*?)</UpdateVariable\s*>")
+        .expect("UpdateVariable 块正则为常量,编译必然成功");
     for cap in re.captures_iter(text) {
         let block = &cap[1];
         if let Some(p) = extract_json_patch(block) {
@@ -54,7 +70,9 @@ pub fn parse_update_variable(text: &str) -> (String, Vec<PatchOp>) {
 
 /// 提取块内 <JSONPatch> 数组并解析为操作;无该标签或解析失败返回 None
 fn extract_json_patch(block: &str) -> Option<Vec<PatchOp>> {
-    let re = regex::Regex::new(r"(?is)<JSONPatch\b[^>]*>([\s\S]*?)</JSONPatch\s*>").unwrap();
+    // 正则为写死字面量,编译必然成功
+    let re = regex::Regex::new(r"(?is)<JSONPatch\b[^>]*>([\s\S]*?)</JSONPatch\s*>")
+        .expect("JSONPatch 块正则为常量,编译必然成功");
     let body = re.captures(block)?.get(1)?.as_str().to_string();
     let v: Value = serde_json::from_str(&body).ok()?;
     parse_patch_array(&v)
@@ -129,7 +147,8 @@ pub fn parse_patch_array(v: &Value) -> Option<Vec<PatchOp>> {
 /// 被 initvar 模块([InitVar] 初始变量)复用,故为 pub(super)
 pub(super) fn parse_set_statements(block: &str) -> Vec<PatchOp> {
     let mut ops = Vec::new();
-    let re = regex::Regex::new(r"[_.]\s*set\s*\(").unwrap();
+    // 正则为写死字面量,编译必然成功
+    let re = regex::Regex::new(r"[_.]\s*set\s*\(").expect("set 语句正则为常量,编译必然成功");
     let mut i = 0usize;
     while let Some(m) = re.find(&block[i..]) {
         let open_idx = i + m.end() - 1; // '(' 位置
@@ -182,7 +201,11 @@ fn parse_set_body(body: &str) -> Option<(String, Value, Option<String>)> {
     let mut code = body.to_string();
     let reason = if let Some(idx) = find_line_comment(&code) {
         // 先取注释内容为 owned 字符串,再截断代码(避免借用冲突)
-        let comment = code[idx + 2..].trim().trim_end_matches(';').trim().to_string();
+        let comment = code[idx + 2..]
+            .trim()
+            .trim_end_matches(';')
+            .trim()
+            .to_string();
         code.truncate(idx);
         if comment.is_empty() {
             None
@@ -381,7 +404,11 @@ mod tests {
     /// 关键:模型输出 'a\nb' 应还原为真实换行(此前只 strip_quotes 存字面两字符)。
     #[test]
     fn unescape_string_escapes() {
-        assert_eq!(parse_js_value(r"'a\nb'"), json!("a\nb"), "\\n 应还原为真实换行");
+        assert_eq!(
+            parse_js_value(r"'a\nb'"),
+            json!("a\nb"),
+            "\\n 应还原为真实换行"
+        );
         assert_eq!(parse_js_value(r"'a\rb'"), json!("a\rb"));
         assert_eq!(parse_js_value(r"'a\tb'"), json!("a\tb"));
         assert_eq!(parse_js_value(r"'a\\b'"), json!(r"a\b"));
@@ -438,7 +465,10 @@ mod tests {
     fn block_reason_extraction() {
         assert_eq!(find_block_reason("/* 原因 */"), Some("原因".to_string()));
         assert_eq!(find_block_reason("a /* b */ c"), Some("b".to_string()));
-        assert_eq!(find_block_reason("/* 多行\n注释 */"), Some("多行\n注释".to_string()));
+        assert_eq!(
+            find_block_reason("/* 多行\n注释 */"),
+            Some("多行\n注释".to_string())
+        );
         assert_eq!(find_block_reason("没有块注释"), None);
         assert_eq!(find_block_reason("/* */"), None, "空块注释无 reason");
     }
@@ -453,14 +483,31 @@ mod tests {
         ]);
         let ops = parse_patch_array(&arr).expect("应解析");
         assert_eq!(ops.len(), 1, "非数字 delta 应被跳过");
-        assert_eq!(ops[0], PatchOp::Replace { path: "/x".into(), value: json!(1), reason: None });
+        assert_eq!(
+            ops[0],
+            PatchOp::Replace {
+                path: "/x".into(),
+                value: json!(1),
+                reason: None
+            }
+        );
         // 缺 value → 跳过
         let arr2 = json!([{ "op": "delta", "path": "/好感度" }]);
-        assert!(parse_patch_array(&arr2).is_none(), "delta 缺 value 整批视为无效");
+        assert!(
+            parse_patch_array(&arr2).is_none(),
+            "delta 缺 value 整批视为无效"
+        );
         // 数字 delta 正常
         let arr3 = json!([{ "op": "delta", "path": "/好感度", "value": 2 }]);
         let ops3 = parse_patch_array(&arr3).expect("应解析");
-        assert_eq!(ops3[0], PatchOp::Delta { path: "/好感度".into(), value: 2.0, reason: None });
+        assert_eq!(
+            ops3[0],
+            PatchOp::Delta {
+                path: "/好感度".into(),
+                value: 2.0,
+                reason: None
+            }
+        );
     }
 
     /// 任务4:insert op 并入 Replace(reason 恒 None)。
@@ -484,7 +531,11 @@ mod tests {
         let ops = parse_set_statements("_.set('x', old, 'a\\nb');//原因");
         assert_eq!(ops.len(), 1);
         match &ops[0] {
-            PatchOp::Replace { path, value, reason } => {
+            PatchOp::Replace {
+                path,
+                value,
+                reason,
+            } => {
                 assert_eq!(path, "x");
                 assert_eq!(value, &json!("a\nb"), "语句值内 \\n 应还原为真实换行");
                 assert_eq!(reason, &Some("原因".into()));

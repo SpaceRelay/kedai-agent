@@ -186,9 +186,10 @@ fn normalize_keys(map: &Map<String, Value>) -> (Vec<String>, bool) {
         }
     };
     // 判定是否发生归一:字段名不是 keys、字符串形态、数组含非字符串/空串
+    // matches! 守卫内:!x.is_string() 为真时短路,as_str() 仅在确认为字符串时调用,必然为 Some
     let normalized = used_field != Some("keys")
         || matches!(raw, Value::String(_))
-        || matches!(raw, Value::Array(arr) if arr.iter().any(|x| !x.is_string() || x.as_str().unwrap().trim().is_empty()));
+        || matches!(raw, Value::Array(arr) if arr.iter().any(|x| !x.is_string() || x.as_str().expect("已判定为字符串,as_str 必然为 Some").trim().is_empty()));
     (keys, normalized)
 }
 

@@ -173,7 +173,8 @@ pub(crate) fn render_template_with_ctx(
             i = k;
             continue;
         }
-        let ch = escaped[i..].chars().next().unwrap();
+        // 外层循环条件 i < bytes.len() 保证必有下一字符
+        let ch = escaped[i..].chars().next().expect("i 在界内,必有下一字符");
         text.push(ch);
         i += ch.len_utf8();
     }
@@ -251,7 +252,8 @@ fn escape_ejs_blocks(template: &str) -> (String, Vec<String>) {
                 continue;
             }
         }
-        let ch = template[i..].chars().next().unwrap();
+        // 外层循环条件 i < bytes.len() 保证必有下一字符
+        let ch = template[i..].chars().next().expect("i 在界内,必有下一字符");
         out.push(ch);
         i += ch.len_utf8();
     }
@@ -281,7 +283,7 @@ fn starts_with_ci_ascii(s: &str, at: usize, needle: &str) -> bool {
     rest.as_bytes()[..needle.len()]
         .iter()
         .zip(needle.bytes())
-        .all(|(a, b)| a.to_ascii_lowercase() == b.to_ascii_lowercase())
+        .all(|(a, b)| a.eq_ignore_ascii_case(&b))
 }
 
 /// 渲染后还原 escape 块占位符:OPEN 占位 → `<%`,CLOSE 占位 → `%>`(按编码类型还原)
@@ -489,7 +491,10 @@ mod tests {
         assert_eq!(render("<%= '  abc  '.trimEnd() %>", &mut v), "  abc");
         assert_eq!(render("<%= 'ab'.repeat(3) %>", &mut v), "ababab");
         assert_eq!(
-            render("<%= [1, 2, 3].find(function (n) { return n > 1; }) %>", &mut v),
+            render(
+                "<%= [1, 2, 3].find(function (n) { return n > 1; }) %>",
+                &mut v
+            ),
             "2"
         );
     }
@@ -511,7 +516,8 @@ mod tests {
         let tpl = "<% var data = getvar('数据'); %> <%= data.是否在场 ? '在场' : '缺席' %>";
         assert_eq!(render(tpl, &mut v), " 在场");
         // 中文属性链继续访问
-        let tpl2 = "<% var cg = { 角色: { 漂泊者: { 形态: ['A'] } } }; %><%= cg.角色.漂泊者.形态[0] %>";
+        let tpl2 =
+            "<% var cg = { 角色: { 漂泊者: { 形态: ['A'] } } }; %><%= cg.角色.漂泊者.形态[0] %>";
         assert_eq!(render(tpl2, &mut v), "A");
     }
 
@@ -569,18 +575,28 @@ mod tests {
     fn inject_prompt_is_silent_placeholder() {
         let mut v = AssistantVars::new();
         // injectPrompt 各种参数形态都不报错
-        let tpl = "<% injectPrompt('key', '提示内容'); injectPrompt('k2', 'p2', 10, true, 'uid'); %>OK";
+        let tpl =
+            "<% injectPrompt('key', '提示内容'); injectPrompt('k2', 'p2', 10, true, 'uid'); %>OK";
         assert_eq!(render(tpl, &mut v), "OK");
         // 返回值空字符串
         assert_eq!(render("<%= injectPrompt('key', '内容') %>", &mut v), "");
         // 读取注入清单:空字符串 / false
         assert_eq!(render("<%= getPromptsInjected('key') %>", &mut v), "");
         assert_eq!(
-            render("<% if (hasPromptsInjected('key')) { %>有<% } else { %>无<% } %>", &mut v),
+            render(
+                "<% if (hasPromptsInjected('key')) { %>有<% } else { %>无<% } %>",
+                &mut v
+            ),
             "无"
         );
         // 缺参也不报错
-        assert_eq!(render("<%= getPromptsInjected() %>|<%= hasPromptsInjected() %>", &mut v), "|false");
+        assert_eq!(
+            render(
+                "<%= getPromptsInjected() %>|<%= hasPromptsInjected() %>",
+                &mut v
+            ),
+            "|false"
+        );
     }
 
     /// parseJSON:合法 JSON 返回解析值;非法 JSON 原样返回字符串(不报错)
@@ -595,10 +611,7 @@ mod tests {
         // 合法 JSON 数组 → length
         assert_eq!(render("<%= parseJSON('[1,2,3]').length %>", &mut v), "3");
         // 非法 JSON → 原样返回字符串
-        assert_eq!(
-            render("<%= parseJSON('不是 JSON') %>", &mut v),
-            "不是 JSON"
-        );
+        assert_eq!(render("<%= parseJSON('不是 JSON') %>", &mut v), "不是 JSON");
         // 数字/空串等边界也不报错
         assert_eq!(render("<%= parseJSON('') %>", &mut v), "");
         assert_eq!(render("<%= parseJSON('42') %>", &mut v), "42");
@@ -663,7 +676,13 @@ mod tests {
         let mut empty = AssistantVars::new();
         assert_eq!(render("<%= variables.不存在 %>", &mut empty), "undefined");
         // 模板自定义 variables 局部变量时以用户定义为准
-        assert_eq!(render("<% var variables = { 自定: 1 }; %><%= variables.自定 %>", &mut v), "1");
+        assert_eq!(
+            render(
+                "<% var variables = { 自定: 1 }; %><%= variables.自定 %>",
+                &mut v
+            ),
+            "1"
+        );
     }
 
     /// 变量写入/自增别名:setGlobalVar/setLocalVar/setMessageVar/incvar/decvar
@@ -693,7 +712,10 @@ mod tests {
         let tpl = "<% print(injectPrompt(), getwi(), getchar(), getpreset(), getqr(), getChatMessage(), getChatMessages(), getPromptsInjected(), hasPromptsInjected(), parseJSON(), jsonPatch(), evalTemplate()); %>DONE";
         let out = render(tpl, &mut v);
         assert!(out.starts_with("[]"), "空数组 String 化为 []: {out:?}");
-        assert!(out.contains("false"), "hasPromptsInjected() 返回 false: {out:?}");
+        assert!(
+            out.contains("false"),
+            "hasPromptsInjected() 返回 false: {out:?}"
+        );
         assert!(out.ends_with("DONE"), "print 不 panic: {out:?}");
     }
 

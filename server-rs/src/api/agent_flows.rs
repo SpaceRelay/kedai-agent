@@ -23,7 +23,12 @@ fn flow_payload(lib: &AgentFlowLibrary) -> serde_json::Value {
 }
 
 pub async fn get_agent_flows(State(state): State<Arc<AppState>>) -> Response {
-    let lib = state.flow.lock().unwrap_or_else(|e| e.into_inner()).get_library().clone();
+    let lib = state
+        .flow
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_library()
+        .clone();
     Json(flow_payload(&lib)).into_response()
 }
 
@@ -38,17 +43,23 @@ pub async fn update_agent_flows(
     State(state): State<Arc<AppState>>,
     Json(body): Json<UpdateFlowBody>,
 ) -> Response {
-    // 显式 let 绑定 guard:match 内联临时 guard 会存活到 match 结束,
-    // 分支内再次 lock() 会触发 std Mutex 重入死锁
-    let set_result = state.flow.lock().unwrap_or_else(|e| e.into_inner()).set(body.config);
-    match set_result {
-        Ok(()) => {
-            let lib = state.flow.lock().unwrap_or_else(|e| e.into_inner()).get_library().clone();
-            Json(flow_payload(&lib)).into_response()
-        }
-        Err(e) => Json(json!({ "error": e }))
+    // B-1:set 内含同步 JSON 落盘,整体(持锁 + 校验 + 写文件)挪阻塞线程池;
+    // 显式持锁在闭包内一次完成(set 后直接读库),避免 std Mutex 重入死锁
+    let flow = state.flow.clone();
+    let result = state
+        .db_call(move || {
+            let mut svc = flow.lock().unwrap_or_else(|e| e.into_inner());
+            svc.set(body.config).map(|()| svc.get_library().clone())
+        })
+        .await;
+    match result {
+        Ok(Ok(lib)) => Json(flow_payload(&lib)).into_response(),
+        Ok(Err(e)) => Json(json!({ "error": e }))
             .into_response()
             .with_status(StatusCode::BAD_REQUEST),
+        Err(e) => Json(json!({ "error": e }))
+            .into_response()
+            .with_status(StatusCode::INTERNAL_SERVER_ERROR),
     }
 }
 
@@ -62,15 +73,22 @@ pub async fn select_agent_flow(
     State(state): State<Arc<AppState>>,
     Json(body): Json<SelectFlowBody>,
 ) -> Response {
-    let select_result = state.flow.lock().unwrap_or_else(|e| e.into_inner()).select(&body.id);
-    match select_result {
-        Ok(()) => {
-            let lib = state.flow.lock().unwrap_or_else(|e| e.into_inner()).get_library().clone();
-            Json(flow_payload(&lib)).into_response()
-        }
-        Err(e) => Json(json!({ "error": e }))
+    // B-1:select 内含同步落盘,持锁 + 写文件整体挪阻塞线程池
+    let flow = state.flow.clone();
+    let result = state
+        .db_call(move || {
+            let mut svc = flow.lock().unwrap_or_else(|e| e.into_inner());
+            svc.select(&body.id).map(|()| svc.get_library().clone())
+        })
+        .await;
+    match result {
+        Ok(Ok(lib)) => Json(flow_payload(&lib)).into_response(),
+        Ok(Err(e)) => Json(json!({ "error": e }))
             .into_response()
             .with_status(StatusCode::BAD_REQUEST),
+        Err(e) => Json(json!({ "error": e }))
+            .into_response()
+            .with_status(StatusCode::INTERNAL_SERVER_ERROR),
     }
 }
 
@@ -79,14 +97,21 @@ pub async fn delete_agent_flow(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Response {
-    let remove_result = state.flow.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
-    match remove_result {
-        Ok(()) => {
-            let lib = state.flow.lock().unwrap_or_else(|e| e.into_inner()).get_library().clone();
-            Json(flow_payload(&lib)).into_response()
-        }
-        Err(e) => Json(json!({ "error": e }))
+    // B-1:remove 内含同步落盘,持锁 + 写文件整体挪阻塞线程池
+    let flow = state.flow.clone();
+    let result = state
+        .db_call(move || {
+            let mut svc = flow.lock().unwrap_or_else(|e| e.into_inner());
+            svc.remove(&id).map(|()| svc.get_library().clone())
+        })
+        .await;
+    match result {
+        Ok(Ok(lib)) => Json(flow_payload(&lib)).into_response(),
+        Ok(Err(e)) => Json(json!({ "error": e }))
             .into_response()
             .with_status(StatusCode::BAD_REQUEST),
+        Err(e) => Json(json!({ "error": e }))
+            .into_response()
+            .with_status(StatusCode::INTERNAL_SERVER_ERROR),
     }
 }

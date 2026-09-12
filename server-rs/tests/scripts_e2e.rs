@@ -129,7 +129,8 @@ async fn character_backend_script_runs_and_persists_scope() {
     assert_eq!(status, StatusCode::OK);
     let data = &got["data"];
     assert_eq!(
-        data["rounds"], json!(2),
+        data["rounds"],
+        json!(2),
         "两轮 chat 后脚本应已执行两次,实际 {got}"
     );
     assert_eq!(data["last"], json!("执行于消息生成后"));

@@ -95,7 +95,9 @@ mod tests {
         let v = serde_json::to_value(&m).unwrap();
         assert_eq!(v["lastTurnId"], 0);
         assert_eq!(v["runId"], 0);
-        assert!(v.get("pending").is_some_and(|p| p.as_array().is_some_and(|a| a.is_empty())));
+        assert!(v
+            .get("pending")
+            .is_some_and(|p| p.as_array().is_some_and(|a| a.is_empty())));
     }
 
     /// 反序列化缺字段用默认填充(向后兼容)。
@@ -136,7 +138,11 @@ mod tests {
         let out = merge_pending(&existing, &incoming, &["好感度"], 5);
         let paths: Vec<&str> = out.iter().map(|p| p.op.path.as_str()).collect();
         assert!(!paths.contains(&"好感度"), "已应用的 path 消费: {paths:?}");
-        assert_eq!(out.iter().filter(|p| p.op.path == "情绪").count(), 1, "去重");
+        assert_eq!(
+            out.iter().filter(|p| p.op.path == "情绪").count(),
+            1,
+            "去重"
+        );
         assert!(paths.contains(&"体力"), "新 op 入队: {paths:?}");
         assert!(out.iter().all(|p| p.created_at_turn > 0));
     }

@@ -21,6 +21,14 @@ pub struct RegexScript {
     pub markdown_only: bool,
     /// 是否启用
     pub enabled: bool,
+    /// 酒馆楼层深度下限:仅对深度 >= min_depth 的消息生效(深度 0 = 最新一条)。
+    /// 「删除远楼层开场标记」类脚本靠它避免误删当前开场(wuwa 卡主开场空白根因:
+    /// 归一化丢弃该字段后,渲染层对所有楼层无差别删除占位符)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_depth: Option<u32>,
+    /// 酒馆楼层深度上限:仅对深度 <= max_depth 的消息生效
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_depth: Option<u32>,
 }
 
 /// 从角色卡 data_raw 提取正则脚本(extensions.regex_scripts 或顶层 regex_scripts)
@@ -52,43 +60,53 @@ pub fn extract_regex_scripts(data_raw: &Value) -> Vec<RegexScript> {
     Vec::new()
 }
 
+/// 多键名兼容取字符串:酒馆生态脚本键名有 camelCase(findRegex)与
+/// snake_case(find_regex)两种写法,只认一种会导致脚本被静默丢弃(界面无 HTML 可渲染)
+fn get_str<'a>(v: &'a Value, keys: &[&str]) -> Option<&'a str> {
+    keys.iter().find_map(|k| v.get(*k).and_then(|x| x.as_str()))
+}
+
+fn get_bool(v: &Value, keys: &[&str]) -> Option<bool> {
+    keys.iter()
+        .find_map(|k| v.get(*k).and_then(|x| x.as_bool()))
+}
+
+fn get_u32(v: &Value, keys: &[&str]) -> Option<u32> {
+    keys.iter()
+        .find_map(|k| v.get(*k).and_then(|x| x.as_u64()))
+        .and_then(|n| u32::try_from(n).ok())
+}
+
 fn normalize_script(v: &Value) -> Option<RegexScript> {
-    let find_regex = v
-        .get("findRegex")
-        .and_then(|f| f.as_str())
+    let find_regex = get_str(v, &["findRegex", "find_regex"])
         .unwrap_or("")
         .trim()
         .to_string();
     if find_regex.is_empty() {
+        // 有替换体但取不到查找模式 = 键名变体不识别,记录下来而不是静默丢弃
+        if get_str(v, &["replaceString", "replace_string"]).is_some() {
+            let keys: Vec<&str> = v
+                .as_object()
+                .map(|o| o.keys().map(|k| k.as_str()).collect())
+                .unwrap_or_default();
+            eprintln!("[regex_scripts] 丢弃脚本:取不到 findRegex/find_regex(实际键:{keys:?})");
+        }
         return None;
     }
-    let enabled = v
-        .get("disabled")
-        .and_then(|d| d.as_bool())
-        .map(|d| !d)
-        .unwrap_or(true);
+    let enabled = get_bool(v, &["disabled"]).map(|d| !d).unwrap_or(true);
     Some(RegexScript {
-        id: v
-            .get("id")
-            .and_then(|i| i.as_str())
-            .unwrap_or("")
-            .to_string(),
-        script_name: v
-            .get("scriptName")
-            .and_then(|s| s.as_str())
+        id: get_str(v, &["id"]).unwrap_or("").to_string(),
+        script_name: get_str(v, &["scriptName", "script_name"])
             .unwrap_or("")
             .to_string(),
         find_regex,
-        replace_string: v
-            .get("replaceString")
-            .and_then(|s| s.as_str())
+        replace_string: get_str(v, &["replaceString", "replace_string"])
             .unwrap_or("")
             .to_string(),
-        markdown_only: v
-            .get("markdownOnly")
-            .and_then(|m| m.as_bool())
-            .unwrap_or(false),
+        markdown_only: get_bool(v, &["markdownOnly", "markdown_only"]).unwrap_or(false),
         enabled,
+        min_depth: get_u32(v, &["minDepth", "min_depth"]),
+        max_depth: get_u32(v, &["maxDepth", "max_depth"]),
     })
 }
 
@@ -197,6 +215,8 @@ mod tests {
             replace_string: repl.into(),
             markdown_only,
             enabled,
+            min_depth: None,
+            max_depth: None,
         }
     }
 
@@ -216,6 +236,25 @@ mod tests {
         assert_eq!(scripts[0].script_name, "状态栏");
         assert!(scripts[0].markdown_only);
         assert!(scripts[0].enabled);
+    }
+
+    /// 楼层深度限制保留:wuwa 卡「删除远楼层开场标记」minDepth=2(只对远楼层生效),
+    /// 归一化丢弃它会使渲染层误删当前开场的占位符,主开场界面永远空白
+    #[test]
+    fn preserves_floor_depth_limits() {
+        let raw = json!({
+            "extensions": {
+                "regex_scripts": [
+                    { "id": "1", "scriptName": "删除远楼层开场标记", "findRegex": "\\[角色创建与故事开场\\]", "replaceString": "", "markdownOnly": true, "disabled": false, "minDepth": 2, "maxDepth": null },
+                    { "id": "2", "scriptName": "蛇形键", "find_regex": "/A/g", "replace_string": "B", "markdown_only": true, "enabled": true, "min_depth": 3 }
+                ]
+            }
+        });
+        let scripts = extract_regex_scripts(&raw);
+        assert_eq!(scripts.len(), 2);
+        assert_eq!(scripts[0].min_depth, Some(2));
+        assert_eq!(scripts[0].max_depth, None);
+        assert_eq!(scripts[1].min_depth, Some(3));
     }
 
     /// V3 data.extensions 布局
@@ -276,5 +315,40 @@ mod tests {
         let bad_re = script("([", "B", true, true);
         let out = apply_regex_scripts("A", &[disabled, empty_repl, bad_re]);
         assert_eq!(out, "A");
+    }
+
+    /// snake_case 键名兼容(部分导出器写 find_regex/replace_string/script_name/markdown_only,
+    /// 只认 camelCase 会把整批脚本静默丢弃 → 角色卡界面只有文字没有 HTML)
+    #[test]
+    fn extracts_snake_case_keys() {
+        let raw = json!({
+            "extensions": {
+                "regex_scripts": [
+                    { "id": "1", "script_name": "状态栏", "find_regex": "/<StatusPlaceHolderImpl\\/>/g", "replace_string": "<div>状态</div>", "markdown_only": true, "disabled": false }
+                ]
+            }
+        });
+        let scripts = extract_regex_scripts(&raw);
+        assert_eq!(scripts.len(), 1);
+        assert_eq!(scripts[0].script_name, "状态栏");
+        assert_eq!(scripts[0].replace_string, "<div>状态</div>");
+        assert!(scripts[0].markdown_only);
+        assert!(scripts[0].enabled);
+    }
+
+    /// 混合键名:camelCase 优先,缺项回退 snake_case
+    #[test]
+    fn mixed_key_styles_fallback() {
+        let raw = json!({
+            "extensions": {
+                "regex_scripts": [
+                    { "findRegex": "/A/g", "replace_string": "B" }
+                ]
+            }
+        });
+        let scripts = extract_regex_scripts(&raw);
+        assert_eq!(scripts.len(), 1);
+        assert_eq!(scripts[0].find_regex, "/A/g");
+        assert_eq!(scripts[0].replace_string, "B");
     }
 }

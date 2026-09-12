@@ -1,6 +1,7 @@
 // 快速回复(Quick Replies)服务:SQLite 表 quick_replies 的 CRUD。
 // 条目可被世界书 EJS 模板经 getqr/getQuickReply(name[, label]) 读取并嵌套渲染
 // (ST-Prompt-Template / 酒馆助手生态兼容);管理 UI 在后续阶段提供。
+use super::log_query_failure;
 use crate::models::db::{now_iso, Db};
 use crate::parsing::assistant::QuickReplyCtx;
 use rusqlite::{params, OptionalExtension};
@@ -85,17 +86,23 @@ impl QuickReplyService {
 
     /// 列表(启用优先,按 name/position/sort_order 排序)
     pub fn list(&self, only_enabled: bool) -> Vec<QuickReplyRecord> {
-        let conn = self.db.conn();
+        let conn = self.db.read().expect("获取只读连接失败");
         let sql = if only_enabled {
             format!("SELECT {SELECT_COLS} FROM quick_replies WHERE enabled = 1 ORDER BY name, position, sort_order, id")
         } else {
-            format!("SELECT {SELECT_COLS} FROM quick_replies ORDER BY name, position, sort_order, id")
+            format!(
+                "SELECT {SELECT_COLS} FROM quick_replies ORDER BY name, position, sort_order, id"
+            )
         };
-        let mut stmt = conn.prepare(&sql).unwrap();
-        stmt.query_map([], |row| row_to_record(row))
-            .unwrap()
-            .filter_map(|r| r.ok())
-            .collect()
+        let mut stmt = match conn.prepare(&sql) {
+            Ok(s) => s,
+            Err(e) => return log_query_failure("快速回复列表 prepare", e),
+        };
+        let query = stmt.query_map([], row_to_record);
+        match query {
+            Ok(rows) => rows.filter_map(|r| r.ok()).collect(),
+            Err(e) => log_query_failure("快速回复列表 query_map", e),
+        }
     }
 
     /// 引擎加载:启用条目 → 渲染上下文可读的 QuickReplyCtx 列表
@@ -112,11 +119,12 @@ impl QuickReplyService {
 
     pub fn get(&self, id: i64) -> Option<QuickReplyRecord> {
         self.db
-            .conn()
+            .read()
+            .ok()?
             .query_row(
                 &format!("SELECT {SELECT_COLS} FROM quick_replies WHERE id = ?1"),
                 params![id],
-                |row| row_to_record(row),
+                row_to_record,
             )
             .optional()
             .ok()
@@ -132,16 +140,13 @@ impl QuickReplyService {
         let now = now_iso();
         let id = self
             .db
-            .conn()
+            .write()
             .execute(
                 "INSERT INTO quick_replies (name, label, content, enabled, position, sort_order, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 params![r.name, r.label, r.content, r.enabled, r.position, r.sort_order, now, now],
             )
             .map_err(|e| format!("写入数据库失败: {e}"))?;
-        Ok(QuickReplyRecord {
-            id: id as i64,
-            ..r
-        })
+        Ok(QuickReplyRecord { id: id as i64, ..r })
     }
 
     /// 更新指定字段;None 表示不变
@@ -160,7 +165,7 @@ impl QuickReplyService {
         // conn 作用域收窄:UPDATE 语句执行后立即释放锁,
         // 避免末尾 self.get(id) 再次 lock 同一 Mutex 造成自死锁
         let n = {
-            let conn = self.db.conn();
+            let conn = self.db.write();
             conn.execute(
                 "UPDATE quick_replies SET name = ?1, label = ?2, content = ?3, enabled = ?4, position = ?5, sort_order = ?6, updated_at = ?7 WHERE id = ?8",
                 params![name, r.label, r.content, r.enabled, r.position, r.sort_order, now, id],
@@ -175,7 +180,7 @@ impl QuickReplyService {
 
     pub fn delete(&self, id: i64) -> bool {
         self.db
-            .conn()
+            .write()
             .execute("DELETE FROM quick_replies WHERE id = ?1", params![id])
             .map(|n| n > 0)
             .unwrap_or(false)

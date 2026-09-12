@@ -1,6 +1,6 @@
 [package]
 name = "kedai-server"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 description = "Kedai 后端:Rust + axum + SQLite + SSE + Agent 引擎"
 license = "MIT"
@@ -14,35 +14,75 @@ axum = "0.8"
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-rusqlite = { version = "0.32", features = ["bundled", "backup"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "native-tls"] }
-tiktoken-rs = "0.6"
-png = "0.17"
+rusqlite = { version = "0.40", features = ["bundled", "backup"] }
+# sqlite-vec 0.1.9:向量检索虚拟表扩展(记忆库语义召回)。
+# 走静态链接 + sqlite3_auto_extension 注册(build.rs 仅用 cc 编一个 C 文件,
+# 与既有 libsqlite3-sys/rquickjs-sys 同路径),产物仍为单 exe,无需分发 dll。
+sqlite-vec = "0.1.9"
+# reqwest 的 TLS 后端按目标平台分离(见文件末尾 target 依赖块):
+# 桌面 native-tls 保持 Windows 现有证书行为;Android 用 rustls 以消除对系统 OpenSSL 的依赖。
+# 注意:两处 features 必须保持 json/stream 一致,只改 TLS 后端。
+# tiktoken-rs 0.12:get_bpe_from_model 已废弃(改名 bpe_for_model,返回 &'static 单例且下载失败会 panic),
+# 故 token_service 改用直接构造器(cl100k_base/o200k_base/p50k_base),保持「失败返回 Err 降级估算」语义
+tiktoken-rs = "0.12"
+# 注:png 依赖已移除——角色卡 PNG tEXt 解析(parsing/character_card.rs)为手工 chunk 解析,
+# 全仓无任何 png:: API 调用(grep `png::`/`use png` 无命中),属冗余依赖;无需升级到 0.18
 tower-http = { version = "0.6", features = ["cors", "fs", "set-header"] }
-tokio-stream = { version = "0.1", features = ["sync"] }
 futures = "0.3"
 uuid = { version = "1", features = ["v4"] }
 chrono = "0.4"
 dotenvy = "0.15"
 base64 = "0.22"
 include_dir = "0.7"
-thiserror = "2"
 async-stream = "0.3"
-mime = "0.3"
 regex = "1.13"
-rquickjs = "0.12.2"
+# rquickjs 按目标平台分离声明(见文件末尾 target 依赖块):
+# Android 无预生成绑定,必须启用 bindgen(需 libclang);桌面沿用内置绑定,不引入 bindgen 依赖。
+# r2d2_sqlite 0.35 依赖 rusqlite ^0.40,两者必须同代升级
+r2d2 = "0.8.10"
+r2d2_sqlite = "0.35.0"
+# 资源页代理按 charset 解码(GBK 等中文编码的作者页面,from_utf8_lossy 会乱码)
+encoding_rs = "0.8"
+# D-4:日志迁移到 tracing 生态——热路径不再持全局锁,文件/stdout 双写走 non-blocking channel;
+# json 特性保留(结构化输出能力),实际行格式由自定义 PinoFormat 保证与旧 logger 逐字段一致
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
+tracing-appender = "0.2"
 
 # Windows DPAPI:API Key 静态加密(CryptProtectData / CryptUnprotectData)
+# 版本与传递依赖(tokio/rustix/schannel 等)对齐到 0.61,消除 Cargo.lock 中 0.59/0.61 双版本并存
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = [
+windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Security_Cryptography",
     "Win32_Storage_FileSystem",
 ] }
 
+# reqwest 按目标平台选 TLS 后端,以及 rquickjs 的绑定策略。
+# - 桌面(含 Windows):native-tls。Windows 上走 schannel,保持与既有版本一致的证书信任链
+#   (读系统证书存储),这是「移植不改桌面行为」的硬要求。
+# - Android:rustls(纯 Rust + webpki-roots)。Android 没有系统 OpenSSL 开发文件,
+#   native-tls 会因找不到 OpenSSL 而编译失败(见 docs/android-port-plan.md 硬阻塞 #1)。
+#   webpki-roots 把 Mozilla 根证书编进二进制,不依赖 Android 系统证书目录。
+#   rquickjs 无 aarch64-linux-android 预生成绑定(0.12.2 与 0.13.0 均无),
+#   必须走 bindgen;上游 build.rs 在 target==host 时复用内置绑定,
+#   故桌面构建不会真正调用 libclang,行为不变。
+[target.'cfg(not(target_os = "android"))'.dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "native-tls"] }
+rquickjs = "0.12.2"
+
+[target.'cfg(target_os = "android")'.dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+rquickjs = { version = "0.12.2", features = ["bindgen"] }
+# JNI:Android Keystore 桥接(API Key 加密存储,见 services/keystore_android.rs)。
+# 版本与 tao/tauri 传递依赖的 jni 对齐(0.21),避免同一 JNI 类型出现两份定义。
+jni = "0.21"
+
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
+# test-util:暂停时钟(start_paused/time::advance),delta 攒批时间窗单测用(批次 R4)
+tokio = { version = "1", features = ["test-util"] }
 
 [profile.release]
 lto = true
