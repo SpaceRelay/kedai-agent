@@ -1,0 +1,19 @@
+<resources xmlns:tools="http://schemas.android.com/tools">
+    <!--
+      Kedai 夜间(系统深色模式)主题。
+
+      Kedai 前端只有浅色设计体系(淡粉纸色),无深色主题。若这里继承 DayNight 走深色配色,
+      系统切到深色时状态栏/导航栏会变黑,而 Web 内容仍是浅粉,出现割裂。
+      故深色模式下仍显式指定浅色系统栏与浅色图标,保持与日间一致。
+    -->
+    <style name="Theme.kedai_desktop" parent="Theme.MaterialComponents.DayNight.NoActionBar">
+        <item name="android:statusBarColor">@color/kedai_surface</item>
+        <item name="android:navigationBarColor">@color/kedai_surface</item>
+        <item name="android:windowLightStatusBar">true</item>
+        <item name="android:windowLightNavigationBar" tools:targetApi="27">true</item>
+        <item name="android:windowBackground">@color/kedai_paper</item>
+        <item name="colorPrimary">@color/colorPrimary</item>
+        <item name="colorPrimaryDark">@color/colorPrimaryDark</item>
+        <item name="colorAccent">@color/colorAccent</item>
+    </style>
+</resources>

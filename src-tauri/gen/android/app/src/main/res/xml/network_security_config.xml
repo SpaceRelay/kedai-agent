@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Kedai Android 网络安全配置。
+
+  背景:内嵌 axum 后端监听 http://127.0.0.1:<port>/,WebView 通过该 loopback 地址加载
+  前端并为 REST/SSE 提供同源接口。Android 9(API 28)起默认禁止明文 HTTP
+  (release 构建的 usesCleartextTraffic=false),若不放行 loopback,正式包会白屏。
+
+  策略:只对 loopback 放行明文,其余所有域名仍强制 HTTPS —— 不用
+  android:usesCleartextTraffic="true" 全局开门,避免把用户到 LLM 供应商的流量
+  也置于明文风险中。
+-->
+<network-security-config>
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="false">127.0.0.1</domain>
+        <domain includeSubdomains="false">localhost</domain>
+        <domain includeSubdomains="false">::1</domain>
+    </domain-config>
+    <base-config cleartextTrafficPermitted="false" />
+</network-security-config>

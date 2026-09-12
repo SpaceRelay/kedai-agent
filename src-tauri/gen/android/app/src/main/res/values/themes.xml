@@ -1,0 +1,23 @@
+<resources xmlns:tools="http://schemas.android.com/tools">
+    <!--
+      Kedai 应用主题。
+
+      在原模板基础上补齐系统栏配色:不设置时状态栏/导航栏取 Material 默认紫色,
+      与应用的淡粉纸色体系冲突(实机截图确认)。此处:
+      - statusBarColor / navigationBarColor 用 app 表面色,视觉上与应用顶部/底部连成一体;
+      - windowLightStatusBar / windowLightNavigationBar 置 true,把系统栏图标转为深色
+        (纸色是浅底,白图标会看不清);
+      - windowBackground 用画布纸色,消除启动瞬间的白闪。
+      深色模式(values-night)另有一份同名主题,保持系统栏同样为深色底浅色图标。
+    -->
+    <style name="Theme.kedai_desktop" parent="Theme.MaterialComponents.DayNight.NoActionBar">
+        <item name="android:statusBarColor">@color/kedai_surface</item>
+        <item name="android:navigationBarColor">@color/kedai_surface</item>
+        <item name="android:windowLightStatusBar">true</item>
+        <item name="android:windowLightNavigationBar" tools:targetApi="27">true</item>
+        <item name="android:windowBackground">@color/kedai_paper</item>
+        <item name="colorPrimary">@color/colorPrimary</item>
+        <item name="colorPrimaryDark">@color/colorPrimaryDark</item>
+        <item name="colorAccent">@color/colorAccent</item>
+    </style>
+</resources>

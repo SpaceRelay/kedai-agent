@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Kedai Android 颜色资源。
+
+  原模板只含 Material 默认的 purple/teal 色板,系统状态栏/导航栏因此渲染成紫色,
+  与应用「淡粉纸色 + 印刷黑」的视觉体系冲突(实机截图确认)。此处改为与
+  web/src/style.css 的设计令牌同值,让系统栏与应用融为一体。
+-->
+<resources>
+    <!-- 应用主色板(与 web 侧 CSS 变量同值)。
+         注意:XML 注释内不得出现连续两个连字符,故此处不写 CSS 变量名。 -->
+    <color name="kedai_paper">#FBEFF1</color>   <!-- 主画布淡粉 -->
+    <color name="kedai_surface">#F4DBE2</color> <!-- 栏位表面 -->
+    <color name="kedai_ink">#141414</color>     <!-- 印刷黑 -->
+
+    <!-- Material 语义色:覆盖默认紫色系,状态栏/控件不再走 Material 默认主题 -->
+    <color name="colorPrimary">#141414</color>
+    <color name="colorPrimaryDark">#141414</color>
+    <color name="colorAccent">#E06890</color>
+    <color name="colorSurface">#FBEFF1</color>
+    <color name="colorOnSurface">#141414</color>
+
+    <!-- 保留模板原有名字(Material 组件可能按名引用),值改指 Kedai 色板 -->
+    <color name="purple_200">#F4DBE2</color>
+    <color name="purple_500">#141414</color>
+    <color name="purple_700">#141414</color>
+    <color name="teal_200">#E06890</color>
+    <color name="teal_700">#141414</color>
+    <color name="black">#FF000000</color>
+    <color name="white">#FFFFFFFF</color>
+</resources>

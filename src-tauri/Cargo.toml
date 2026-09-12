@@ -1,6 +1,6 @@
 [package]
 name = "kedai-desktop"
-version = "0.2.0"
+version = "0.2.1"
 description = "Kedai 桌面应用(Tauri 壳 + 内嵌 Rust 服务)"
 edition = "2021"
 
@@ -8,6 +8,10 @@ edition = "2021"
 name = "kedai_desktop_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
+# 两个可执行入口均为桌面专属(main.rs/portable_main.rs 带 windows_subsystem 属性)。
+# 注意:不加 required-features/feature 门控——桌面构建脚本(build.ps1)与 AGENTS.md
+# 的验证命令都以默认 feature 调 cargo,任何默认值改动都会破坏桌面流程。
+# Android 侧多编两个 bin 无副作用(不参与 APK 打包,Tauri 只取 libkedai_desktop_lib.so)。
 [[bin]]
 name = "kedai-desktop"
 path = "src/main.rs"
@@ -27,11 +31,21 @@ tauri-plugin-fs = "2"
 tokio = { version = "1", features = ["time", "rt", "macros", "sync"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-reqwest = { version = "0.12", default-features = false, features = ["native-tls"] }
+# reqwest 仅用于启动期健康检查(health_ok);TLS 后端按目标平台分离,见文件末尾。
 url = "2"
-rusqlite = { version = "0.32", features = ["bundled", "backup"] }
+# 必须与 kedai-server 的 rusqlite 同代:bundled 会链接 libsqlite3-sys,版本不一致会触发 links="sqlite3" 冲突
+rusqlite = { version = "0.40", features = ["bundled", "backup"] }
 # 复用既有 axum 后端:以库形式内嵌,同一进程内启动服务
 kedai-server = { path = "../server-rs" }
+# D-4:日志宏(kedai-server 已迁 tracing;Tauri 2 自身也传递依赖,无新增体量)
+tracing = "0.1"
+
+# reqwest 按目标平台选 TLS 后端(与 server-rs 同策略,理由见 server-rs/Cargo.toml)
+[target.'cfg(not(target_os = "android"))'.dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["native-tls"] }
+
+[target.'cfg(target_os = "android")'.dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 
 [profile.release]
 lto = true
