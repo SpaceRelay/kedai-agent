@@ -1,6 +1,6 @@
 {
   "name": "kedai",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "private": true,
   "description": "文学创作 / 角色扮演交互工具 —— 前端 Vue 3,后端 Rust(axum)",
   "workspaces": [
@@ -11,13 +11,20 @@
     "build": "npm run build -w web",
     "test": "npm test -w web",
     "build:rs": "powershell -NoProfile -ExecutionPolicy Bypass -File build.ps1",
+    "build:test": "powershell -NoProfile -ExecutionPolicy Bypass -File build.ps1 -TestOnly",
     "build:desktop": "powershell -NoProfile -ExecutionPolicy Bypass -File build.ps1 -Tauri",
     "build:portable": "powershell -NoProfile -ExecutionPolicy Bypass -File tools/build-portable.ps1",
-    "desktop": "src-tauri\\target\\release\\kedai-desktop.exe",
-    "start": "server-rs\\target\\release\\kedai-server.exe"
+    "build:all": "powershell -NoProfile -ExecutionPolicy Bypass -File build.ps1 -WithPortable",
+    "version:bump": "powershell -NoProfile -ExecutionPolicy Bypass -File tools/bump-version.ps1",
+    "desktop": "dist\\Kedai-portable\\Kedai.exe",
+    "start": "powershell -NoProfile -ExecutionPolicy Bypass -File start.ps1",
+    "check": "powershell -NoProfile -ExecutionPolicy Bypass -File tools/check-all.ps1",
+    "perf": "node tools/perf-baseline.mjs",
+    "inspect:card": "node tools/inspect-card.mjs"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2.11.4",
-    "concurrently": "^9.1.0"
+    "concurrently": "^9.1.0",
+    "typescript": "^5.9.2"
   }
 }
