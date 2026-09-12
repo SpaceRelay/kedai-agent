@@ -1,16 +1,17 @@
 {
   "name": "kedai-web",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "private": true,
   "type": "module",
-  "description": "Kedai 前端:Vue 3 + Vite + Tailwind CSS v4 + Pinia(极简黑白至上主义)",
+  "description": "Kedai 前端:Vue 3 + Vite + Tailwind CSS v4 + Pinia(淡粉画布 × 至上主义/构成主义设计系统)",
   "scripts": {
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",
     "test": "vitest run",
     "test:watch": "vitest",
-    "check": "npm run test && npm run build"
+    "typecheck": "vue-tsc --noEmit",
+    "check": "npm run typecheck && npm run test && npm run build"
   },
   "dependencies": {
     "@fontsource/archivo-black": "^5.3.0",
@@ -28,8 +29,9 @@
     "@types/sanitize-html": "^2.16.1",
     "@vitejs/plugin-vue": "^5.2.1",
     "tailwindcss": "^4.0.0",
-    "typescript": "^7.0.2",
+    "typescript": "^5.9.3",
     "vite": "^6.0.7",
-    "vitest": "^4.1.10"
+    "vitest": "^4.1.10",
+    "vue-tsc": "^3.3.11"
   }
 }

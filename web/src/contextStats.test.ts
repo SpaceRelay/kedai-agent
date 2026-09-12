@@ -16,6 +16,7 @@ describe('computeHitRate(缓存命中率,6d)', () => {
       total_tokens: 1000,
       context_tokens: 1000,
       prompt_cache_hit_tokens: 0,
+      prompt_cache_miss_tokens: 1000,
       ...partial,
     };
   }
@@ -55,12 +56,12 @@ describe('推荐设置合并(6d)', () => {
   it('勾选项合并为 patch,仅含勾选键', () => {
     const selected: RecommendedSetting[] = [
       RECOMMENDED_SETTINGS[0], // mvu_vars_position
-      RECOMMENDED_SETTINGS[2], // bypass_mode
+      RECOMMENDED_SETTINGS[2], // authorization_mode
     ];
     const patch = buildRecommendedPatch(selected);
     expect(patch).toEqual({
       mvu_vars_position: 'system',
-      bypass_mode: true,
+      authorization_mode: 'loose',
     });
     expect('render_html' in patch).toBe(false);
     expect('max_tool_rounds' in patch).toBe(false);
@@ -76,7 +77,7 @@ describe('推荐设置合并(6d)', () => {
     expect(patch).toMatchObject<RuntimeSettingsPatch>({
       mvu_vars_position: 'system',
       render_html: true,
-      bypass_mode: true,
+      authorization_mode: 'loose',
       max_tool_rounds: 32,
       max_context_tokens: 65536,
     });

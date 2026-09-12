@@ -7,15 +7,30 @@
      网格系统、粗体排版、功能主义、工业感
    ------------------------------------------------------------
    融合原则:
-   · 基底:淡粉色画布(#fdf2f4,低饱和柔和,不刺眼;控件保持纯白形成层次)
-   · 结构:纯黑 #000000(结构主义的工业骨架)
+   · 基底:淡粉色画布(#fbeef1,低饱和柔和,不刺眼;控件保持纯白形成层次)
+   · 结构:印刷黑 #141414(结构主义的工业骨架;纯黑 #000 仅留至上主义方块本体)
    · 主色:淡粉红 #f7c8d8(与 Logo 统一的温柔变体)
-   · 点缀:结构主义红 #e3342f / 至上主义蓝 #1e3a8a / 黄 #f5b301
+   · 点缀:海报红 #d62b25 / 至上主义蓝 #1e3a8a / 黄 #f5b301
    · 几何:方块、矩形、对角线——直角硬朗,拒绝圆角
    · 构图:非对称、对角线动势、元素漂浮于淡粉空间
    · 排版:粗体无衬线,文字即视觉元素(结构主义海报传统)
    · 阴影:硬偏移阴影(无模糊),模拟画作厚度
+   · 质感:全屏 feTurbulence 纸噪点(body::after,multiply 5%),印刷纸面
    可读性保障:文本对比度 ≥ 12:1,黑底白字,焦点状态明确
+   ============================================================ */
+
+/* ============================================================
+   分层约定(2026-09 D-5 起生效)
+   ------------------------------------------------------------
+   本文件只保留「必须全局」的两层:
+     层① 设计变量(:root 令牌,24 行起)——改色改尺度的唯一入口
+     层② 基础层(html/body/滚动条/焦点/选区/噪点等全局底座)
+   其下各区(装饰元件 / 布局三栏 / 顶栏 / 气泡 / 弹窗……)均为**存量层③**,
+   属待外迁资产,遵循「改到谁拆谁」:
+   · 新增组件样式:一律 <style scoped> 或 Tailwind 工具类,**禁止**再写入本文件;
+   · 修改存量组件时:顺手把该组件样式从本文件搬进组件 scoped 块;
+   · !important 存量 11 处,新增样式不得再引入(覆盖优先级用更具体选择器解决)。
+   层③ 各节以「===== 标题 =====」注释带划分,搬迁时整节移走并删节标题。
    ============================================================ */
 
 @import "tailwindcss";
@@ -23,7 +38,7 @@
 :root {
   /* ===== 基底:淡粉画布(肉眼可辨、柔和不刺眼;控件纯白形成层次) ===== */
   --sv-paper: #fbeef1;          /* 主画布:淡粉 */
-  --sv-surface: #f6e1e6;        /* 表面:侧栏/顶栏/输入区/模态框(略深一档的粉) */
+  --sv-surface: #f4dbe2;        /* 表面:侧栏/顶栏/输入区/模态框(比画布深两档,栏位层次分明) */
   --sv-surface-elevated: #fdf5f7;
   --sv-white: #ffffff;          /* 纯白(控件白底/白字,多处引用须有定义) */
 
@@ -32,7 +47,7 @@
   --sv-ink-supreme: #000000;    /* 纯黑:仅至上主义方块本体 */
   --sv-ink-soft: #2b2b2b;
   --sv-ink-dim: #5c5c5c;
-  --sv-ink-faint: #8a8a8a;
+  --sv-ink-faint: #6b6b6b;      /* 次级文字(淡粉画布上对比度 ≈4.7:1,过 WCAG AA 正文线) */
   --sv-line: #e9d5db;           /* 粉灰线(与淡粉底协调) */
   --sv-line-strong: #dcc3cb;
 
@@ -44,13 +59,22 @@
   --sv-pink-dark: #c84878;
 
   /* ===== 结构主义三原色:红 / 黑 / 白 ===== */
-  --sv-red: #e3342f;            /* 结构主义红——能量/危险/停止 */
+  --sv-red: #d62b25;            /* 海报红——能量/危险/停止(比原 #e3342f 深一档,更贴构成主义原作) */
   --sv-red-deep: #b92b27;       /* 深红:红字在浅底上的可读变体 */
+  /* 顶端海报 rule(红黑双色段带):画布与任务详情共用的单一来源(实跑问题 6 抽出共享定义) */
+  --sv-top-stripe: linear-gradient(
+    90deg,
+    var(--sv-red) 0 72px,
+    var(--sv-ink-supreme) 72px 96px,
+    transparent 96px
+  );
   --sv-blue: #1e3a8a;           /* 至上主义蓝——深度/稳定 */
   --sv-yellow: #f5b301;         /* 至上主义黄——注意力(仅色块,不作文字色) */
   --sv-yellow-deep: #8a6203;    /* 深黄:黄系文字在浅底上的可读变体 */
-  --sv-green: #16a34a;          /* 功能绿 */
+  --sv-green: #16a34a;          /* 功能绿(色块/边框;浅底上对比 ≈3.3:1,仅作图形色) */
+  --sv-green-deep: #1a7f37;     /* 深绿:绿系文字在浅底上的可读变体(对比 ≈4.6:1,过 WCAG AA;批次 5 第二轮评审点名绿徽标文字对比不足) */
   --sv-purple: #8e44ad;         /* 第 6 层/速查面板专用色标(收编自散落的 #9b59b6) */
+  --sv-orange: #e8842e;         /* 橙:构成主义用色(settings 引用,收编自硬编码) */
 
   /* ===== 语义别名(历史遗留变量,统一指向主 token) ===== */
   --sv-accent: var(--sv-pink-deep);   /* 强调色(slash 菜单等) */
@@ -61,25 +85,73 @@
 
   /* ===== 功能 ===== */
   --radius: 0;                  /* 绝对直角 */
-  --shadow-sm: 2px 2px 0 rgba(0, 0, 0, 0.06);
-  --shadow-card: 3px 3px 0 rgba(0, 0, 0, 0.08);
-  --shadow-pink: 4px 4px 0 rgba(232, 104, 144, 0.15);
-  --shadow-hover: 5px 5px 0 rgba(0, 0, 0, 0.12);
+  /* 粉阴影的统一 RGB 分量(与 --sv-pink-deep #e06890 = rgb(224,104,144) 一致;
+     历史硬编码 rgba(232,104,144) 有 8 单位色差,统一从这里取) */
+  --sv-pink-deep-rgb: 224, 104, 144;
+
+  /* ===== 边框宽度梯度(批次 5 海报化:结构边框 2px→3px,顶层浮层 3px→4px) ===== */
+  --bw: 3px;                    /* 标准:按钮/卡片/输入框/面板/结构分隔 */
+  --bw-heavy: 4px;              /* 重型:模态框/右键菜单等顶层浮层 */
+  --bw-thin: 2px;               /* 紧凑:chip/tag/列表行/时间线节点等密集组件(防抖动) */
+  --bw-hair: 1px;               /* 发丝:内嵌 pre/code/表格单元 */
+  /* 粗网格分隔:面板/区块分隔线(3px 印刷黑;回声段可叠红/蓝,见各组件) */
+  --rule-strong: var(--bw) solid var(--sv-ink);
+
+  /* ===== 硬阴影(批次 5:偏移加大到 4-6px 级、纯色无模糊、浓度加深) ===== */
+  --shadow-sm: 3px 3px 0 rgba(0, 0, 0, 0.09);
+  --shadow-card: 4px 4px 0 rgba(0, 0, 0, 0.12);
+  --shadow-pink: 4px 4px 0 rgba(var(--sv-pink-deep-rgb), 0.22);  /* 粉强调阴影(任务项 hover 等) */
+  --shadow-pink-strong: 4px 4px 0 rgba(var(--sv-pink-deep-rgb), 0.3); /* 粉强调阴影·深档 */
+  --shadow-hover: 6px 6px 0 rgba(0, 0, 0, 0.16);
+  --shadow-raise: 4px 4px 0 rgba(0, 0, 0, 0.16);  /* 按钮/面板 hover 上浮 */
+  --shadow-sunk: 4px 4px 0 rgba(0, 0, 0, 0.14);   /* 选中/按下(略沉于 raise) */
+  --shadow-card-soft: 5px 5px 0 rgba(0, 0, 0, 0.09); /* 大卡片轻投影(结果卡等) */
+  --shadow-modal: 10px 10px 0 rgba(0, 0, 0, 0.2); /* 模态框 */
+  --shadow-ctx: 8px 8px 0 rgba(0, 0, 0, 0.18);    /* 右键菜单 */
+  --shadow-hard: 5px 5px 0 var(--sv-ink);  /* 海报级实黑硬投影:仅英雄元素(primary 按钮/成果卡/批准区) */
   --shadow-press: 0 0 0 rgba(0, 0, 0, 0);  /* 按下态:阴影归零(画贴回画布) */
   --font-display: "Archivo Black", "Arial Black", "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
-  --font-body: "Segoe UI", "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+  --font-body: "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "Noto Sans SC", system-ui, sans-serif;
 
   /* 字阶:全站只允许这些字号(偶发微调除外) */
+  --text-2xs: 10px;
   --text-xs: 11px;
   --text-sm: 12px;
   --text-base: 13px;
   --text-md: 14px;
   --text-lg: 16px;
   --text-xl: 20px;
+  --text-2xl: 28px;
 
-  /* 过渡 */
+  /* 层叠阶梯(z-index 唯一来源;常量命名防裸值漂移) */
+  --z-base: 0;
+  --z-toggle: 40;      /* 右缘 AGENT 条 / 音频悬浮钮 */
+  --z-popover: 45;     /* slash 联想 / 快速回复等向上弹出层 */
+  --z-modal: 50;       /* 模态遮罩 */
+  --z-ctx: 60;         /* 右键菜单遮罩 */
+  --z-ctx-menu: 61;    /* 右键菜单本体 */
+  --z-resource-wide: 70; /* 资源卡片宽屏态(盖过聊天区/右缘条,低于启动动画) */
+  --z-splash: 100;     /* 启动动画 */
+
+  /* 过渡(2026-09 动效令牌统一):新增 --dur-* / --ease-* 供新增动画使用;
+     --transition-* 保留为既有组件的兼容别名,值不变 */
+  --dur-fast: 0.1s;
+  --dur-normal: 0.15s;
+  --dur-slow: 0.22s;
+  --ease-standard: ease;
+  --ease-out: cubic-bezier(0.22, 0.61, 0.36, 1);
   --transition-fast: 0.1s ease;
   --transition-normal: 0.15s ease;
+
+  /* 间距档位(4/8px 网格;批次 5 第二轮收编高频 padding——仅替换值不变的档位,
+     非倍数裸值(10/14px 等)留待下轮统一归档) */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 20px;
+  --space-6: 24px;
+  --space-8: 32px;
 }
 
 * { box-sizing: border-box; }
@@ -94,11 +166,51 @@ body {
   -webkit-font-smoothing: antialiased;
 }
 
+/* 纸张噪点:全屏固定噪点层,模拟印刷纸面质感(纯装饰,pointer-events 穿透)。
+   SVG feTurbulence 生成去色噪点,multiply 混合压进纸色;静态无动画,不受 reduced-motion 影响。 */
+body::after {
+  content: '';
+  position: fixed;
+  inset: 0;
+  z-index: calc(var(--z-splash) + 1);
+  pointer-events: none;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='220' height='220'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.82' numOctaves='2' stitchTiles='stitch'/%3E%3CfeColorMatrix type='saturate' values='0'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+  background-size: 220px 220px;
+  opacity: 0.05;
+  mix-blend-mode: multiply;
+}
+
 /* 滚动条:直角黑条 */
 ::-webkit-scrollbar { width: 6px; height: 6px; }
 ::-webkit-scrollbar-thumb { background: var(--sv-ink); }
 ::-webkit-scrollbar-thumb:hover { background: var(--sv-ink-soft); }
 ::-webkit-scrollbar-track { background: transparent; }
+
+/* 键盘焦点:2px 印刷黑外描边 + 2px 偏移(构成主义硬边框,非柔和发光)。
+   按钮/输入/导航/开关统一可见;点击鼠标时不显示,仅键盘 Tab 时出现。 */
+:focus-visible {
+  outline: 2px solid var(--sv-ink);
+  outline-offset: 2px;
+}
+
+/* 硬边教义(批次 5 第二轮):全局直角,拒绝圆角。
+   评审点名:原生表单控件(select/textarea/input/button)在 Chromium 新版默认外观
+   带微圆角,与卡片直角混用;此处对全部 sv-* 组件与原生控件统一归零,
+   三处散写的 border-radius: 0(resource-card / render-panel / model-select)收编于此。 */
+[class*="sv-"],
+select,
+input,
+textarea,
+button,
+output {
+  border-radius: 0;
+}
+
+/* 文本选区:淡粉底 + 印刷黑字(与画布同色系,非默认蓝) */
+::selection {
+  background: var(--sv-pink);
+  color: var(--sv-ink);
+}
 
 /* ===== 至上主义装饰元件:纯粹几何 ===== */
 
@@ -116,18 +228,45 @@ body {
 .sv-supreme.pink-deep { background: var(--sv-pink-deep); }
 .sv-supreme.green { background: var(--sv-green); }
 /* 橙(结构主义用色之一;settings 多处引用,须有定义而非回退黑色) */
-.sv-supreme.orange { background: #e8842e; }
+.sv-supreme.orange { background: var(--sv-orange); }
 .sv-supreme.purple { background: var(--sv-purple); }
 
-/* 对角线装饰(结构主义动势):标题旁/空态构图用,需父级 position: relative */
-.sv-diagonal-accent {
-  position: absolute;
-  width: 40px;
+/* 对角线:构成主义第一签名(红斜线)。仅供装饰,不参与交互。 */
+.sv-diagonal {
+  display: inline-block;
+  width: 22px;
   height: 3px;
   background: var(--sv-red);
   transform: rotate(-45deg);
-  transform-origin: left center;
+  flex-shrink: 0;
 }
+.sv-diagonal.sm { width: 16px; height: 2px; }
+.sv-diagonal.lg { width: 34px; height: 4px; }
+
+/* 标题前缀标记:收编散写的 ::before 装饰,统一为「方块/菱形/方块」三变体 */
+.sv-marker {
+  position: relative;
+  padding-left: 16px;
+}
+.sv-marker::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 10px;
+  height: 10px;
+  background: var(--sv-ink-supreme);
+}
+.sv-marker.diamond::before {
+  background: var(--sv-red);
+  transform: translateY(-50%) rotate(45deg);
+}
+.sv-marker.pink::before { background: var(--sv-pink); }
+
+/* ===== 排版工具 ===== */
+/* 数字等宽:Token 统计/用量仪表等数字密集处,防位数跳动 */
+.sv-tnum { font-variant-numeric: tabular-nums; }
 
 /* ===== 布局:三栏 ===== */
 
@@ -158,7 +297,12 @@ body {
   display: flex;
   flex-direction: column;
   background: var(--sv-surface);
-  border-right: 2px solid var(--sv-ink);
+  border-right: var(--bw) solid var(--sv-ink);
+  transition: width var(--transition-normal);
+}
+/* 任务模式加宽:给「下达目标」输入区留出更多空间 */
+.sv-sidebar.wide {
+  width: 320px;
 }
 
 /* 右侧 Agent 面板 */
@@ -168,7 +312,7 @@ body {
   display: flex;
   flex-direction: column;
   background: var(--sv-surface);
-  border-left: 2px solid var(--sv-ink);
+  border-left: var(--bw) solid var(--sv-ink);
   overflow: hidden;
   transition: width var(--transition-normal);
 }
@@ -182,7 +326,7 @@ body {
   right: 0;
   top: 50%;
   transform: translateY(-50%);
-  z-index: 40;
+  z-index: var(--z-toggle);
   writing-mode: vertical-lr;
   text-orientation: mixed;
   padding: 20px 8px;
@@ -204,33 +348,64 @@ body {
 }
 
 /* ===== 顶栏 ===== */
+/* 下边线:构成主义双线 rule(3px ink + 淡粉回声);装饰集中为标题左侧一组构成,右端控件区零叠印 */
 .sv-topbar {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 12px 20px;
-  border-bottom: 2px solid var(--sv-ink);
+  padding: var(--space-3) var(--space-5) var(--space-3) 46px; /* 左内边距 46px 加大:给标题前的构成装饰组留位 */
+  border-bottom: var(--bw) solid var(--sv-ink);
+  box-shadow: 0 4px 0 0 var(--sv-pink); /* 回声段:粉灰线升级为淡粉,暖档套版 */
   background: var(--sv-surface);
+  position: relative;
+}
+/* 标题前构成组·方块对:海报红(上)+ 纯黑(右下错位),马列维奇式非对称;纯装饰 */
+.sv-topbar::before {
+  content: '';
+  position: absolute;
+  left: 12px;
+  top: 50%;
+  width: 8px;
+  height: 8px;
+  background: var(--sv-red);
+  box-shadow: 11px 11px 0 0 var(--sv-ink-supreme);
+  transform: translateY(calc(-50% - 6px));
+  pointer-events: none;
+}
+/* 标题前构成组·红斜线:底部向右上挑起(构成主义第一签名),与方块对同组;
+   评审第二轮:自右端控件区挪来此处,拨杆/会话控件不再被装饰压印 */
+.sv-topbar::after {
+  content: '';
+  position: absolute;
+  left: 12px;
+  bottom: 5px;
+  width: 18px;
+  height: 3px;
+  background: var(--sv-red);
+  transform: rotate(-45deg);
+  transform-origin: left center;
+  pointer-events: none;
 }
 .sv-topbar-right { display: flex; align-items: center; gap: 12px; }
-.sv-topbar-title { font-size: 13px; font-weight: 800; letter-spacing: 0.04em; }
+.sv-topbar-title { font-family: var(--font-display); font-size: 13px; font-weight: 800; letter-spacing: 0.05em; }
 .sv-topbar-sub { font-size: 11px; color: var(--sv-ink-faint); letter-spacing: 0.05em; }
 
-/* Token 统计(顶栏紧凑版) */
+/* Token 统计(顶栏紧凑版;数字用至上蓝——次强调位) */
 .sv-token-inline {
   display: flex;
   align-items: center;
   gap: 8px;
   font-family: var(--font-display);
   font-size: 11.5px;
-  color: var(--sv-ink-soft);
-  border: 2px solid var(--sv-ink);
+  font-variant-numeric: tabular-nums;
+  color: var(--sv-blue);
+  border: var(--bw) solid var(--sv-ink);
   padding: 4px 10px;
 }
 
 /* 会话切换器 */
 .sv-session-select {
-  border: 2px solid var(--sv-ink);
+  border: var(--bw) solid var(--sv-ink);
   background: var(--sv-white);
   padding: 6px 10px;
   font-size: 12px;
@@ -241,12 +416,23 @@ body {
 .sv-session-select:focus { border-color: var(--sv-pink-deep); }
 
 /* ===== 聊天画布 ===== */
+/* 顶端海报 rule(红黑双色段带)共享定义见 :root 的 --sv-top-stripe。
+   实跑问题 6:段带画在画布 y=0 处,而 .sv-topbar 是定位元素、其
+   box-shadow: 0 4px 0 var(--sv-pink) 从顶栏下边框向下覆盖 4px(定位元素绘制在
+   非定位兄弟的画布之上),原 5px 段带只剩约 1px 可见 → 视觉断层。
+   修复:段带下移 4px 让开回声阴影,形成「粉回声 + 红黑段带」的清晰两层。 */
 .sv-canvas {
   flex: 1;
   min-height: 0;
   overflow-y: auto;
   padding: 32px clamp(24px, 5vw, 64px);
   background: var(--sv-paper);
+  /* 批次 5:画布顶端红黑双色段带(构成主义海报 rule;背景层,固定于面板顶部不随内容滚动,
+     让开顶栏回声阴影,不压内容;克制档仅此一条带) */
+  background-image: var(--sv-top-stripe);
+  background-repeat: no-repeat;
+  background-size: 100% 5px;
+  background-position: 0 4px;
 }
 
 /* 空态:至上主义几何构成(方块序列 + 红色对角线) */
@@ -270,8 +456,13 @@ body {
   width: 34px;
   height: 3px;
   background: var(--sv-red);
+  box-shadow: 0 6px 0 0 var(--sv-pink); /* 套版双线回声 */
   transform: rotate(-45deg);
 }
+/* 空态组合下缘距变体(替代模板内联 margin-bottom) */
+.sv-empty-geo.mb8 { margin-bottom: 8px; }
+.sv-empty-geo.mb10 { margin-bottom: 10px; }
+.sv-empty-geo.mb14 { margin-bottom: 14px; }
 .sv-empty .big {
   font-family: var(--font-display);
   font-size: 22px;
@@ -295,11 +486,10 @@ body {
   word-break: break-word;
   position: relative;
 }
-/* 用户消息:黑底白字 */
+/* 用户消息:黑底白字(纯展示容器,按阴影规则不挂投影——黑块本身即至上主义实体) */
 .sv-msg.user .sv-msg-bubble {
   background: var(--sv-ink);
   color: var(--sv-white);
-  box-shadow: var(--shadow-card);
 }
 .sv-msg.user .sv-msg-bubble::after {
   content: "";
@@ -310,17 +500,16 @@ body {
   height: 16px;
   background: var(--sv-pink);
 }
-/* 角色消息:白底黑字 */
+/* 角色消息:白底黑字(纯展示容器,按阴影规则不挂投影——3px 粗框 + 粉顶线承担立体感) */
 .sv-msg.assistant .sv-msg-bubble {
   background: var(--sv-surface);
-  border: 2px solid var(--sv-ink);
+  border: var(--bw) solid var(--sv-ink);
   border-top: 4px solid var(--sv-pink);
-  box-shadow: var(--shadow-card);
 }
 /* 系统消息 */
 .sv-msg.system .sv-msg-bubble {
   background: var(--sv-surface);
-  border: 2px solid var(--sv-line);
+  border: var(--bw-thin) solid var(--sv-line);
   border-left: 4px solid var(--sv-ink);
   color: var(--sv-ink-dim);
 }
@@ -335,13 +524,26 @@ body {
   line-height: 1.5;
   color: var(--sv-ink-dim);
   background: var(--sv-surface);
-  border: 2px solid var(--sv-line);
+  border: var(--bw-thin) solid var(--sv-line);
   border-left: 4px solid var(--sv-pink);
   white-space: pre-wrap;
   word-break: break-word;
 }
 
 .sv-msg.assistant .min-w-0 { flex: 1; min-width: 0; }
+
+/* 状态栏/卡内 HTML 的渲染容器(实跑问题 5):酒馆状态栏按整幅聊天区宽度设计,
+   塞进 max-width:min(560px,78%) 的气泡后容易横向溢出/被裁,表现为「文案显示不全」。
+   含 data-kd-scope 卡片的气泡放宽到 92%,容器自身允许横向滚动兜底(不裁内容、不撑破布局)。
+   注::has() 在 WebView2/Chromium 均已支持;不支持时仅退回原宽度,不影响可用性。 */
+.sv-msg.assistant .sv-msg-bubble:has([data-kd-scope]) {
+  max-width: 92%;
+}
+.sv-msg-bubble [data-kd-scope] {
+  max-width: 100%;
+  overflow-x: auto;
+  overflow-y: visible;
+}
 
 /* 方块头像 */
 .sv-avatar {
@@ -394,6 +596,37 @@ body {
   color: var(--sv-pink-deep);
   animation: sv-blink 1s infinite;
 }
+/* 流式光标的块级适配(修复用户实测「装饰线条错位/多余线段」):
+   markdown 气泡(sv-msg-md,v-html 渲染)内容以块级元素(p/ul/pre 等)结尾时,
+   气泡自身的内联 ::after 光标被末块挤到下一行,显示为气泡底部孤立粉竖线。
+   处理:md 气泡关闭气泡级光标,改由最后一个块级子元素承担——
+   段落/标题 inline 化使光标尾随同行;列表尾随末列表项;pre(工具调用块/代码块)
+   光标落入块内文本末尾(继承 pre 白字,黑底可见,不触深色兜底规则)。
+   末块为 table/hr/blockquote 等未覆盖形态时暂无光标(流式中间态,后续输出到达即恢复)。 */
+.sv-msg-bubble.sv-msg-md.sv-stream-cursor::after { content: none; }
+.sv-msg-bubble.sv-msg-md.sv-stream-cursor > p:last-child,
+.sv-msg-bubble.sv-msg-md.sv-stream-cursor > h1:last-child,
+.sv-msg-bubble.sv-msg-md.sv-stream-cursor > h2:last-child,
+.sv-msg-bubble.sv-msg-md.sv-stream-cursor > h3:last-child,
+.sv-msg-bubble.sv-msg-md.sv-stream-cursor > h4:last-child {
+  display: inline;
+}
+.sv-msg-bubble.sv-msg-md.sv-stream-cursor > p:last-child::after,
+.sv-msg-bubble.sv-msg-md.sv-stream-cursor > h1:last-child::after,
+.sv-msg-bubble.sv-msg-md.sv-stream-cursor > h2:last-child::after,
+.sv-msg-bubble.sv-msg-md.sv-stream-cursor > h3:last-child::after,
+.sv-msg-bubble.sv-msg-md.sv-stream-cursor > h4:last-child::after,
+.sv-msg-bubble.sv-msg-md.sv-stream-cursor > ul:last-child > li:last-child::after,
+.sv-msg-bubble.sv-msg-md.sv-stream-cursor > ol:last-child > li:last-child::after {
+  content: "▍";
+  color: var(--sv-pink-deep);
+  animation: sv-blink 1s infinite;
+}
+/* pre 结尾(工具调用块/代码块):光标尾随代码文本,颜色继承 pre 白字(黑底上可见) */
+.sv-msg-bubble.sv-msg-md.sv-stream-cursor > pre:last-child::after {
+  content: "▍";
+  animation: sv-blink 1s infinite;
+}
 
 /* 消息操作行 */
 .sv-msg-actions {
@@ -432,7 +665,7 @@ body {
   gap: 8px;
   width: 100%;
   max-width: 560px;
-  border: 2px solid var(--sv-ink);
+  border: var(--bw) solid var(--sv-ink);
   background: var(--sv-surface);
   padding: 12px;
 }
@@ -444,7 +677,7 @@ body {
   color: var(--sv-ink-faint);
 }
 .sv-edit-box textarea {
-  border: 2px solid var(--sv-line);
+  border: var(--bw) solid var(--sv-line);
   background: var(--sv-white);
   padding: 10px 12px;
   font-size: 14px;
@@ -461,9 +694,9 @@ body {
 /* ===== 输入区 ===== */
 
 .sv-inputbar {
-  border-top: 2px solid var(--sv-ink);
+  border-top: var(--bw) solid var(--sv-ink);
   background: var(--sv-surface);
-  padding: 16px 20px;
+  padding: var(--space-4) var(--space-5);
 }
 .sv-inputbox { display: flex; gap: 12px; align-items: flex-end; }
 .sv-inputbox textarea {
@@ -471,7 +704,7 @@ body {
   min-height: 48px;
   max-height: 160px;
   resize: none;
-  border: 2px solid var(--sv-ink);
+  border: var(--bw) solid var(--sv-ink);
   background: var(--sv-white);
   padding: 12px 14px;
   font-family: var(--font-body);
@@ -482,7 +715,7 @@ body {
 .sv-inputbox textarea::placeholder { color: var(--sv-ink-faint); }
 .sv-inputbox textarea:focus {
   border-color: var(--sv-pink-deep);
-  box-shadow: 3px 3px 0 rgba(232, 104, 144, 0.2);
+  box-shadow: var(--shadow-pink-strong);
 }
 
 /* 发送按钮 */
@@ -490,9 +723,10 @@ body {
   width: 48px;
   height: 48px;
   flex-shrink: 0;
-  border: 2px solid var(--sv-ink);
+  border: var(--bw) solid var(--sv-ink);
   background: var(--sv-ink);
   color: var(--sv-white);
+  box-shadow: var(--shadow-card);
   font-size: 18px;
   cursor: pointer;
   display: flex;
@@ -512,7 +746,7 @@ body {
 /* ===== slash 联想 / 快速回复下拉(ChatInput) ===== */
 
 .sv-slash-menu {
-  border: 2px solid var(--sv-ink);
+  border: var(--bw) solid var(--sv-ink);
   background: var(--sv-white);
   box-shadow: var(--shadow-hover);
   max-height: 248px;
@@ -526,7 +760,7 @@ body {
   gap: 2px;
   width: 100%;
   padding: 8px 10px;
-  border: 2px solid transparent;
+  border: var(--bw-thin) solid transparent;
   background: transparent;
   text-align: left;
   cursor: pointer;
@@ -536,6 +770,7 @@ body {
 .sv-slash-item.active {
   background: var(--sv-pink-light);
   border-color: var(--sv-ink);
+  box-shadow: var(--shadow-card);
 }
 .sv-slash-item b {
   font-family: var(--font-display);
@@ -580,9 +815,10 @@ body {
 /* 模式切换 */
 .sv-mode {
   display: flex;
-  border: 2px solid var(--sv-ink);
+  border: var(--bw) solid var(--sv-ink);
   overflow: hidden;
   flex-shrink: 0;
+  box-shadow: var(--shadow-card); /* 阴影规则:可交互分段拨杆挂 card 影 */
 }
 .sv-mode button {
   padding: 8px 14px;
@@ -613,8 +849,9 @@ body {
 .sv-auth-mode-label { letter-spacing: 0.05em; }
 .sv-auth-toggle {
   display: flex;
-  border: 2px solid var(--sv-ink);
+  border: var(--bw) solid var(--sv-ink);
   overflow: hidden;
+  box-shadow: var(--shadow-card);
 }
 .sv-auth-toggle button {
   padding: 6px 12px;
@@ -646,7 +883,7 @@ body {
   align-items: center;
   gap: 6px;
   padding: 6px 10px;
-  border: 2px solid var(--sv-ink);
+  border: var(--bw-thin) solid var(--sv-ink);
   background: var(--sv-white);
   font-size: 11.5px;
   color: var(--sv-ink);
@@ -678,12 +915,13 @@ body {
   align-items: center;
   gap: 6px;
   padding: 8px 14px;
-  border: 2px solid var(--sv-ink);
+  border: var(--bw) solid var(--sv-ink);
   background: var(--sv-white);
   color: var(--sv-ink);
   font-size: 12px;
   font-weight: 700;
   cursor: pointer;
+  box-shadow: var(--shadow-card);
 }
 .sv-btn-attach:hover {
   background: var(--sv-pink-light);
@@ -726,8 +964,8 @@ body {
 /* ===== 侧栏内部 ===== */
 
 .sv-side-head {
-  padding: 16px;
-  border-bottom: 2px solid var(--sv-ink);
+  padding: var(--space-4);
+  border-bottom: var(--bw) solid var(--sv-ink);
   background: var(--sv-surface);
 }
 .sv-brand { display: flex; align-items: center; gap: 10px; }
@@ -746,29 +984,44 @@ body {
   color: var(--sv-ink);
 }
 
-/* Token 统计 */
+/* Token 统计(单列:色标 + 数值靠左 + 标签靠右,紧凑横排) */
 .sv-tokens {
   display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 10px;
+  grid-template-columns: 1fr;
+  gap: 8px;
   margin-top: 14px;
 }
 .sv-token-cell {
   display: flex;
   align-items: center;
   gap: 8px;
-  padding: 8px 10px;
-  border: 2px solid var(--sv-ink);
+  padding: 7px 10px;
+  border: var(--bw) solid var(--sv-ink);
   background: var(--sv-white);
 }
 .sv-token-cell .sv-supreme { flex-shrink: 0; }
-.sv-token-cell b { display: block; font-size: 15px; font-family: var(--font-display); }
-.sv-token-cell span { font-size: 10px; color: var(--sv-ink-faint); letter-spacing: 0.05em; }
+.sv-token-cell > div {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+}
+.sv-token-cell b {
+  display: block;
+  font-size: 14px;
+  font-family: var(--font-display);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.sv-token-cell span { font-size: 10px; color: var(--sv-ink-faint); letter-spacing: 0.05em; flex-shrink: 0; }
 
 /* 搜索 */
 .sv-search {
   width: 100%;
-  border: 2px solid var(--sv-ink);
+  border: var(--bw) solid var(--sv-ink);
   background: var(--sv-white);
   padding: 10px 12px;
   font-size: 13px;
@@ -784,15 +1037,20 @@ body {
   gap: 10px;
   width: 100%;
   padding: 10px 12px;
-  border: 2px solid transparent;
+  border: var(--bw-thin) solid transparent;
   background: transparent;
   text-align: left;
   cursor: pointer;
   margin-bottom: 3px;
+  /* 2026-09 动效补齐:角色列表原先 hover/active 为突变,补过渡与现有列表语言一致 */
+  transition: background var(--dur-fast) var(--ease-standard),
+    border-color var(--dur-fast) var(--ease-standard),
+    box-shadow var(--dur-fast) var(--ease-standard);
 }
 .sv-char-item:hover {
   background: var(--sv-pink-light);
   border-color: var(--sv-pink);
+  box-shadow: var(--shadow-card); /* 阴影规则:可点列表行 hover 挂 card 影 */
 }
 .sv-char-item.active {
   background: var(--sv-ink);
@@ -812,7 +1070,7 @@ body {
 }
 
 /* 底部工具条 */
-.sv-side-foot { border-top: 2px solid var(--sv-ink); padding: 12px; }
+.sv-side-foot { border-top: var(--bw) solid var(--sv-ink); padding: var(--space-3); }
 
 /* 连接状态灯 */
 .sv-conn { display: flex; align-items: center; gap: 6px; font-size: 11px; color: var(--sv-ink-soft); }
@@ -826,7 +1084,7 @@ body {
 .sv-modal-mask {
   position: fixed;
   inset: 0;
-  z-index: 50;
+  z-index: var(--z-modal);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -837,8 +1095,8 @@ body {
   max-width: 92vw;
   max-height: 84vh;
   background: var(--sv-surface);
-  border: 3px solid var(--sv-ink);
-  box-shadow: 8px 8px 0 rgba(0, 0, 0, 0.15);
+  border: var(--bw-heavy) solid var(--sv-ink);
+  box-shadow: var(--shadow-modal);
   display: flex;
   flex-direction: column;
   overflow: hidden;
@@ -847,11 +1105,33 @@ body {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 16px 20px;
-  border-bottom: 3px solid var(--sv-ink);
+  padding: var(--space-4) var(--space-5);
+  border-bottom: var(--bw) solid var(--sv-ink);
   background: var(--sv-ink); /* 黑条头部:放大的黑方块,全站模态统一节奏 */
   color: var(--sv-white);
+  position: relative;
 }
+/* 红斜线角标:黑条头部右缘的构成主义签名(纯装饰,不遮关闭按钮);深粉回声成对出现。
+   定位修复(用户实测装饰压 ✕):right 52px 时斜线旋转(-45°)后包围盒右缘 ≈ right 49.6px
+   (半宽 8.1px + 回声阴影随旋转向右下扩 4.2px),而 ✕ 按钮(sv-btn-square ≈34px 宽 +
+   右内边距 20px)左缘 ≈ right 54px,二者相交。改为 calc(space-5 + 62px) = 82px:
+   20px 内边距 + 34px 按钮热区 + 12px 净距 + 16px 旋转/回声余量,✕ 周围留白干净。 */
+.sv-modal-head::after {
+  content: '';
+  position: absolute;
+  right: calc(var(--space-5) + 62px);
+  top: 50%;
+  width: 20px;
+  height: 3px;
+  background: var(--sv-red);
+  box-shadow: 0 6px 0 0 var(--sv-pink-deep);
+  transform: translateY(-50%) rotate(-45deg);
+  pointer-events: none;
+}
+/* 头部右侧带额外控件组的模态(聊天记录「＋ 新建」/脚本管理「导出·导入」):
+   装饰线无论怎么偏移都会与控件组相交,直接隐藏,保持功能控件区干净 */
+.wb-modal .sv-modal-head::after,
+.sv-scripts-modal .sv-modal-head::after { content: none; }
 .sv-modal-head h2 {
   margin: 0;
   font-family: var(--font-display);
@@ -859,6 +1139,8 @@ body {
   letter-spacing: 0.1em;
   color: var(--sv-white);
 }
+/* 模态头色点:统一 18px,替代各模板的内联尺寸 */
+.sv-modal-head .sv-supreme { width: 18px; height: 18px; flex: none; }
 .sv-modal-head .sv-wb-count { color: rgba(255, 255, 255, 0.65); }
 /* 黑条头部内的次要文字(角色名/说明/标签):白字降透明度保证可读 */
 .sv-modal-head .sv-char-desc,
@@ -870,7 +1152,7 @@ body {
   font-size: 10.5px;
   font-weight: 700;
   padding: 2px 8px;
-  border: 2px solid var(--sv-red);
+  border: var(--bw-thin) solid var(--sv-red);
   color: var(--sv-red-deep);
   background: var(--sv-white);
   white-space: nowrap;
@@ -879,11 +1161,19 @@ body {
   color: #fff;
   background: transparent;
 }
-.sv-modal-head .logo { width: 18px; height: 18px; background: var(--sv-pink); }
-.sv-modal-body { flex: 1; overflow-y: auto; padding: 20px; }
+/* 分区分隔线:构成主义双线(粗网格分隔 + 淡粉回声),替换模板内联 border-top */
+.sv-separator {
+  margin: 16px 0 12px;
+  padding-top: 12px;
+  border-top: var(--rule-strong);
+  box-shadow: 0 4px 0 0 var(--sv-pink);
+}
+/* 窄容器变体(如设置 Hub 左侧导航内) */
+.sv-separator.tight { margin: 10px 4px; padding-top: 10px; }
+.sv-modal-body { flex: 1; overflow-y: auto; padding: var(--space-5); }
 .sv-modal-foot {
   padding: 14px 20px;
-  border-top: 2px solid var(--sv-ink);
+  border-top: var(--bw) solid var(--sv-ink);
   display: flex;
   justify-content: flex-end;
   background: var(--sv-pink-light);
@@ -902,9 +1192,9 @@ body {
   display: flex;
   flex-direction: column;
   gap: 6px;
-  margin-bottom: 20px;
-  border: 2px solid var(--sv-ink);
-  padding: 16px;
+  margin-bottom: var(--space-5);
+  border: var(--bw) solid var(--sv-ink);
+  padding: var(--space-4);
   background: var(--sv-surface);
 }
 /* 设置字段(embedded 模式容器,无边框) */
@@ -923,7 +1213,7 @@ body {
   color: var(--sv-ink);
   margin-bottom: 14px;
   padding-bottom: 10px;
-  border-bottom: 2px solid var(--sv-line);
+  border-bottom: var(--bw-thin) solid var(--sv-line);
 }
 .sv-field-label .sv-supreme { width: 10px; height: 10px; }
 /* 次级小标题(区块内,不带上边框线节奏) */
@@ -965,7 +1255,10 @@ body {
 .sv-input, .sv-select {
   flex: 1;
   min-width: 0;
-  border: 2px solid var(--sv-ink);
+  /* 块级父容器下占满整行(textarea 不再塌缩回 cols 默认宽);
+     flex 行内被 flex:1 的 basis:0% 覆盖,无副作用 */
+  width: 100%;
+  border: var(--bw) solid var(--sv-ink);
   background: var(--sv-white);
   padding: 9px 12px;
   font-size: 13px;
@@ -975,7 +1268,7 @@ body {
 }
 .sv-input:focus, .sv-select:focus {
   border-color: var(--sv-pink-deep);
-  box-shadow: 3px 3px 0 rgba(232, 104, 144, 0.2);
+  box-shadow: var(--shadow-pink-strong);
 }
 .sv-input::placeholder { color: var(--sv-ink-faint); }
 
@@ -993,7 +1286,7 @@ body {
 
 .sv-code {
   flex: 1;
-  border: 2px solid var(--sv-line);
+  border: var(--bw-thin) solid var(--sv-line);
   background: var(--sv-paper);
   padding: 8px 10px;
   font-size: 12px;
@@ -1018,6 +1311,8 @@ body {
   line-height: 1.5;
 }
 .sv-note code { color: var(--sv-ink-soft); }
+/* F8(2026-09-10):流程步骤「工具」三态误配警示,用暖色区分于普通说明 */
+.sv-note.flow-tool-warn { color: #b45309; }
 
 /* 滑块 */
 .sv-range-label {
@@ -1049,7 +1344,7 @@ body {
   font-size: 15px;
   min-width: 34px;
   text-align: center;
-  border: 2px solid var(--sv-ink);
+  border: var(--bw-thin) solid var(--sv-ink);
   padding: 3px 8px;
   background: var(--sv-white);
 }
@@ -1065,7 +1360,7 @@ input[type="range"].sv-range::-webkit-slider-thumb {
   width: 18px;
   height: 18px;
   background: var(--sv-pink);
-  border: 2px solid var(--sv-ink);
+  border: var(--bw-thin) solid var(--sv-ink);
   cursor: pointer;
 }
 input[type="range"].sv-range::-webkit-slider-thumb:hover { background: var(--sv-pink-deep); }
@@ -1073,11 +1368,14 @@ input[type="range"].sv-range::-moz-range-thumb {
   width: 16px;
   height: 16px;
   background: var(--sv-pink);
-  border: 2px solid var(--sv-ink);
+  border: var(--bw-thin) solid var(--sv-ink);
   cursor: pointer;
 }
 
-/* 按钮:按压联动(hover 抬起 + 硬阴影生长,active 压下 + 阴影归零) */
+/* 按钮:按压联动(hover 抬起 + 硬阴影生长,active 压下 + 阴影归零)。
+   批次 5 第二轮阴影规则:可交互元素静态挂 --shadow-card,hover 升 --shadow-hover;
+   纯展示容器不挂阴影;浮层(modal/ctx/popover/slash-menu)为分层例外保留投影;
+   --shadow-hard 实黑影仅英雄位(primary 按钮/成果卡/批准区)。 */
 .sv-btn, .sv-btn-send, .sv-btn-attach, .sv-icon-btn, .sv-agent-panel-close {
   transition:
     transform var(--transition-fast),
@@ -1092,7 +1390,7 @@ input[type="range"].sv-range::-moz-range-thumb {
 .sv-icon-btn:hover,
 .sv-agent-panel-close:hover {
   transform: translate(-1px, -1px);
-  box-shadow: 3px 3px 0 rgba(0, 0, 0, 0.12);
+  box-shadow: var(--shadow-hover);
 }
 .sv-btn:active:not(:disabled),
 .sv-btn-send:active:not(:disabled),
@@ -1108,15 +1406,19 @@ input[type="range"].sv-range::-moz-range-thumb {
   font-size: 13px;
   font-weight: 700;
   cursor: pointer;
-  border: 2px solid var(--sv-ink);
+  border: var(--bw) solid var(--sv-ink);
+  box-shadow: var(--shadow-card); /* 阴影规则:可交互元素静态挂 card 影 */
 }
+/* 主按钮:海报级实黑硬投影(英雄元素;hover 抬起时阴影继续生长) */
 .sv-btn.primary {
   background: var(--sv-ink);
   color: var(--sv-white);
+  box-shadow: var(--shadow-hard);
 }
 .sv-btn.primary:hover {
   background: var(--sv-pink-deep);
   border-color: var(--sv-pink-deep);
+  box-shadow: 6px 6px 0 var(--sv-ink);
 }
 .sv-btn.ghost {
   background: var(--sv-white);
@@ -1146,10 +1448,11 @@ input[type="range"].sv-range::-moz-range-thumb {
   display: flex;
   align-items: center;
   justify-content: center;
-  border: 2px solid var(--sv-ink);
+  border: var(--bw) solid var(--sv-ink);
   background: var(--sv-white);
   cursor: pointer;
   font-size: 14px;
+  box-shadow: var(--shadow-card);
 }
 .sv-icon-btn:hover { background: var(--sv-pink-light); }
 
@@ -1161,11 +1464,39 @@ input[type="range"].sv-range::-moz-range-thumb {
   font-size: 12px;
   padding: 10px 12px;
   margin-top: 10px;
-  border: 2px solid;
+  border: var(--bw-thin) solid;
 }
-.sv-feedback.ok { border-color: var(--sv-green); color: var(--sv-green); background: rgba(22, 163, 74, 0.05); }
+.sv-feedback.ok { border-color: var(--sv-green); color: var(--sv-green-deep); background: rgba(22, 163, 74, 0.05); }
 .sv-feedback.err { border-color: var(--sv-red); color: var(--sv-red); background: rgba(227, 52, 47, 0.05); }
 .sv-feedback.info { border-color: var(--sv-blue); color: var(--sv-blue); background: rgba(30, 58, 138, 0.05); }
+
+/* 全局错误条:数据加载失败 / 弹窗懒加载失败(吸顶,可重试可关闭) */
+.sv-global-error {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  padding: 8px 14px;
+  font-size: 12px;
+  color: var(--sv-red);
+  background: rgba(227, 52, 47, 0.08);
+  border-bottom: var(--bw-thin) solid var(--sv-red);
+}
+.sv-global-error-text { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* 渲染引导条:角色卡含界面脚本但当前纯文本显示时的一键开启提示(蓝色 info,可关闭) */
+.sv-render-hint {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  padding: 7px 14px;
+  font-size: 12px;
+  color: var(--sv-blue);
+  background: rgba(30, 58, 138, 0.06);
+  border-bottom: var(--bw-thin) solid var(--sv-blue);
+}
+.sv-render-hint-text { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 /* 数据管理行 */
 .sv-datalist { display: flex; flex-direction: column; gap: 10px; }
@@ -1175,12 +1506,30 @@ input[type="range"].sv-range::-moz-range-thumb {
   justify-content: space-between;
   gap: 12px;
   padding: 12px 14px;
-  border: 2px solid var(--sv-ink);
+  border: var(--bw) solid var(--sv-ink);
   background: var(--sv-white);
 }
 .sv-data-row .info { font-size: 12.5px; }
 .sv-data-row .info b { display: block; font-size: 13px; }
 .sv-data-row .info span { color: var(--sv-ink-faint); font-size: 11px; }
+/* 开场选择器行:整行按钮化 + 预览文本限高滚动(收编模板内联) */
+.sv-greet-row {
+  width: 100%;
+  text-align: left;
+  cursor: pointer;
+  align-items: flex-start;
+  font-family: var(--font-body);
+}
+.sv-greet-row .info { min-width: 0; }
+.sv-greet-row .info b { display: flex; align-items: center; gap: 8px; }
+.sv-greet-row .preview {
+  display: block;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 110px;
+  overflow-y: auto;
+  margin-top: 4px;
+}
 /* 脚本/会话元信息小字(脚本管理、优化面板、DevTools 共用) */
 .sv-script-meta {
   color: var(--sv-ink-faint);
@@ -1191,7 +1540,7 @@ input[type="range"].sv-range::-moz-range-thumb {
 .sv-skill-preview {
   margin-top: 6px;
   padding: 8px 10px;
-  border: 2px solid var(--sv-ink);
+  border: var(--bw-thin) solid var(--sv-ink);
   background: var(--sv-white);
   font-family: var(--font-mono, ui-monospace, monospace);
   font-size: 11px;
@@ -1216,7 +1565,7 @@ input[type="range"].sv-range::-moz-range-thumb {
 .sv-hub-nav {
   width: 180px;
   flex-shrink: 0;
-  border-right: 2px solid var(--sv-ink);
+  border-right: var(--bw) solid var(--sv-ink);
   background: var(--sv-pink-light);
   padding: 16px 10px;
   overflow-y: auto;
@@ -1227,7 +1576,7 @@ input[type="range"].sv-range::-moz-range-thumb {
   gap: 10px;
   width: 100%;
   padding: 10px 14px;
-  border: 2px solid transparent;
+  border: var(--bw-thin) solid transparent;
   background: transparent;
   font-size: 13px;
   font-weight: 600;
@@ -1239,18 +1588,54 @@ input[type="range"].sv-range::-moz-range-thumb {
 .sv-hub-nav-item:hover {
   background: var(--sv-white);
   border-color: var(--sv-pink);
+  box-shadow: var(--shadow-card);
 }
 .sv-hub-nav-item.active {
   background: var(--sv-ink);
   color: var(--sv-white);
   border-color: var(--sv-ink);
 }
+/* 导航序号:构成主义数字(display 字体,同 .sv-mode-idx 节奏);
+   批次 5 第二轮:编号 pink-deep → 海报红,与色点构成红黑海报对 */
+.sv-hub-nav-idx {
+  font-family: var(--font-display);
+  font-size: 9px;
+  color: var(--sv-red);
+  letter-spacing: 0.05em;
+  flex-shrink: 0;
+}
+.sv-hub-nav-item.active .sv-hub-nav-idx { color: var(--sv-pink); }
+/* 批次 5 第二轮:Hub 左栏色点配色收敛——模板 dot 类含橙/黄,出海报红/印刷黑/至上蓝
+   三色体系;不改 DOM,在 Hub 作用域统一为印刷黑(全组单色,克制档);
+   active(黑底)态色点翻海报红,保持黑底上可见 */
+.sv-hub-nav .sv-hub-nav-item .sv-supreme { background: var(--sv-ink); }
+.sv-hub-nav .sv-hub-nav-item.active .sv-supreme { background: var(--sv-red); }
+/* active 态右缘红斜线指向(纯装饰) */
+.sv-hub-nav-item.active::after {
+  content: '';
+  width: 14px;
+  height: 2px;
+  background: var(--sv-red);
+  transform: rotate(-45deg);
+  margin-left: auto;
+  flex-shrink: 0;
+}
 .sv-hub-content {
   flex: 1;
   min-width: 0;
   overflow-y: auto;
-  padding: 20px;
+  padding: var(--space-5);
   background: var(--sv-surface);
+}
+/* 右区当前分区标题(display 字体 + 红黑双色 rule 下缘:3px 印刷黑 + 海报红回声段) */
+.sv-hub-content-title {
+  margin: 0 0 16px;
+  padding-bottom: 12px;
+  border-bottom: var(--rule-strong);
+  box-shadow: 0 5px 0 0 var(--sv-red);
+  font-family: var(--font-display);
+  font-size: var(--text-md);
+  letter-spacing: 0.08em;
 }
 
 /* ===== Agent 面板内容 ===== */
@@ -1259,7 +1644,7 @@ input[type="range"].sv-range::-moz-range-thumb {
   align-items: center;
   justify-content: space-between;
   padding: 14px 16px;
-  border-bottom: 3px solid var(--sv-ink);
+  border-bottom: var(--bw) solid var(--sv-ink);
   background: var(--sv-ink); /* 黑条头部:与模态统一节奏 */
   color: var(--sv-white);
 }
@@ -1274,7 +1659,7 @@ input[type="range"].sv-range::-moz-range-thumb {
 }
 .sv-agent-panel-close {
   background: none;
-  border: 2px solid var(--sv-white);
+  border: var(--bw-thin) solid var(--sv-white);
   width: 28px;
   height: 28px;
   display: flex;
@@ -1290,19 +1675,58 @@ input[type="range"].sv-range::-moz-range-thumb {
   border-color: var(--sv-ink);
 }
 
+/* ===== Agent 面板分区标签页(「调用情况」面板合并入 AgentPanel 后的内部分区) ===== */
+.sv-agent-tabs {
+  display: flex;
+  flex: none;
+  border-bottom: var(--bw) solid var(--sv-ink);
+  background: var(--sv-surface);
+}
+.sv-agent-tab-btn {
+  flex: 1;
+  padding: 8px 10px;
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  background: var(--sv-white);
+  color: var(--sv-ink-dim);
+  border: none;
+  cursor: pointer;
+}
+.sv-agent-tab-btn + .sv-agent-tab-btn { border-left: var(--bw) solid var(--sv-ink); }
+.sv-agent-tab-btn:hover { background: var(--sv-pink-light); color: var(--sv-ink); }
+/* active 态:黑底白字 + 海报红底线下划(构成主义签名,与面板头黑条节奏一致) */
+.sv-agent-tab-btn.active {
+  background: var(--sv-ink);
+  color: var(--sv-white);
+  box-shadow: inset 0 -3px 0 0 var(--sv-red);
+}
+/* tab 内容容器:v-show 切换显隐;显示时继承面板体的纵向间距节奏 */
+.sv-agent-tab {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+}
+.sv-calltrace-tab {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+}
+
 .sv-agent-panel-body {
   flex: 1;
   min-height: 0;
   overflow-y: auto;
-  padding: 16px;
+  padding: var(--space-4);
   display: flex;
   flex-direction: column;
-  gap: 16px;
+  gap: var(--space-4);
 }
 
 /* Agent 状态总览 */
 .sv-agent-summary {
-  border: 2px solid var(--sv-ink);
+  border: var(--bw) solid var(--sv-ink);
   background: var(--sv-white);
   padding: 12px;
 }
@@ -1325,6 +1749,30 @@ input[type="range"].sv-range::-moz-range-thumb {
   color: var(--sv-ink-faint);
   margin-bottom: 10px;
   font-weight: 800;
+}
+
+/* ===== 调用追踪面板(批次 3 L3,复用 sv-agent-panel 抽屉壳) ===== */
+.sv-calltrace-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 12px;
+  margin-top: 6px;
+  font-size: 11px;
+  color: var(--sv-ink-dim);
+}
+/* 摘要展开区:等宽 + 限高滚动(同 sv-tool-panel-card pre 纪律) */
+.sv-calltrace-pre {
+  margin: 6px 0 0;
+  font-family: ui-monospace, Consolas, monospace;
+  font-size: 11px;
+  white-space: pre-wrap;
+  word-break: break-all;
+  color: var(--sv-ink-soft);
+  max-height: 160px;
+  overflow-y: auto;
+  background: var(--sv-paper);
+  padding: 8px;
+  border: 1px solid var(--sv-line);
 }
 .sv-timeline {
   list-style: none;
@@ -1356,7 +1804,7 @@ input[type="range"].sv-range::-moz-range-thumb {
   width: 14px;
   height: 14px;
   background: var(--sv-pink-deep);
-  border: 2px solid var(--sv-ink);
+  border: var(--bw-thin) solid var(--sv-ink);
 }
 .sv-timeline-item .step-detail {
   display: block;
@@ -1367,7 +1815,7 @@ input[type="range"].sv-range::-moz-range-thumb {
 
 /* 工具调用卡片 */
 .sv-tool-panel-card {
-  border: 2px solid var(--sv-ink);
+  border: var(--bw) solid var(--sv-ink);
   background: var(--sv-white);
   padding: 12px;
   font-size: 12px;
@@ -1375,6 +1823,7 @@ input[type="range"].sv-range::-moz-range-thumb {
 }
 .sv-tool-panel-card.running { border-left: 4px solid var(--sv-yellow); }
 .sv-tool-panel-card.authorization_required { border-left: 4px solid var(--sv-red); }
+.sv-tool-panel-card.failed { border-left: 4px solid var(--sv-red); }
 .sv-tool-panel-card .tool-name {
   font-family: var(--font-display);
   font-weight: 800;
@@ -1407,7 +1856,7 @@ input[type="range"].sv-range::-moz-range-thumb {
   font-weight: 900;
   background: var(--sv-pink-light);
   color: var(--sv-ink);
-  border: 2px solid var(--sv-ink);
+  border: var(--bw-thin) solid var(--sv-ink);
 }
 .sv-tool-panel-card .tool-status.done { background: var(--sv-green); color: #fff; }
 .sv-tool-panel-card .tool-status.running { background: var(--sv-yellow); color: #000; }
@@ -1424,13 +1873,13 @@ input[type="range"].sv-range::-moz-range-thumb {
 .sv-splash {
   position: fixed;
   inset: 0;
-  z-index: 100;
+  z-index: var(--z-splash);
   display: flex;
   align-items: center;
   justify-content: center;
   background: var(--sv-paper);
 }
-.sv-splash.fade-out { opacity: 0; pointer-events: none; transition: opacity 0.4s ease; }
+.sv-splash.fade-out { opacity: 0; pointer-events: none; transition: opacity 0.4s var(--ease-standard); }
 .sv-splash-content {
   text-align: center;
   position: relative;
@@ -1462,21 +1911,6 @@ input[type="range"].sv-range::-moz-range-thumb {
   from { opacity: 0; transform: translateY(12px); }
   to { opacity: 1; transform: translateY(0); }
 }
-.sv-splash-geo {
-  position: absolute;
-}
-.sv-splash-geo.pink { background: var(--sv-pink); }
-.sv-splash-geo.deep { background: var(--sv-pink-deep); }
-.sv-splash-geo.black { background: var(--sv-ink); }
-.sv-splash-geo.soft { background: var(--sv-ink-soft); }
-@keyframes sv-splash-float {
-  0%, 100% { transform: translate(0, 0) rotate(0deg); }
-  33% { transform: translate(12px, -18px) rotate(90deg); }
-  66% { transform: translate(-10px, 12px) rotate(180deg); }
-}
-.sv-splash-geo.f1 { width: 24px; height: 24px; top: -40px; left: -50px; animation: sv-splash-float 3s ease-in-out infinite; }
-.sv-splash-geo.f2 { width: 16px; height: 16px; bottom: -30px; right: -40px; animation: sv-splash-float 2.5s ease-in-out infinite 0.5s; }
-.sv-splash-geo.f3 { width: 12px; height: 12px; top: 15px; right: -60px; animation: sv-splash-float 3.5s ease-in-out infinite 1s; }
 
 /* 主界面淡入 */
 .sv-app-enter {
@@ -1494,7 +1928,7 @@ input[type="range"].sv-range::-moz-range-thumb {
   align-items: center;
   gap: 10px;
   padding: 10px 12px;
-  border: 2px solid var(--sv-ink);
+  border: var(--bw-thin) solid var(--sv-ink);
   background: var(--sv-white);
 }
 .sv-plugin-item:hover { background: var(--sv-pink-light); }
@@ -1507,7 +1941,7 @@ input[type="range"].sv-range::-moz-range-thumb {
 .sv-plugin-empty {
   text-align: center;
   padding: 30px 16px;
-  border: 2px dashed var(--sv-line);
+  border: var(--bw-thin) dashed var(--sv-line);
   color: var(--sv-ink-faint);
 }
 .sv-plugin-empty-icon { font-size: 26px; display: block; margin-bottom: 6px; }
@@ -1516,7 +1950,7 @@ input[type="range"].sv-range::-moz-range-thumb {
 
 .sv-plugin-cards { display: flex; flex-direction: column; gap: 10px; margin-top: 8px; }
 .sv-plugin-card {
-  border: 2px solid var(--sv-ink);
+  border: var(--bw) solid var(--sv-ink);
   background: var(--sv-white);
   padding: 14px;
 }
@@ -1530,19 +1964,19 @@ input[type="range"].sv-range::-moz-range-thumb {
   flex-shrink: 0;
   font-size: 11px;
   padding: 2px 8px;
-  color: var(--sv-green);
-  border: 2px solid var(--sv-green);
+  color: var(--sv-green-deep);
+  border: var(--bw-thin) solid var(--sv-green);
 }
 .sv-plugin-features { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
 .sv-chip {
   font-size: 11.5px;
   padding: 3px 8px;
-  border: 2px solid var(--sv-line);
+  border: var(--bw-thin) solid var(--sv-line);
   color: var(--sv-ink-dim);
   background: var(--sv-white);
 }
 .sv-chip:not(.off) {
-  color: var(--sv-green);
+  color: var(--sv-green-deep);
   border-color: var(--sv-green);
 }
 .sv-chip.off { opacity: 0.4; text-decoration: line-through; }
@@ -1551,16 +1985,16 @@ input[type="range"].sv-range::-moz-range-thumb {
 .sv-ctx-mask {
   position: fixed;
   inset: 0;
-  z-index: 60;
+  z-index: var(--z-ctx);
   background: transparent;
 }
 .sv-ctx-menu {
   position: fixed;
   width: 164px;
-  z-index: 61;
+  z-index: var(--z-ctx-menu);
   background: var(--sv-white);
-  border: 3px solid var(--sv-ink);
-  box-shadow: 6px 6px 0 rgba(0, 0, 0, 0.15);
+  border: var(--bw-heavy) solid var(--sv-ink);
+  box-shadow: var(--shadow-ctx);
   padding: 4px;
 }
 .sv-ctx-title {
@@ -1569,7 +2003,7 @@ input[type="range"].sv-range::-moz-range-thumb {
   letter-spacing: 0.06em;
   padding: 8px 10px 6px;
   color: var(--sv-ink-faint);
-  border-bottom: 2px solid var(--sv-line);
+  border-bottom: var(--bw-thin) solid var(--sv-line);
   margin-bottom: 4px;
   white-space: nowrap;
   overflow: hidden;
@@ -1613,7 +2047,7 @@ input[type="range"].sv-range::-moz-range-thumb {
 .sv-wb-ops { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
 .sv-wb-select {
   max-width: 150px;
-  border: 2px solid var(--sv-ink);
+  border: var(--bw-thin) solid var(--sv-ink);
   background: var(--sv-white);
   padding: 5px 8px;
   font-size: 11.5px;
@@ -1627,11 +2061,11 @@ input[type="range"].sv-range::-moz-range-thumb {
   font-size: 10.5px;
   font-weight: 600;
   color: var(--sv-ink-soft);
-  border: 2px solid var(--sv-line);
+  border: var(--bw-thin) solid var(--sv-line);
   white-space: nowrap;
 }
 .sv-tag-muted { color: var(--sv-ink-faint); }
-.sv-tag-on { color: var(--sv-green); border-color: var(--sv-green); }
+.sv-tag-on { color: var(--sv-green-deep); border-color: var(--sv-green); }
 .sv-tag-off { color: var(--sv-red); border-color: var(--sv-red); }
 .sv-btn-on { border-color: var(--sv-pink-deep); background: var(--sv-pink-light); }
 /* 自动分配机制自检面板 */
@@ -1641,7 +2075,7 @@ input[type="range"].sv-range::-moz-range-thumb {
   align-items: flex-start;
   gap: 8px;
   padding: 6px 10px;
-  border: 2px solid var(--sv-line);
+  border: var(--bw-thin) solid var(--sv-line);
   background: var(--sv-white);
   font-size: 11.5px;
   line-height: 1.6;
@@ -1656,10 +2090,10 @@ input[type="range"].sv-range::-moz-range-thumb {
   color: var(--sv-ink);
   margin-bottom: 8px;
   padding-bottom: 6px;
-  border-bottom: 2px solid var(--sv-line);
+  border-bottom: var(--bw-thin) solid var(--sv-line);
 }
 .sv-wb-entry {
-  border: 2px solid var(--sv-ink);
+  border: var(--bw) solid var(--sv-ink);
   margin-bottom: 8px;
   overflow: hidden;
 }
@@ -1669,7 +2103,7 @@ input[type="range"].sv-range::-moz-range-thumb {
   gap: 8px;
   padding: 8px 10px;
   background: var(--sv-paper);
-  border-bottom: 2px solid var(--sv-ink);
+  border-bottom: var(--bw-thin) solid var(--sv-ink);
   font-size: 12px;
   flex-wrap: wrap;
 }
@@ -1696,7 +2130,7 @@ input[type="range"].sv-range::-moz-range-thumb {
   line-height: 1.6;
   color: var(--sv-blue);
   background: rgba(30, 58, 138, 0.05);
-  border-bottom: 2px dashed var(--sv-line);
+  border-bottom: var(--bw-thin) dashed var(--sv-line);
   font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
   overflow-x: auto;
 }
@@ -1707,7 +2141,7 @@ input[type="range"].sv-range::-moz-range-thumb {
   flex-direction: column;
   gap: 8px;
   padding: 10px;
-  border: 2px solid var(--sv-ink);
+  border: var(--bw) solid var(--sv-ink);
   background: var(--sv-paper);
 }
 .sv-wb-edit .sv-wb-entry { margin-bottom: 0; }
@@ -1718,7 +2152,7 @@ input[type="range"].sv-range::-moz-range-thumb {
   align-items: center;
   gap: 8px;
   padding: 6px 10px;
-  border-bottom: 2px dashed var(--sv-line);
+  border-bottom: var(--bw-thin) dashed var(--sv-line);
 }
 .sv-wb-field-tag {
   flex-shrink: 0;
@@ -1765,17 +2199,16 @@ input[type="range"].sv-range::-moz-range-thumb {
 .sv-msg-bubble.sv-msg-md p { margin: 0.55em 0; }
 
 /* ===== 远程资源界面卡片($('body').load(...) 沙箱 iframe) ===== */
+/* 纯展示容器:按阴影规则不挂投影(硬边由全局 [class*="sv-"] 规则保证) */
 .sv-resource-card {
   display: flex;
   flex-direction: column;
   width: 100%;
   max-width: 640px;
   margin: 4px 0;
-  border: 2px solid var(--sv-ink, #141414);
-  border-radius: 0;
+  border: var(--bw) solid var(--sv-ink, #141414);
   overflow: hidden;
   background: var(--sv-white, #fff);
-  box-shadow: var(--shadow-card);
 }
 .sv-resource-card-head {
   display: flex;
@@ -1809,6 +2242,38 @@ input[type="range"].sv-range::-moz-range-thumb {
   opacity: 0.55;
   border-top: 1px solid var(--sv-line, rgba(128, 128, 128, 0.2));
 }
+.sv-resource-card-side {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.sv-resource-card-wide {
+  font: inherit;
+  font-size: 12px;
+  color: inherit;
+  background: none;
+  border: 1px solid var(--sv-line, rgba(128, 128, 128, 0.4));
+  padding: 1px 8px;
+  cursor: pointer;
+  opacity: 0.7;
+}
+.sv-resource-card-wide:hover { opacity: 1; }
+/* 宽屏态:整卡 fixed 撑满视口(作者页游戏界面为全屏设计,沙箱 iframe 的
+   撑满样式进不了宿主文档,由宿主补足);head/note 保留,iframe flex 填满其余 */
+.sv-resource-card[data-kd-wide="1"] {
+  position: fixed;
+  inset: 0;
+  z-index: var(--z-resource-wide);
+  max-width: none;
+  margin: 0;
+  border: 0;
+}
+.sv-resource-card[data-kd-wide="1"] .sv-resource-card-frame {
+  flex: 1;
+  height: auto;
+  min-height: 0;
+}
+.sv-resource-card[data-kd-wide="1"] .sv-resource-card-note { display: none; }
 .sv-msg-bubble.sv-msg-md h1,
 .sv-msg-bubble.sv-msg-md h2,
 .sv-msg-bubble.sv-msg-md h3,
@@ -1816,6 +2281,7 @@ input[type="range"].sv-range::-moz-range-thumb {
   margin: 0.9em 0 0.45em;
   line-height: 1.3;
   font-weight: 800;
+  letter-spacing: 0.01em;
 }
 .sv-msg-bubble.sv-msg-md h1 { font-size: 1.3em; }
 .sv-msg-bubble.sv-msg-md h2 { font-size: 1.18em; }
@@ -1828,7 +2294,7 @@ input[type="range"].sv-range::-moz-range-thumb {
 }
 .sv-msg-bubble.sv-msg-md ul { list-style: disc; }
 .sv-msg-bubble.sv-msg-md ol { list-style: decimal; }
-.sv-msg-bubble.sv-msg-md li { margin: 0.22em 0; }
+.sv-msg-bubble.sv-msg-md li { margin: 0.28em 0; }
 .sv-msg-bubble.sv-msg-md blockquote {
   margin: 0.6em 0;
   padding: 0.3em 0.9em;
@@ -1863,7 +2329,7 @@ input[type="range"].sv-range::-moz-range-thumb {
 .sv-msg-bubble.sv-msg-md a {
   color: var(--sv-blue);
   text-decoration: underline;
-  text-underline-offset: 2px;
+  text-underline-offset: 3px;
 }
 .sv-msg-bubble.sv-msg-md table {
   border-collapse: collapse;
@@ -1872,7 +2338,7 @@ input[type="range"].sv-range::-moz-range-thumb {
 }
 .sv-msg-bubble.sv-msg-md th,
 .sv-msg-bubble.sv-msg-md td {
-  border: 2px solid var(--sv-line);
+  border: var(--bw-thin) solid var(--sv-line);
   padding: 0.35em 0.7em;
   text-align: left;
 }
@@ -1882,7 +2348,7 @@ input[type="range"].sv-range::-moz-range-thumb {
 }
 .sv-msg-bubble.sv-msg-md hr {
   border: none;
-  border-top: 2px solid var(--sv-line);
+  border-top: var(--bw-thin) solid var(--sv-line);
   margin: 0.8em 0;
 }
 .sv-msg-bubble.sv-msg-md img {
@@ -1898,7 +2364,7 @@ input[type="range"].sv-range::-moz-range-thumb {
   gap: 6px;
   align-items: center;
   padding: 8px;
-  border: 2px solid var(--sv-ink);
+  border: var(--bw-thin) solid var(--sv-ink);
   background: var(--sv-white);
 }
 .floor-row.dragging { opacity: 0.4; border-style: dashed; }
@@ -1916,11 +2382,22 @@ input[type="range"].sv-range::-moz-range-thumb {
   gap: 6px;
   align-items: center;
   padding: 8px;
-  border: 2px solid var(--sv-ink);
+  border: var(--bw-thin) solid var(--sv-ink);
   background: var(--sv-white);
 }
 .flow-row.dragging { opacity: 0.4; border-style: dashed; }
 .flow-row .sv-input, .flow-row .sv-select { font-size: 12px; }
+/* 流程库操作按钮组(选择/新建/复制/删除):桌面保持 display:contents —— 子按钮仍是
+   .sv-inp-row 的直接 flex 项,布局与加这个 wrapper 之前逐像素一致;
+   手机端(媒体查询内)才让它整体换行,给流程下拉让出整行宽度。 */
+.flow-lib-actions { display: contents; }
+/* 「流程名称 / 说明」两组字段:桌面同样 display:contents —— 四个子元素(label/input 各二)
+   仍是 .sv-inp-row 的直接 flex 项,桌面单行布局不变;
+   手机端(媒体查询内)每组各自成行,避免「说明」标签孤零零留在上一行末尾。 */
+.flow-meta-pair { display: contents; }
+/* 桌面:复刻原来内联 style="padding-top:8px" 的视觉效果(说明标签略微下移);
+   手机端用 .flow-meta-pair > .sv-inp-tag(0-2-0)覆盖为 0,无需 !important。 */
+.flow-meta-gap { padding-top: 8px; }
 .flow-edit {
   grid-column: 1 / -1;
   display: flex;
@@ -1928,7 +2405,7 @@ input[type="range"].sv-range::-moz-range-thumb {
   gap: 8px;
   margin-top: 4px;
   padding: 10px 0 2px 18px;
-  border-top: 2px dashed var(--sv-line);
+  border-top: var(--bw-thin) dashed var(--sv-line);
 }
 .flow-edit .sv-inp-row { align-items: flex-start; }
 .flow-edit .sv-inp-tag { padding-top: 7px; }
@@ -1942,7 +2419,7 @@ input[type="range"].sv-range::-moz-range-thumb {
 .sv-modal-wide { width: min(860px, calc(100vw - 48px)); max-height: min(86vh, 760px); }
 .pm-summary {
   padding: 10px;
-  border: 2px solid var(--sv-ink);
+  border: var(--bw-thin) solid var(--sv-ink);
   background: var(--sv-white);
   font-size: 12px;
   line-height: 1.7;
@@ -1952,7 +2429,7 @@ input[type="range"].sv-range::-moz-range-thumb {
 .pm-fixed { opacity: 0.6; font-style: italic; }
 .pm-disabled { opacity: 0.4; }
 .pm-book {
-  border: 2px solid var(--sv-ink);
+  border: var(--bw) solid var(--sv-ink);
   overflow: hidden;
 }
 .pm-book-head {
@@ -1966,14 +2443,14 @@ input[type="range"].sv-range::-moz-range-thumb {
 .pm-book-head:hover { background: var(--sv-pink-light); }
 .pm-book-name { font-weight: 600; font-size: 13px; flex-shrink: 0; }
 .pm-book-caret { margin-left: auto; color: var(--sv-ink-faint); font-size: 12px; }
-.pm-book-body { padding: 8px 10px; border-top: 2px solid var(--sv-ink); display: flex; flex-direction: column; gap: 6px; }
+.pm-book-body { padding: 8px 10px; border-top: var(--bw-thin) solid var(--sv-ink); display: flex; flex-direction: column; gap: 6px; }
 .pm-group-title { font-size: 12px; font-weight: 600; opacity: 0.8; margin-top: 2px; }
 .pm-entry-row {
   display: flex;
   align-items: center;
   gap: 6px;
   padding: 5px 6px;
-  border: 2px solid var(--sv-line);
+  border: var(--bw-thin) solid var(--sv-line);
   font-size: 12px;
 }
 .pm-entry-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -2037,18 +2514,20 @@ input[type="range"].sv-range::-moz-range-thumb {
   position: fixed;
   right: 16px;
   bottom: 16px;
-  z-index: 40;
+  z-index: var(--z-toggle);
   width: 40px;
   height: 40px;
-  border: 2px solid var(--sv-ink);
+  border: var(--bw-thin) solid var(--sv-ink);
   background: var(--sv-ink);
   color: var(--sv-white);
-  font-size: 18px;
-  line-height: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
   cursor: pointer;
   box-shadow: var(--shadow-card);
   transition: transform var(--transition-fast), box-shadow var(--transition-fast), background var(--transition-fast);
 }
+.sv-audio-toggle svg { width: 18px; height: 18px; }
 .sv-audio-toggle:hover {
   background: var(--sv-pink-deep);
   border-color: var(--sv-ink);
@@ -2065,13 +2544,13 @@ input[type="range"].sv-range::-moz-range-thumb {
   position: fixed;
   right: 16px;
   bottom: 16px;
-  z-index: 40;
+  z-index: var(--z-toggle);
 }
 .sv-audio-panel {
   width: 320px;
   max-width: calc(100vw - 32px);
   background: var(--sv-surface);
-  border: 2px solid var(--sv-ink);
+  border: var(--bw) solid var(--sv-ink);
   box-shadow: var(--shadow-hover);
 }
 .sv-audio-panel.collapsed {
@@ -2091,7 +2570,11 @@ input[type="range"].sv-range::-moz-range-thumb {
 }
 .sv-audio-title {
   font-weight: 600;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
 }
+.sv-audio-title svg { width: 13px; height: 13px; }
 .sv-audio-mini {
   border: none;
   background: transparent;
@@ -2118,7 +2601,7 @@ input[type="range"].sv-range::-moz-range-thumb {
   cursor: pointer;
   color: var(--sv-ink);
   opacity: 0.65;
-  border-bottom: 2px solid transparent;
+  border-bottom: var(--bw-thin) solid transparent;
 }
 .sv-audio-tab.active {
   opacity: 1;
@@ -2220,17 +2703,16 @@ input[type="range"].sv-range::-moz-range-thumb {
 }
 
 /* ===== 消息渲染面板(阶段五 5b,TH-render 等价物) ===== */
+/* 纯展示容器:按阴影规则不挂投影(硬边由全局 [class*="sv-"] 规则保证) */
 .sv-render-panel {
   display: flex;
   flex-direction: column;
   width: 100%;
   max-width: 640px;
   margin: 4px 0;
-  border: 2px solid var(--sv-ink, #141414);
-  border-radius: 0;
+  border: var(--bw) solid var(--sv-ink, #141414);
   overflow: hidden;
   background: var(--sv-white, #fff);
-  box-shadow: var(--shadow-card);
 }
 .sv-render-panel-head {
   display: flex;
@@ -2285,11 +2767,11 @@ input[type="range"].sv-range::-moz-range-thumb {
 /* 模态开合:遮罩淡入淡出,面板上浮 + 轻缩放(Vue <Transition name="sv-modal">) */
 .sv-modal-enter-active,
 .sv-modal-leave-active {
-  transition: opacity 0.18s ease;
+  transition: opacity var(--dur-normal) var(--ease-standard);
 }
 .sv-modal-enter-active .sv-modal,
 .sv-modal-leave-active .sv-modal {
-  transition: transform 0.18s ease;
+  transition: transform var(--dur-normal) var(--ease-out);
 }
 .sv-modal-enter-from,
 .sv-modal-leave-to {
@@ -2298,6 +2780,37 @@ input[type="range"].sv-range::-moz-range-thumb {
 .sv-modal-enter-from .sv-modal,
 .sv-modal-leave-to .sv-modal {
   transform: translateY(8px) scale(0.98);
+}
+
+/* 顶层模式切换(角色扮演 ↔ 任务):中间区整体淡入淡出 + 水平位移。
+   只动 transform / opacity,符合克制档动效规范,自动被 prefers-reduced-motion 降级。 */
+.sv-mode-enter-active,
+.sv-mode-leave-active {
+  transition: opacity var(--dur-slow) var(--ease-standard), transform var(--dur-slow) var(--ease-out);
+}
+.sv-mode-enter-from {
+  opacity: 0;
+  transform: translateX(-18px);
+}
+.sv-mode-leave-to {
+  opacity: 0;
+  transform: translateX(18px);
+}
+
+/* 侧栏角色列表 ↔ 任务导航的淡入淡出 */
+.sv-fade-enter-active,
+.sv-fade-leave-active {
+  transition: opacity var(--dur-normal) var(--ease-standard);
+}
+.sv-fade-enter-from,
+.sv-fade-leave-to {
+  opacity: 0;
+}
+
+/* 任务详情区入场:挂载时淡入 */
+@keyframes sv-task-detail-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
 }
 
 /* 无障碍:用户偏好减少动效时,全部动效即时完成 */
@@ -2309,4 +2822,1296 @@ input[type="range"].sv-range::-moz-range-thumb {
     animation-iteration-count: 1 !important;
     transition-duration: 0.01ms !important;
   }
+}
+
+/* ===== 任务模式(至上主义 × 结构主义) ===== */
+
+/* 侧栏顶层模式切换:角色扮演 / 任务(大号双态,黑框直角 + 几何装饰) */
+.sv-appmode {
+  display: flex;
+  margin: 10px 12px 4px;
+  border: var(--bw) solid var(--sv-ink);
+  overflow: hidden;
+  flex-shrink: 0;
+  box-shadow: var(--shadow-card);
+}
+.sv-appmode button {
+  flex: 1;
+  padding: 10px 4px;
+  font-size: 12.5px;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  border: none;
+  background: var(--sv-white);
+  color: var(--sv-ink);
+  cursor: pointer;
+  transition: background var(--transition-fast);
+}
+.sv-appmode button.active {
+  background: var(--sv-ink-supreme);
+  color: var(--sv-white);
+}
+.sv-appmode button:not(.active):hover {
+  background: var(--sv-pink-light);
+}
+
+/* 任务工作台:详情区占满(下达目标与任务历史在左侧 Sidebar 内) */
+.sv-taskboard {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  background: var(--sv-paper);
+}
+
+/* 下达目标 + 任务历史(嵌于 Sidebar 260px 窄栏,水平内边距由外层容器提供) */
+.sv-task-new {
+  padding: var(--space-3) 0;
+  border-bottom: var(--bw) solid var(--sv-ink);
+}
+.sv-task-new-title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  margin-bottom: 8px;
+  color: var(--sv-ink-soft);
+}
+.sv-task-new-title::before {
+  content: '';
+  width: 10px;
+  height: 10px;
+  background: var(--sv-ink-supreme);
+  display: inline-block;
+}
+
+.sv-task-list-head {
+  padding: 12px 0 6px;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  color: var(--sv-ink-faint);
+}
+
+.sv-task-list {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 0 0 12px;
+}
+.sv-task-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 9px 10px;
+  margin-bottom: 4px;
+  border: var(--bw-thin) solid var(--sv-line-strong);
+  background: var(--sv-white);
+  color: var(--sv-ink);
+  cursor: pointer;
+  text-align: left;
+  font-size: 12px;
+  transition: all var(--transition-fast);
+  box-shadow: var(--shadow-card); /* 阴影规则:可点卡片静态挂 card 影 */
+}
+.sv-task-item:hover {
+  border-color: var(--sv-pink-deep);
+  box-shadow: var(--shadow-hover); /* hover 升 hover 影(原粉强调影让位统一规则) */
+}
+.sv-task-item.active {
+  border-color: var(--sv-ink);
+  box-shadow: var(--shadow-sunk);
+  background: var(--sv-pink-light);
+}
+.sv-task-item-title {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 600;
+}
+.sv-task-item-meta {
+  flex-shrink: 0;
+  font-size: 10.5px;
+  color: var(--sv-ink-faint);
+}
+.sv-task-item-del {
+  flex-shrink: 0;
+  color: var(--sv-red);
+  font-size: 12px;
+  padding: 0 2px;
+}
+.sv-task-item-del:hover { color: var(--sv-ink); }
+
+.sv-task-detail {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 20px clamp(20px, 4vw, 48px);
+  animation: sv-task-detail-in 0.32s ease;
+  /* 批次 5:与聊天画布同款的红黑双色段带(--sv-top-stripe 单一来源);
+     实跑问题 6:同样下移 4px 让开顶栏回声阴影 */
+  background-image: var(--sv-top-stripe);
+  background-repeat: no-repeat;
+  background-size: 100% 5px;
+  background-position: 0 4px;
+}
+
+.sv-task-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 12px;
+}
+.sv-task-head-title {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-family: var(--font-display);
+  font-size: 18px;
+  letter-spacing: 0.05em; /* 批次 5:加宽字距,海报标题节奏 */
+  line-height: 1.4;
+}
+.sv-task-head-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+.sv-task-status-line {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 20px;
+}
+
+.sv-task-usage {
+  font-size: 12px;
+  color: var(--sv-ink-soft, #666);
+}
+
+.sv-task-section {
+  margin-bottom: 24px;
+}
+.sv-task-section-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-family: var(--font-display); /* 批次 5:区块小标题也入海报字族(中文自动回退 sans) */
+  font-size: 12px;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  color: var(--sv-ink-soft);
+  padding-bottom: 8px;
+  margin-bottom: 10px;
+  border-bottom: var(--rule-strong); /* 粗网格分隔:3px 印刷黑 */
+}
+.sv-task-section-title::before {
+  content: '';
+  width: 10px;
+  height: 10px;
+  background: var(--sv-red);
+  display: inline-block;
+  transform: rotate(45deg);
+}
+
+.sv-task-step {
+  display: flex;
+  gap: 12px;
+  padding: 12px 14px;
+  margin-bottom: 8px;
+  border: var(--bw-thin) solid var(--sv-line-strong);
+  background: var(--sv-white);
+}
+.sv-task-step-idx {
+  flex-shrink: 0;
+  width: 24px;
+  height: 24px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-family: var(--font-display);
+  font-size: 12px;
+  color: var(--sv-white);
+  background: var(--sv-ink);
+}
+.sv-task-step-idx.done { background: var(--sv-green); }
+.sv-task-step-idx.active { background: var(--sv-yellow); color: var(--sv-ink); }
+/* partial 是终态:橙系与「进行中」黄区分(实跑问题 2 观感修复) */
+.sv-task-step-idx.partial { background: var(--sv-orange); }
+.sv-task-step-idx.error { background: var(--sv-red); }
+.sv-task-step-body { flex: 1; min-width: 0; }
+.sv-task-step-name {
+  font-size: 13px;
+  font-weight: 700;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+/* 步骤目标行(plan 模式批准前审阅计划的关键内容;批次 5 token:弱墨色 + 紧凑行距) */
+.sv-task-step-goal {
+  margin-top: 4px;
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--sv-ink-soft);
+}
+.sv-task-step-result {
+  margin-top: 8px;
+  font-size: 13px;
+  line-height: 1.7;
+  color: var(--sv-ink-soft);
+}
+.sv-task-step-result p { margin: 0.4em 0; }
+
+.sv-task-subtask {
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+  padding: 9px 12px;
+  margin-bottom: 6px;
+  border-left: 4px solid var(--sv-line-strong);
+  background: var(--sv-surface-elevated);
+}
+.sv-task-subtask-body { flex: 1; min-width: 0; }
+.sv-task-subtask-name {
+  font-size: 12px;
+  font-weight: 600;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.sv-task-error {
+  color: var(--sv-red-deep);
+  font-size: 12px;
+  margin-top: 4px;
+}
+
+.sv-task-result {
+  padding: 16px 18px;
+  border: var(--bw) solid var(--sv-ink);
+  background: var(--sv-white);
+  font-size: 14px;
+  line-height: 1.8;
+  box-shadow: var(--shadow-hard); /* 批次 5:成果卡为任务流英雄元素,实黑硬投影 */
+}
+.sv-task-result h1,
+.sv-task-result h2,
+.sv-task-result h3 {
+  font-family: var(--font-display);
+  letter-spacing: 0.02em;
+  margin: 0.8em 0 0.4em;
+}
+.sv-task-result p { margin: 0.5em 0; }
+.sv-task-result pre {
+  background: var(--sv-surface);
+  border: 1px solid var(--sv-line-strong);
+  padding: 10px 12px;
+  overflow-x: auto;
+}
+.sv-task-result code {
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+
+/* ===== 批次 R4 流式输出:「正在生成」块(流式期间纯文本 + 光标,落库后消失) ===== */
+.sv-task-live-text {
+  padding: 14px 16px;
+  border: 1px dashed var(--sv-line-strong);
+  background: var(--sv-surface);
+  font-size: 14px;
+  line-height: 1.8;
+  white-space: pre-wrap; /* 纯文本保留换行(流式期间不跑 markdown) */
+  word-break: break-word;
+  color: var(--sv-ink);
+}
+
+/* ===== 批次 4 六模式:批准区 / 模式提示 / team 分工卡 / 计划简易编辑 ===== */
+/* plan 模式批准区(计划待批准);批次 5:边框跟随 --bw 升级 + 实黑硬投影(关键 CTA 英雄元素) */
+.sv-task-approve {
+  margin-bottom: 24px;
+  padding: 12px 14px;
+  border: var(--bw) solid var(--sv-yellow);
+  background: var(--sv-surface-elevated);
+  box-shadow: var(--shadow-hard);
+}
+.sv-task-approve .sv-task-section-title {
+  border-bottom-color: var(--sv-yellow);
+}
+.sv-task-approve-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+/* solo / multi 模式:调用情况面板入口提示行 */
+.sv-task-hint {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-bottom: 20px;
+  padding: 9px 12px;
+  border: var(--bw-thin) solid var(--sv-line-strong);
+  background: var(--sv-surface-elevated);
+}
+.sv-task-hint-text {
+  flex: 1;
+  min-width: 0;
+  font-size: 12px;
+  color: var(--sv-ink-soft);
+}
+
+/* team 模式:分工卡(按「【主Agent-N】」前缀分组);批次 5:边框跟随 --bw 升级;
+   第二轮:纯展示容器,按阴影规则摘除投影 */
+.sv-task-team-card {
+  margin-bottom: 12px;
+  border: var(--bw) solid var(--sv-ink);
+  background: var(--sv-white);
+}
+.sv-task-team-agent {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  font-size: 12px;
+  font-weight: 800;
+  letter-spacing: 0.04em;
+  border-bottom: var(--bw-thin) solid var(--sv-line);
+  background: var(--sv-surface-elevated);
+}
+/* team 分工卡内步骤:左右留 8px,竖向间距与默认一致(下 8px、上 0),
+   否则 8px 上边距会把「步骤下端 → 下一项」的连线断在半空(实跑问题 3)。 */
+.sv-task-team-card .sv-task-step {
+  margin: 0 8px 8px;
+  border-color: var(--sv-line-strong);
+  box-shadow: none;
+}
+.sv-task-team-card .sv-task-team-agent + .sv-task-step { margin-top: 8px; }
+
+/* plan 模式「修改后批准」:计划简易编辑行(序号 + 名称/目标两个输入框) */
+.sv-task-plan-edit {
+  display: flex;
+  gap: 12px;
+  padding: 8px 0;
+}
+.sv-task-plan-edit-body {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.sv-task-plan-edit .sv-input { width: 100%; }
+
+/* team 模式:审计结论卡(复用 sv-task-result,左边条强调) */
+.sv-task-audit { border-left: 6px solid var(--sv-pink-deep); }
+
+/* plan 模式(批次 R1):最终计划卡(同族左边条强调,用至上主义蓝与审计结论卡区分);
+   批准区内待批准计划清单(与按钮组留距) */
+.sv-task-final-plan { border-left: 6px solid var(--sv-blue); }
+.sv-task-planned-plan { margin: 10px 0; }
+
+/* 任务空态复用 .sv-empty-geo 几何构成 */
+.sv-task-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  color: var(--sv-ink-faint);
+  padding: 32px 16px;
+}
+
+/* 任务状态色块:结构主义三原色语义 */
+.sv-supreme.done { background: var(--sv-green); }
+.sv-supreme.active { background: var(--sv-yellow); }
+/* partial(部分完成)是终态:橙系与「进行中」黄区分(实跑问题 2 观感修复) */
+.sv-supreme.partial { background: var(--sv-orange); }
+.sv-supreme.error { background: var(--sv-red); }
+.sv-supreme.pending { background: var(--sv-line-strong); }
+
+.sv-tag.done { color: var(--sv-green-deep); border-color: var(--sv-green); }
+.sv-tag.active { color: var(--sv-yellow-deep); border-color: var(--sv-yellow); }
+/* partial(部分完成)是终态,与「进行中」的 active 黄区分:橙系表示「已结束但未达标」 */
+.sv-tag.partial { color: var(--sv-orange); border-color: var(--sv-orange); }
+.sv-tag.error { color: var(--sv-red-deep); border-color: var(--sv-red); }
+.sv-tag.pending { color: var(--sv-ink-faint); border-color: var(--sv-line-strong); }
+.sv-tag.sm { font-size: 9.5px; padding: 1px 6px; }
+
+/* ===== 构成主义深化:ChatInput 向上弹层公共类 ===== */
+.sv-popover {
+  position: absolute;
+  bottom: calc(100% + 8px);
+  left: 0;
+  right: 0;
+  z-index: var(--z-popover);
+  border: var(--bw) solid var(--sv-ink);
+  background: var(--sv-white);
+  box-shadow: var(--shadow-sunk);
+  max-height: 260px;
+  overflow-y: auto;
+}
+/* 右对齐变体(快速回复下拉:锚右缘 + 最小宽度) */
+.sv-popover-right {
+  left: auto;
+  min-width: 240px;
+}
+
+/* 模型选择:去原生外观 + 自绘直角黑三角下拉箭头 */
+.sv-model-select {
+  -webkit-appearance: none;
+  appearance: none;
+  border: var(--bw) solid var(--sv-ink);
+  background: var(--sv-white);
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 8 8'%3E%3Cpolygon points='0,0 8,0 4,8' fill='%23141414'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 7px center;
+  padding: 5px 22px 5px 8px;
+  font-size: 12px;
+  color: var(--sv-ink);
+  cursor: pointer;
+}
+
+/* 模式按钮编号色点 */
+.sv-mode-idx {
+  font-family: var(--font-display);
+  font-size: 9px;
+  color: var(--sv-pink-deep);
+  margin-right: 4px;
+  letter-spacing: 0.05em;
+}
+/* active(黑底)态:编号用淡粉,保证黑底上的可读性 */
+.sv-mode button.active .sv-mode-idx {
+  color: var(--sv-pink);
+}
+
+/* ===== 构成主义深化:AudioPlayer 线性图标 ===== */
+.sv-audio-btn svg,
+.sv-audio-mini svg {
+  width: 16px;
+  height: 16px;
+  display: inline-block;
+  vertical-align: -3px;
+}
+
+/* ============================================================
+   构成主义深化:AgentPanel
+   工具入参/出参折叠卡 + 状态徽章 + 时间线当前步脉动
+   ============================================================ */
+
+/* 工具入参/出参折叠卡:细线边框容器 + 小号直角 toggle 按钮 */
+.sv-tool-io {
+  position: relative; /* 底部渐隐遮罩的定位上下文 */
+  border: 1px solid var(--sv-line-strong);
+  margin-top: 6px;
+}
+/* toggle + 复制按钮行 */
+.sv-tool-io-bar { display: flex; align-items: stretch; }
+.sv-tool-io-toggle {
+  font-size: 10px;
+  color: var(--sv-ink-dim);
+  background: var(--sv-pink-light);
+  border: none;
+  padding: 2px 6px;
+  cursor: pointer;
+  font-weight: 700;
+}
+.sv-tool-io-toggle:hover { color: var(--sv-ink); background: var(--sv-pink); }
+/* 复制按钮:复制完整 JSON(截断渐隐时不丢数据) */
+.sv-tool-io-copy {
+  margin-left: auto;
+  font-size: 10px;
+  font-weight: 700;
+  color: var(--sv-ink-dim);
+  background: transparent;
+  border: none;
+  border-left: 1px solid var(--sv-line-strong);
+  padding: 2px 8px;
+  cursor: pointer;
+}
+.sv-tool-io-copy:hover { color: var(--sv-ink); background: var(--sv-pink-light); }
+/* 用 .sv-tool-io .sv-tool-io-body 提升特异性,覆盖 .sv-tool-panel-card pre 的旧样式 */
+.sv-tool-io .sv-tool-io-body {
+  display: none;
+  max-height: 280px;
+  overflow: auto;
+  background: var(--sv-surface);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  padding: 8px;
+  margin: 0;
+}
+.sv-tool-io.open .sv-tool-io-body { display: block; }
+/* 内容溢出可滚时的底部渐隐(滚到底由 JS 移除;遮罩不拦截滚动) */
+.sv-tool-io.has-scroll::after {
+  content: '';
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 22px;
+  background: linear-gradient(transparent, var(--sv-surface));
+  pointer-events: none;
+}
+
+/* 面板内小字说明(状态详情/错误/空态提示):收编模板内联 10-11px */
+.sv-note-mini { font-size: var(--text-xs); font-weight: 500; color: var(--sv-ink-dim); }
+.sv-note-mini.err { color: var(--sv-red); }
+/* 状态总览「详情」行:value 字号降级(长错误文案可读性) */
+.sv-agent-summary-row .value.detail { font-family: var(--font-body); font-size: var(--text-xs); font-weight: 500; }
+/* 子任务状态字:色值逻辑集中进 CSS(替代模板内联色函数) */
+.sv-subtask-status { margin-left: auto; flex-shrink: 0; font-size: var(--text-2xs); font-weight: 700; color: var(--sv-ink-faint); }
+.sv-subtask-status.active { color: var(--sv-yellow-deep); }
+.sv-subtask-status.done { color: var(--sv-green-deep); }
+.sv-subtask-status.error { color: var(--sv-red); }
+
+/* 状态徽章类族:细边框 + 当前颜色描边,替代内联状态小字 */
+.sv-badge {
+  display: inline-block;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  padding: 1px 6px;
+  border: 1px solid currentColor;
+}
+.sv-badge.pending { color: var(--sv-yellow-deep); }
+.sv-badge.done { color: var(--sv-green-deep); }
+.sv-badge.fail { color: var(--sv-red); }
+.sv-badge.run { color: var(--sv-pink-deep); }
+/* 截断徽标(可观测性:finish_reason=length,响应为半截文本;调用情况 tab 行内/详情各一处):
+   醒目档——海报红 2px 硬边框 + 白底小牌,比 fail(红字细边)高一档,沿用批次 5 token */
+.sv-badge.trunc {
+  color: var(--sv-red-deep);
+  border: var(--bw-thin) solid var(--sv-red);
+  background: var(--sv-white);
+}
+
+/* 时间线当前执行步:粉强调阴影 + 序号方块脉动(仅 transform) */
+.sv-timeline-item.running { box-shadow: var(--shadow-pink); }
+.sv-timeline-item.running::before {
+  animation: sv-tl-pulse 0.9s ease-in-out infinite;
+  transform-origin: center;
+}
+@keyframes sv-tl-pulse {
+  0%, 100% { transform: scale(1); }
+  50% { transform: scale(1.15); }
+}
+
+/* ============================================================
+   构成主义深化:ChatWindow
+   swipe 方形切换按钮 + 顶栏控件分组
+   ============================================================ */
+
+/* swipe 版本切换:方形小按钮(硬偏移阴影按压联动,同 .sv-btn 纪律);
+   阴影规则特例:22px 微型按钮静态挂 --shadow-sm(挂 card 影会压过按钮本体) */
+.sv-swipe-btn {
+  width: 22px;
+  height: 22px;
+  border: 1px solid var(--sv-ink);
+  background: var(--sv-white);
+  color: var(--sv-ink);
+  font-size: 10px;
+  line-height: 1;
+  cursor: pointer;
+  box-shadow: var(--shadow-sm);
+  transition: transform var(--transition-fast), box-shadow var(--transition-fast);
+}
+.sv-swipe-btn:hover:not(:disabled) {
+  transform: translate(-1px, -1px);
+  box-shadow: var(--shadow-raise);
+}
+.sv-swipe-btn:active:not(:disabled) {
+  transform: translate(1px, 1px);
+  box-shadow: none;
+}
+.sv-swipe-btn:disabled { opacity: 0.4; cursor: default; }
+.sv-swipe-count {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--sv-ink-dim);
+  padding: 0 4px;
+}
+
+/* 顶栏右侧控件分组:会话操作 / 渲染开关 两组,细左分隔线 */
+.sv-topbar-group {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding-left: 12px;
+  border-left: var(--bw-thin) solid var(--sv-line);
+}
+.sv-topbar-group:first-child {
+  border-left: none;
+  padding-left: 0;
+}
+
+/* ============================================================
+   构成主义深化:Sidebar
+   底部全宽按钮抽类 + Token 统计仪表感
+   ============================================================ */
+
+/* 底部三按钮:全宽 flex 居中,图标与文字 gap 对齐 */
+.sv-side-btn {
+  width: 100%;
+  padding: 12px;
+  font-size: 13px;
+  letter-spacing: 0.1em;
+  margin-top: 8px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+}
+/* 第一个按钮(综合设置,primary)无上间距,其余按钮 8px 间距 */
+.sv-side-btn:first-child { margin-top: 0; }
+.sv-side-btn-ico {
+  display: inline-flex;
+  align-items: center;
+}
+.sv-side-btn-ico svg {
+  width: 16px;
+  height: 16px;
+  vertical-align: middle;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.7;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+.sv-ctx-item svg {
+  width: 16px;
+  height: 16px;
+  flex-shrink: 0;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.7;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+/* Token 数值:显示字体放大至 16px,仪表感 */
+.sv-tokens .sv-token-cell b {
+  font-family: var(--font-display);
+  font-size: 16px;
+  letter-spacing: 0.02em;
+}
+
+/* ============================================================
+   构成主义深化:TaskBoard
+   计划步骤竖向连线 + 最终成果黑顶线 + 错误文本卡式
+   ============================================================ */
+
+/* 计划步骤方块间竖向连线:从序号方块下端延续到下一项,表达进度。
+   几何对齐(实跑问题 3):卡片 padding 12px 14px + 序号方块 24×24,
+   方块中心 x = 14 + 12 = 26px、下端 y = 12 + 24 = 36px;
+   线宽 2px 故 left = 26 - 1 = 25px。旧值 left:14px/top:28px 既未穿过方块中心、
+   也不在方块下端,卡片被 goal/result 撑高或换行时线头即"飘逸"。 */
+.sv-task-step {
+  position: relative;
+}
+.sv-task-step::before {
+  content: '';
+  position: absolute;
+  top: 36px;
+  bottom: -8px;
+  left: 25px;
+  width: 2px;
+  background: var(--sv-line-strong);
+}
+.sv-task-step:last-child::before { display: none; }
+.sv-task-step.done::before { background: var(--sv-green); }
+.sv-task-step.error::before { background: var(--sv-red); }
+.sv-task-step.active::before {
+  background: var(--sv-pink-deep);
+}
+
+/* 「执行中」呼吸指示收敛到序号方块本身(实跑问题 3):整条竖线做 opacity 呼吸
+   既抢戏又因线定位漂移而显得乱;改为方块的 box-shadow 脉动,定位基准就是方块,
+   天生不会漂。复用 AgentPanel 时间线 running 的脉示范式。 */
+@keyframes sv-idx-breath {
+  0%, 100% { box-shadow: 0 0 0 0 var(--sv-yellow); }
+  50% { box-shadow: 0 0 0 5px rgb(0 0 0 / 0); }
+}
+.sv-task-step-idx.active {
+  animation: sv-idx-breath 1.2s ease-in-out infinite;
+}
+
+/* 最终成果卡:4px 印刷黑顶线强调 */
+.sv-task-result {
+  border-top: 4px solid var(--sv-ink);
+}
+
+/* 错误文本:带红左边线的卡片(构成主义警示节奏) */
+.sv-task-error {
+  padding: 6px 10px;
+  border-left: 3px solid var(--sv-red);
+  background: var(--sv-pink-light);
+  color: var(--sv-red-deep);
+}
+
+/* ===== 构成主义深化:列表入场 stagger(仅 transform/opacity,reduced-motion 已全局降级) ===== */
+@keyframes sv-list-in {
+  from { opacity: 0; transform: translateY(4px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+/* 任务计划步骤:逐项延迟入场。
+   实跑问题 3:原用 :nth-child(N) 会把 section 标题等同级节点算进索引,
+   与视觉顺序错位;改 :nth-of-type 按同类元素计数,顺序稳定。 */
+.sv-task-step { animation: sv-list-in 0.22s ease backwards; }
+.sv-task-step:nth-of-type(1) { animation-delay: 0ms; }
+.sv-task-step:nth-of-type(2) { animation-delay: 40ms; }
+.sv-task-step:nth-of-type(3) { animation-delay: 80ms; }
+.sv-task-step:nth-of-type(4) { animation-delay: 120ms; }
+.sv-task-step:nth-of-type(5) { animation-delay: 160ms; }
+/* Agent 时间线项:同款 stagger */
+.sv-timeline-item { animation: sv-list-in 0.22s ease backwards; }
+.sv-timeline-item:nth-child(1) { animation-delay: 0ms; }
+.sv-timeline-item:nth-child(2) { animation-delay: 40ms; }
+.sv-timeline-item:nth-child(3) { animation-delay: 80ms; }
+.sv-timeline-item:nth-child(4) { animation-delay: 120ms; }
+.sv-timeline-item:nth-child(5) { animation-delay: 160ms; }
+.sv-timeline-item:nth-child(6) { animation-delay: 200ms; }
+
+/* ============================================================
+   收编工具类(2026-08 视觉精修)
+   高频视图模板(Sidebar / ChatWindow / ChatInput / TaskBoard /
+   AgentPanel)行内 style 的收编:sv-supreme 尺寸梯度、空态变体与
+   文案字级、文本域高度梯度、红色停止按钮、弹层锚点与少量间距工具。
+   值一律引用 token / 字阶变量,禁止裸色值。
+   ============================================================ */
+
+/* --- sv-supreme 尺寸梯度(默认 14px;装饰方块按语境缩放) --- */
+.sv-supreme.md { width: 12px; height: 12px; }   /* 顶栏标识(TaskBoard) */
+.sv-supreme.sm { width: 10px; height: 10px; }   /* 顶栏/品牌区标识 */
+.sv-supreme.xs { width: 8px; height: 8px; }     /* 列表行内状态点/面板头(收编自 9px,向 4px 网格靠拢) */
+.sv-supreme.xxs { width: 6px; height: 6px; }    /* Token 内联分隔点 */
+
+/* --- 空态变体:侧栏紧凑版 / 面板区块内嵌版 --- */
+.sv-empty.compact { padding: 40px 12px; }
+.sv-empty.panel { padding: 16px; }
+/* 空态文案字级(主行默认 13px 不变;lead 主标 / sub 次级 / hint 提示) */
+.sv-empty .lead, .sv-task-empty .lead { font-size: var(--text-md); }
+.sv-empty .sub, .sv-task-empty .sub { font-size: var(--text-sm); }
+.sv-empty .hint, .sv-task-empty .hint { font-size: var(--text-xs); }
+/* 空态几何构成·小号(侧栏任务列表空态:方块与对角线整体缩一档) */
+.sv-empty-geo.sm .sq.black { width: 10px; height: 10px; }
+.sv-empty-geo.sm .sq.pink { width: 8px; height: 8px; }
+.sv-empty-geo.sm .diag { top: -8px; right: calc(50% - 22px); width: 20px; height: 2px; }
+/* 空态几何构成·大号黑方块(任务工作台全幅空态) */
+.sv-empty-geo.lg .sq.black { width: 22px; height: 22px; }
+
+/* --- 文本域梯度:纵向缩放 + 宽松行高,配 min-height 档位 --- */
+.sv-area { resize: vertical; line-height: 1.7; }
+.sv-area.xl { min-height: 320px; }  /* 角色提示词主文本 */
+.sv-area.md { min-height: 130px; }  /* 主开场白 */
+.sv-area.sm { min-height: 96px; }   /* 备用开场 */
+
+/* --- 红色停止按钮:生成中/任务执行中的停止态,hover 保持红不转粉 --- */
+.sv-btn-send.stop,
+.sv-btn-send.stop:hover:not(:disabled) {
+  background: var(--sv-red);
+  border-color: var(--sv-red);
+}
+.sv-btn.stop {
+  background: var(--sv-red);
+  border-color: var(--sv-red);
+  color: var(--sv-white);
+}
+
+/* --- 思考中占位气泡:顶线降到 2px(区别于正式角色气泡的 4px 粉顶线) --- */
+.sv-msg.assistant .sv-msg-bubble.thinking { border-top-width: 2px; }
+
+/* --- 任务工作台细节 --- */
+.sv-task-empty.fill { height: 100%; }           /* 未选任务时的全幅居中空态 */
+.sv-task-list-empty {                            /* 侧栏任务历史空态说明 */
+  font-size: var(--text-xs);
+  color: var(--sv-ink-faint);
+  padding: 0 2px 10px;
+  margin: 0;
+}
+
+/* --- 弹层锚点与布局工具 --- */
+.sv-rel { position: relative; }
+.sv-inputbox { position: relative; }             /* slash 联想弹层的定位锚 */
+.sv-model-select { flex: none; width: auto; min-width: 120px; } /* 工具栏内不拉伸 */
+.sv-ml-auto { margin-left: auto; }               /* flex 行内右推 */
+.sv-flex-1 { flex: 1; }                          /* flex 行内弹性占位 */
+
+/* --- 间距工具(4px 网格;覆盖带默认 margin 的基类时依赖本小节位于文件末尾) --- */
+.sv-mt6 { margin-top: 6px; }
+.sv-mt8 { margin-top: 8px; }
+.sv-mt12 { margin-top: 12px; }
+.sv-mt14 { margin-top: 14px; }
+.sv-mt16 { margin-top: 16px; }
+.sv-mb6 { margin-bottom: 6px; }
+.sv-mb12 { margin-bottom: 12px; }
+.sv-mr8 { margin-right: 8px; }
+
+/* --- 侧栏「下达目标」区控件:窄栏内全宽纵向排列 --- */
+.sv-task-new .sv-select { width: 100%; margin-top: 8px; }
+.sv-task-new .sv-btn { width: 100%; margin-top: 10px; }
+
+/* --- 侧栏底部反馈条:在按钮组上方,去掉默认上 margin 改下间距 --- */
+.sv-side-foot .sv-feedback { margin: 0 0 8px; }
+
+/* ===== 批次 R2:任务多轮用户输入(追加指令条 + 用户指令历史) ===== */
+/* 追加指令条:textarea + 发送按钮横排,底边对齐(仿 sv-task-new 轻量输入) */
+.sv-task-followup-bar { display: flex; gap: 8px; align-items: flex-end; }
+.sv-task-followup-bar .sv-input { flex: 1; resize: vertical; }
+.sv-task-followup-bar .sv-btn { flex: none; }
+.sv-task-followup-hint { margin-top: 6px; font-size: 12px; color: var(--sv-ink-soft); opacity: 0.75; }
+/* 追加模式选择(追加 / 重写):轻量内联下拉,置于「追加指令」标题右侧 */
+.sv-task-followup-mode {
+  margin-left: 8px;
+  font-size: 12px;
+  padding: 1px 4px;
+  border: 1px solid var(--sv-line-soft, #d8d3c8);
+  border-radius: 6px;
+  background: var(--sv-surface, transparent);
+  color: var(--sv-ink-soft);
+  cursor: pointer;
+}
+/* 指令历史行:user 气泡复用 .sv-msg.user/.sv-msg-bubble 全局样式;行距收紧(对话区默认 28px 过大) */
+.sv-task-messages .sv-msg { margin-bottom: 10px; }
+.sv-task-msg-kind { margin-right: 6px; }
+/* 对话记录的 assistant 行复用 .sv-msg.assistant/.min-w-0 全局布局(完整 markdown 气泡) */
+.sv-task-messages .sv-msg-name { font-size: 12px; color: var(--sv-ink-faint); margin-bottom: 4px; }
+/* 成果汇总卡展开/收起开关(默认收起:逐轮对话记录已是权威视图) */
+.sv-task-summary-toggle {
+  float: right;
+  border: var(--bw-thin) solid var(--sv-line-strong);
+  background: var(--sv-surface);
+  color: var(--sv-ink-soft);
+  font-size: 11px;
+  padding: 2px 8px;
+  cursor: pointer;
+}
+.sv-task-summary-toggle:hover { border-color: var(--sv-ink); color: var(--sv-ink); }
+/* 批准区「与规划器对话」(R2b):与操作按钮留距,记录区限高滚动 */
+.sv-task-plan-chat { margin-top: 14px; border-top: var(--bw-thin) solid var(--sv-line-strong); padding-top: 10px; }
+.sv-task-plan-chat-title { font-size: 13px; font-weight: 600; margin-bottom: 8px; }
+.sv-task-plan-chat-log { max-height: 260px; overflow-y: auto; margin-bottom: 8px; }
+.sv-task-plan-chat-log .sv-msg { margin-bottom: 10px; }
+
+/* ============================================================================
+   移动端 / 窄屏适配(Android 移植,阶段 4)
+   ----------------------------------------------------------------------------
+   设计原则:
+   1. 全部规则包在 media query 内 —— 桌面端(≥1100px)匹配不到任何一条,
+      渲染结果与移植前逐像素一致,零回归风险。
+   2. 断点与信息架构:
+      - ≥1100px  桌面:沿用原三栏(Sidebar 常驻 + 聊天 + AgentPanel 抽屉)
+      - 768–1099 平板/横屏:三栏收窄,取消 1100px 硬最小宽度(不再横向裁切)
+      - <768px   手机竖屏:三栏改为「抽屉 + 底部导航」,弹窗改全屏 Sheet
+   3. 触摸替代:hover 显示的操作改常显,触摸目标 ≥44px,禁用双击缩放。
+   4. 安全区:viewport-fit=cover 配合 env(safe-area-inset-*) 处理刘海/手势条。
+   ============================================================================ */
+
+/* 抽屉遮罩与底部导航:默认隐藏,仅手机断点启用。
+   基类必须 display:none —— 否则桌面端打开 Agent 面板时会多出一层遮罩。 */
+.sv-drawer-backdrop { display: none; }
+.sv-mobile-nav { display: none; }
+.sv-sidebar-close { display: none; }
+
+/* 触摸设备(无 hover 能力):消息操作按钮由「悬停显示」改为常显。
+   依据 media (hover: none) 而非宽度 —— 触摸笔记本/平板横屏同样适用。 */
+@media (hover: none) {
+  .sv-msg-actions { opacity: 1; }
+  /* 触摸端双击缩放易误触,交由浏览器单点手势处理 */
+  button, [role='button'], .sv-char-item, .sv-mode button { touch-action: manipulation; }
+}
+
+/* ---------- 平板 / 手机横屏(768–1099px):三栏收窄,去掉 1100px 硬约束 ---------- */
+@media (max-width: 1099px) and (min-width: 768px) {
+  .sv-frame-col { min-width: 0; }
+  .sv-sidebar { width: 220px; }
+  .sv-sidebar.wide { width: 258px; }
+  .sv-agent-panel.open { width: 300px; }
+  .sv-canvas { padding: 24px clamp(16px, 3vw, 36px); }
+  .sv-topbar { padding-left: 38px; }
+  .sv-session-select { max-width: 200px; }
+}
+
+/* ---------- 手机(<768px):抽屉 + 底部导航 ---------- */
+@media (max-width: 767px) {
+  :root {
+    --mobile-nav-h: 56px;
+    --safe-top: env(safe-area-inset-top, 0px);
+    --safe-bottom: env(safe-area-inset-bottom, 0px);
+  }
+
+  /* Android 原生壳(见 MainActivity.kt)已用 WindowInsets 把状态栏/导航栏/软键盘的
+     insets 作为 padding 让给内容,WebView 视口本身不再包含系统栏区域。
+     此处把 safe-area 兜底变量归零,避免「原生 padding + CSS env()」双重留白
+     (无刘海机 env() 本就是 0,归零只影响有切口的设备)。 */
+  :root.kd-native-insets {
+    --safe-top: 0px;
+    --safe-bottom: 0px;
+  }
+
+  /* --- 视口:释放 1100px 硬宽度,顶部让开状态栏,底部为导航栏留位 --- */
+  .sv-frame-col {
+    min-width: 0;
+    height: 100dvh; /* 动态视口:软键盘弹出时不被截断 */
+    /* 状态栏:不加这段顶栏会被状态栏时间/信号图标压住(实机截图确认) */
+    padding-top: var(--safe-top);
+    padding-bottom: calc(var(--mobile-nav-h) + var(--safe-bottom));
+  }
+
+  /* --- 左栏 → 左侧覆盖式抽屉 --- */
+  .sv-sidebar,
+  .sv-sidebar.wide {
+    position: fixed;
+    top: 0;
+    left: 0;
+    bottom: 0;
+    z-index: 52;
+    width: min(84vw, 320px);
+    transform: translateX(-100%);
+    transition: transform var(--transition-normal);
+    padding-top: var(--safe-top);
+    overflow-y: auto;
+  }
+  .sv-sidebar.open {
+    transform: translateX(0);
+    box-shadow: 8px 0 0 rgba(0, 0, 0, 0.18);
+  }
+  /* 抽屉关闭键:桌面隐藏,手机在品牌行右端显示 */
+  .sv-sidebar-close {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 34px;
+    height: 34px;
+    margin-left: 8px;
+    flex: none;
+    border: var(--bw-thin) solid var(--sv-ink);
+    background: var(--sv-white);
+    color: var(--sv-ink);
+    font-size: 14px;
+    line-height: 1;
+    cursor: pointer;
+  }
+
+  /* --- 右栏 Agent 面板 → 右侧覆盖式抽屉 --- */
+  .sv-agent-panel,
+  .sv-agent-panel.open {
+    position: fixed;
+    top: 0;
+    right: 0;
+    bottom: 0;
+    z-index: 52;
+    width: min(88vw, 380px);
+    transform: translateX(100%);
+    transition: transform var(--transition-normal);
+    padding-top: var(--safe-top);
+    padding-bottom: calc(var(--mobile-nav-h) + var(--safe-bottom));
+  }
+  .sv-agent-panel.open {
+    transform: translateX(0);
+    box-shadow: -8px 0 0 rgba(0, 0, 0, 0.18);
+  }
+  /* 右缘竖排 AGENT 条在手机上误触且无意义(底导航已有入口) */
+  .sv-agent-toggle { display: none; }
+
+  /* --- 抽屉遮罩 --- */
+  .sv-drawer-backdrop {
+    display: block;
+    position: fixed;
+    inset: 0;
+    z-index: 51;
+    background: rgba(0, 0, 0, 0.42);
+  }
+
+  /* --- 底部导航栏 --- */
+  .sv-mobile-nav {
+    display: flex;
+    position: fixed;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    z-index: 53;
+    height: calc(var(--mobile-nav-h) + var(--safe-bottom));
+    padding-bottom: var(--safe-bottom);
+    background: var(--sv-surface);
+    border-top: var(--bw) solid var(--sv-ink);
+    box-shadow: 0 -4px 0 0 var(--sv-pink);
+  }
+  .sv-mobile-nav-item {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 3px;
+    border: none;
+    background: none;
+    color: var(--sv-ink-soft);
+    font-size: 10px;
+    font-family: var(--font-display);
+    letter-spacing: 0.06em;
+    cursor: pointer;
+    padding: 0;
+  }
+  .sv-mobile-nav-item svg {
+    width: 21px;
+    height: 21px;
+    fill: none;
+    stroke: currentColor;
+    stroke-width: 1.8;
+    stroke-linecap: square;
+    stroke-linejoin: miter;
+  }
+  .sv-mobile-nav-item.active { color: var(--sv-pink-deep); }
+  .sv-mobile-nav-item:active { background: var(--sv-paper); }
+
+  /* --- 顶栏:压缩内边距,右侧控件横向可滚 --- */
+  .sv-topbar {
+    padding: 8px 12px 8px 34px;
+    gap: 8px;
+  }
+  .sv-topbar-title { font-size: 12px; }
+  /* 型号名与「会话」标签在手机上让位给可操作控件 */
+  .sv-topbar-sub { display: none; }
+  .sv-topbar-right {
+    gap: 8px;
+    overflow-x: auto;
+    scrollbar-width: none;
+  }
+  .sv-topbar-right::-webkit-scrollbar { display: none; }
+  .sv-session-select { max-width: 46vw; padding: 6px 8px; }
+  /* Token 统计已由侧栏抽屉承载,顶栏重复项隐藏 */
+  .sv-token-inline { display: none; }
+
+  /* 顶栏右侧的 AGENT 入口在手机上隐藏:该位置空间不足(实测被裁切),
+     功能已由底部导航「AGENT」完整承载,避免重复入口挤占 HTML/JS 开关的位置。 */
+  .sv-topbar-agent { display: none; }
+
+  /* --- 聊天画布与输入区 --- */
+  .sv-canvas { padding: 16px 12px; }
+  .sv-inputbar { padding: 8px 12px 10px; }
+  .sv-inputbox { gap: 8px; }
+  /* 16px 是 Android/iOS WebView 免「聚焦自动放大」的下限 */
+  .sv-inputbox textarea { font-size: 16px; min-height: 44px; padding: 10px 12px; }
+  /* 工具行:桌面为多行换行,手机上改成单行横向滚动。
+     原先 4 组控件折成 3 行占约 200px,挤压消息区;横滑后只占一行。 */
+  .sv-input-toolbar {
+    flex-wrap: nowrap;
+    overflow-x: auto;
+    scrollbar-width: none;
+    gap: 8px;
+    padding: 8px 12px;
+  }
+  .sv-input-toolbar::-webkit-scrollbar { display: none; }
+  .sv-input-toolbar > * { flex: 0 0 auto; }
+  /* CTX 提示占宽且非操作项,手机上让位(侧栏抽屉内已有完整 token 统计) */
+  .sv-input-toolbar .sv-hint { display: none; }
+  .sv-mode button { padding: 6px 9px; font-size: 11px; }
+  .sv-model-select { max-width: 132px; }
+  .sv-btn-attach { padding: 6px 10px; font-size: 11.5px; }
+  /* 音频入口已移到下方导航栏,隐藏悬浮钮避免压住工具行右端 */
+  .sv-audio-toggle { display: none; }
+  /* 音频面板改为底部整宽浮层(导航栏之上) */
+  .sv-audio-float {
+    right: 0;
+    left: 0;
+    bottom: calc(var(--mobile-nav-h) + var(--safe-bottom));
+  }
+  .sv-audio-panel { width: 100%; max-width: none; }
+
+  /* --- 模态弹窗 → 全屏 Sheet --- */
+  .sv-modal-mask {
+    align-items: stretch;
+    justify-content: stretch;
+    padding: 0;
+  }
+  /* 统一覆盖所有尺寸变体。桌面端各模态有 sm/md/lg/pm-edit/macros-modal/wb-modal
+     等固定 px 宽度(480~1080px),手机上必然溢出;此处不动各自定义,
+     只在窄屏统一拉满。specificity 用 .sv-modal-mask 前缀保证压过 .sv-modal.lg 之类。 */
+  .sv-modal-mask .sv-modal,
+  .sv-modal-mask .sv-modal.sm,
+  .sv-modal-mask .sv-modal.md,
+  .sv-modal-mask .sv-modal.lg,
+  .sv-modal-mask .sv-modal.pm-edit,
+  .sv-modal-mask .sv-modal.macros-modal,
+  .sv-modal-mask .sv-modal.sv-hub-modal,
+  .sv-modal-mask .wb-modal,
+  .sv-modal-wide {
+    width: 100%;
+    max-width: none;
+    height: 100dvh;
+    max-height: none;
+    border: none;
+    border-top: var(--bw-heavy) solid var(--sv-ink);
+    padding-top: var(--safe-top);
+    padding-bottom: var(--safe-bottom);
+  }
+  .sv-modal-body { padding: var(--space-4); }
+  /* Sheet 头部吸顶,长内容滚动时关闭键始终可达 */
+  .sv-modal-head { position: sticky; top: 0; z-index: 1; }
+
+  /* --- 综合设置:左侧 180px 导航 + 内容双栏改为上下堆叠 ---
+     桌面双栏塞进 412px 会把内容区挤到视口外(实测截图确认)。
+     移动端改为两行导航条:第一行 = 一级功能域(横滑),第二行 = 当前域的分区/工具(横滑)。
+     注意 .sv-hub-nav 内除按钮外还有 .hub-sub 二级菜单与版本指纹块(DOM 顺序固定),
+     故用 flex-wrap + 二级块占满整行(flex-basis:100%),避免它们被挤成同排的畸形块。
+     二级菜单样式定义在 SettingsHub.vue 的 scoped 块内,此处需更高特异性(3 个类)才压得住。 */
+  .sv-hub-body { flex-direction: column; }
+  .sv-hub-nav {
+    width: 100%;
+    flex-shrink: 0;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    padding: 10px;
+    max-height: none;
+    border-right: none;
+    border-bottom: var(--bw) solid var(--sv-ink);
+    overflow: visible;
+  }
+  .sv-hub-nav-item {
+    flex: 0 0 auto;
+    width: auto;
+    margin-bottom: 0;
+    padding: 8px 12px;
+    white-space: nowrap;
+  }
+  /* tab 内的序号/色点在窄条上冗余,隐藏以省宽度 */
+  .sv-hub-nav-item .sv-hub-nav-idx,
+  .sv-hub-nav-item .sv-supreme { display: none; }
+
+  /* 二级项:整行铺开并横向滚动 */
+  .sv-hub-body .sv-hub-nav .hub-sub {
+    flex-basis: 100%;
+    flex-direction: row;
+    gap: 6px;
+    margin: 2px 0 0;
+    padding-left: 0;
+    border-left: none;
+    overflow-x: auto;
+    scrollbar-width: none;
+  }
+  .sv-hub-body .sv-hub-nav .hub-sub::-webkit-scrollbar { display: none; }
+  .sv-hub-body .sv-hub-nav .hub-sub-item {
+    flex: 0 0 auto;
+    width: auto;
+    white-space: nowrap;
+    padding: 6px 10px;
+  }
+  /* 版本/构建指纹块在窄屏占两行且非操作项,隐藏(桌面仍可见) */
+  .sv-hub-nav > div:not(.hub-sub) { display: none; }
+
+  .sv-hub-content { flex: 1; min-height: 0; overflow-y: auto; }
+  .sv-hub-modal { width: 100%; }
+
+  /* --- 设置面板表单行:窄屏堆叠(修输入框塌缩 / 下拉截断 / 横向溢出) ---
+     根因:.sv-input/.sv-select 的 `flex:1` 即 basis 0%,与同行的长中文说明
+     (.sv-note,basis:auto)竞争负自由空间时,收缩权重按 basis 摊 → basis 为 0 的
+     控件一点都不缩也长不大,恒定 0 内容宽,只剩 24px padding + 6px 边框,数字被裁空
+     (说明越长越空:实测只有说明最短的「子代理深度/并发」幸存)。.inject-num 的
+     width:110px 同样被 basis:0% 覆盖而失效。
+     改为:标签与控件同一行(控件吃满剩余宽),说明文字独占下一行。
+     min-width:60px 是关键——它让「流程名称+说明」这类同行双控件自动折成两行,无需改模板。 */
+  .sv-inp-row { flex-wrap: wrap; row-gap: 6px; align-items: center; }
+  .sv-inp-row > .sv-inp-tag { flex: 0 0 auto; }
+  .sv-inp-row > .sv-input,
+  .sv-inp-row > .sv-select {
+    flex: 1 1 0;
+    width: auto; /* 中和 .inject-num 的 width:110px(basis:0 已使其失效,此处写清意图) */
+    /* min-width 兜底:绝不收缩到 0 导致数值不可见;120px 同时是折行阈值——
+       「流程名称 + 说明」这类同行双控件(label 72×2 + 120×2 + 间距 30 = 414)超过
+       可用宽(约 210~282)时会自动折成两行,无需改模板。
+       取 120 而非更大值:320px 最窄视口下可用宽约 210,72+120+10 恰好放得下不溢出。 */
+    min-width: 120px;
+    min-height: 44px; /* 项目既有触摸目标下限 */
+  }
+  /* 说明文字换到下一行:既保证完整可读,也消除与控件抢空间的竞争本身 */
+  .sv-inp-row > .sv-note { flex: 1 1 100%; }
+  .sv-inp-row > .sv-btn:not(.sv-btn-fill) { flex: 0 0 auto; white-space: nowrap; }
+  /* 流程库操作按钮组:整体换到下一行右对齐,让流程下拉吃到整行宽度 */
+  .sv-inp-row > .flow-lib-actions {
+    flex: 1 1 100%;
+    display: flex;
+    gap: 6px;
+    justify-content: flex-end;
+  }
+  /* 「流程名称 / 说明」每组各自成行(否则「说明」标签孤立在上一行末尾) */
+  .sv-inp-row > .flow-meta-pair {
+    flex: 1 1 100%;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    row-gap: 6px;
+  }
+  .flow-meta-pair > .sv-inp-tag { flex: 0 0 auto; padding-top: 0; }
+  .flow-meta-pair > .sv-input {
+    flex: 1 1 0;
+    width: auto;
+    min-width: 120px;
+    min-height: 44px;
+  }
+
+  /* --- 执行流程步骤行:grid → flex-wrap ---
+     原 6 列 auto grid 最小内容宽合计约 350px > 可用约 282px,行盒溢出 →
+     .sv-hub-content 的 overflow-y:auto 使另一轴计算为 auto → 横向滚动,最右列
+     ✕ 被推出视口;grid 轨道缩到 min-content → select 只剩箭头、无 nowrap 的中文
+     按钮缩成 1 字宽竖排(「生成」竖排)。 */
+  .flow-row { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+  .flow-row > .floor-grip { flex: 0 0 auto; }
+  /* 步骤名称 basis 取 120px:实测 412px 视口下容器内宽约 306px,这样「把手+开关+
+     名称+动作下拉」正好落在第一行(名称伸展到约 145px),「生成/不生成」与操作按钮
+     落到第二行;basis 再大就会把下拉挤到第二行、多出一行。 */
+  .flow-row > .floor-name { flex: 1 1 120px; min-width: 0; }
+  .flow-row > .floor-select { flex: 0 0 auto; min-width: 84px; } /* 至少显示「执行」 */
+  .flow-row > .sv-btn:not(.sv-btn-fill) { flex: 0 0 auto; white-space: nowrap; }
+  /* 操作按钮组:margin-left:auto 推到自己那行的右端(原 grid 下在最右列,窄屏被挤出视口) */
+  .flow-row > .floor-actions { flex: 0 0 auto; margin-left: auto; }
+  .flow-row > .flow-edit { flex: 1 1 100%; } /* 原 grid-column:1/-1 在 flex 下失效 */
+  .flow-edit { padding-left: 0; } /* 窄屏不再缩进,省出宽度给控件 */
+
+  /* --- 提示词楼层行:同病同治(PromptManager / PromptInjectSection 共用 7 列 grid) --- */
+  .floor-row { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+  .floor-row > .floor-grip { flex: 0 0 auto; }
+  .floor-row > .floor-name { flex: 1 1 120px; min-width: 0; }
+  .floor-row > .floor-select { flex: 0 0 auto; min-width: 84px; }
+  .floor-row > .floor-depth { flex: 0 0 auto; width: 76px; }
+  .floor-row > .sv-btn:not(.sv-btn-fill) { flex: 0 0 auto; white-space: nowrap; }
+  .floor-row > .floor-actions { flex: 0 0 auto; margin-left: auto; }
+  .floor-row > .floor-content { flex: 1 1 100%; } /* 原 grid-column:1/-1 在 flex 下失效 */
+
+  /* --- 音频浮层上移到导航栏之上,避开手势条 --- */
+  /* 音频浮层位置已在输入区小节统一处理(底部整宽浮层) */
+
+  /* --- 触摸目标放大(≥44px) --- */
+  .sv-icon-btn,
+  .sv-btn-sm,
+  .sv-char-item,
+  .sv-msg-action {
+    min-height: 44px;
+  }
+  .sv-msg-actions { gap: 14px; }
+
+  /* 滑块:加大拇指命中区便于手指拖动(音频音量/生成参数)。
+     选择器需带 .sv-range 才压得住原有样式(否则被更高优先级的原规则盖过)。 */
+  input[type='range'].sv-range { height: 10px; }
+  input[type='range'].sv-range::-webkit-slider-thumb {
+    width: 26px;
+    height: 26px;
+  }
+
+  /* --- 任务模式:空态与卡片的最小宽度在窄屏放宽,避免横向溢出 --- */
+  .sv-task-empty { min-width: 0; }
+  .sv-taskboard { padding: 12px; }
+  /* 任务详情内的操作按钮行改纵向堆叠,避免按钮被挤出视口 */
+  .sv-task-head { flex-direction: column; align-items: flex-start; gap: 8px; }
+  .sv-task-head-actions { flex-wrap: wrap; }
 }

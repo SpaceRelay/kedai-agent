@@ -23,6 +23,11 @@ export interface UpdateCommand {
 export interface UpdateVariableParse {
   cleaned: string;
   commands: UpdateCommand[];
+  /**
+   * 块内 `<initvar>` 初始化段原文(YAML 缩进键值/JSON/_.set 混合,由调用方解析)。
+   * 开场白常用它播种初始变量(如 wuwa 14 个备用开场);无该段为 undefined。
+   */
+  initvar?: string;
 }
 
 /** 提取全部 `<UpdateVariable>` 块(不区分大小写,容忍属性/空白) */
@@ -233,9 +238,13 @@ export function parseUpdateVariable(text: string): UpdateVariableParse {
   while ((m = BLOCK_RE.exec(text)) !== null) {
     blocks.push(m[1]);
   }
+  let initvar: string | undefined;
   if (blocks.length > 0) {
     cleaned = text.replace(BLOCK_RE, '');
     for (const block of blocks) {
+      // <initvar> 初始化段(开场白播种初始变量;多段拼接)
+      const iv = extractInitVar(block);
+      if (iv) initvar = initvar ? `${initvar}\n${iv}` : iv;
       // 优先酒馆助手 JSONPatch 格式
       const jsonPatch = parseJsonPatchBlock(block);
       if (jsonPatch) {
@@ -249,7 +258,14 @@ export function parseUpdateVariable(text: string): UpdateVariableParse {
       }
     }
   }
-  return { cleaned, commands };
+  return initvar !== undefined ? { cleaned, commands, initvar } : { cleaned, commands };
+}
+
+/** 提取块内 `<initvar>` 段原文(去标签;空段返回 undefined) */
+function extractInitVar(block: string): string | undefined {
+  const m = /<\s*initvar\b[^>]*>([\s\S]*?)<\/\s*initvar\s*>/i.exec(block);
+  const body = m?.[1].trim();
+  return body ? body : undefined;
 }
 
 /** 解析块内 <JSONPatch> 数组为更新命令;无该标签或解析失败返回 null */

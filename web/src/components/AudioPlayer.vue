@@ -55,12 +55,6 @@ const modeLabels: Record<AudioChannelSettings['mode'], string> = {
   shuffle: '随机',
   play_one_and_stop: '播完即止',
 };
-const modeIcons: Record<AudioChannelSettings['mode'], string> = {
-  repeat_one: '⟳',
-  repeat_all: '🔁',
-  shuffle: '🎲',
-  play_one_and_stop: '⏹',
-};
 
 /** 当前激活通道的曲目索引(越界钳制) */
 function currentIndex(type: AudioChannelType): number {
@@ -354,8 +348,20 @@ onBeforeUnmount(() => {
   <div class="sv-audio-panel" :class="{ collapsed }">
     <!-- 标题栏 -->
     <div class="sv-audio-head">
-      <span class="sv-audio-title">♪ 播放器</span>
-      <button class="sv-audio-mini" :title="collapsed ? '展开' : '折叠'" @click="collapsed = !collapsed">{{ collapsed ? '▢' : '—' }}</button>
+      <span class="sv-audio-title">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="square" stroke-linejoin="miter" aria-hidden="true"><path d="M9 18V6l10-2v12" /><circle cx="6.5" cy="18" r="2.5" /><circle cx="16.5" cy="16" r="2.5" /></svg>
+        播放器
+      </span>
+      <button class="sv-audio-mini" :title="collapsed ? '展开' : '折叠'" @click="collapsed = !collapsed">
+        <svg v-if="collapsed" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="square" stroke-linejoin="miter" aria-hidden="true">
+          <path d="M9 5l-6 7 6 7" />
+          <path d="M15 5l6 7-6 7" />
+        </svg>
+        <svg v-else viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="square" stroke-linejoin="miter" aria-hidden="true">
+          <path d="M6 6l6 6-6 6" />
+          <path d="M18 6l-6 6 6 6" />
+        </svg>
+      </button>
     </div>
 
     <template v-if="!collapsed">
@@ -381,16 +387,56 @@ onBeforeUnmount(() => {
             启用
           </label>
           <button class="sv-audio-mini" :title="modeLabels[channelSettings(activeChannel).mode]" @click="cycleMode">
-            {{ modeIcons[channelSettings(activeChannel).mode] }}
+            <svg v-if="channelSettings(activeChannel).mode === 'repeat_one'" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="square" stroke-linejoin="miter" aria-hidden="true">
+              <path d="M3 7h14" />
+              <path d="M3 7v10" />
+              <path d="M21 7v10" />
+              <path d="M7 17h14" />
+              <polyline points="17 4 21 7 17 10" />
+              <polyline points="7 14 3 17 7 20" />
+              <path d="M13 10l-2 2v4" />
+            </svg>
+            <svg v-else-if="channelSettings(activeChannel).mode === 'repeat_all'" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="square" stroke-linejoin="miter" aria-hidden="true">
+              <path d="M3 7h14" />
+              <path d="M3 7v10" />
+              <path d="M21 7v10" />
+              <path d="M7 17h14" />
+              <polyline points="17 4 21 7 17 10" />
+              <polyline points="7 14 3 17 7 20" />
+            </svg>
+            <svg v-else-if="channelSettings(activeChannel).mode === 'shuffle'" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="square" stroke-linejoin="miter" aria-hidden="true">
+              <path d="M4 20L20 4" />
+              <polyline points="17 4 20 4 20 7" />
+              <polyline points="4 17 4 20 7 20" />
+            </svg>
+            <svg v-else viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="square" stroke-linejoin="miter" aria-hidden="true">
+              <rect x="6" y="6" width="12" height="12" />
+            </svg>
           </button>
         </div>
 
         <div class="sv-audio-row">
-          <button class="sv-audio-btn" title="上一首" @click="prevTrack">⏮</button>
-          <button class="sv-audio-btn sv-audio-play" :title="playing ? '暂停' : '播放'" @click="togglePlay">
-            {{ playing ? '❚❚' : '▶' }}
+          <button class="sv-audio-btn" title="上一首" @click="prevTrack">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="square" stroke-linejoin="miter" aria-hidden="true">
+              <path d="M5 4l10 8-10 8z" />
+              <line x1="18" y1="4" x2="18" y2="20" />
+            </svg>
           </button>
-          <button class="sv-audio-btn" title="下一首" @click="nextTrack">⏭</button>
+          <button class="sv-audio-btn sv-audio-play" :title="playing ? '暂停' : '播放'" @click="togglePlay">
+            <svg v-if="playing" viewBox="0 0 24 24" fill="currentColor" stroke="none" aria-hidden="true">
+              <rect x="6" y="4" width="4" height="16" />
+              <rect x="14" y="4" width="4" height="16" />
+            </svg>
+            <svg v-else viewBox="0 0 24 24" fill="currentColor" stroke="none" aria-hidden="true">
+              <polygon points="6,3 20,12 6,21" />
+            </svg>
+          </button>
+          <button class="sv-audio-btn" title="下一首" @click="nextTrack">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="square" stroke-linejoin="miter" aria-hidden="true">
+              <path d="M19 4L9 12l10 8z" />
+              <line x1="6" y1="4" x2="6" y2="20" />
+            </svg>
+          </button>
           <select
             class="sv-audio-select"
             :value="currentTrack?.url ?? ''"
@@ -415,7 +461,15 @@ onBeforeUnmount(() => {
 
         <div class="sv-audio-row">
           <button class="sv-audio-btn" :class="{ active: channelSettings(activeChannel).muted }" title="静音" @click="toggleMuted">
-            {{ channelSettings(activeChannel).muted ? '🔇' : '🔊' }}
+            <svg v-if="channelSettings(activeChannel).muted" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="square" stroke-linejoin="miter" aria-hidden="true">
+              <path d="M3 10v4h4l5 4V2L7 6H3z" />
+              <line x1="4" y1="4" x2="20" y2="20" />
+            </svg>
+            <svg v-else viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="square" stroke-linejoin="miter" aria-hidden="true">
+              <path d="M3 10v4h4l5 4V2L7 6H3z" />
+              <path d="M15.5 9.5l2.5 2.5-2.5 2.5" />
+              <path d="M18.5 6.5l3.5 5.5-3.5 5.5" />
+            </svg>
           </button>
           <input
             class="sv-audio-range"
@@ -437,10 +491,15 @@ onBeforeUnmount(() => {
           <div v-for="(t, i) in editorTracks" :key="i" class="sv-audio-editor-row">
             <input v-model="t.title" class="sv-audio-input" placeholder="标题" />
             <input v-model="t.url" class="sv-audio-input" placeholder="https://…" />
-            <button class="sv-audio-btn" title="删除" @click="removeEditorRow(i)">✕</button>
+            <button class="sv-audio-btn" title="删除" @click="removeEditorRow(i)">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="square" stroke-linejoin="miter" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18" /></svg>
+            </button>
           </div>
           <div class="sv-audio-row sv-audio-actions">
-            <button class="sv-audio-btn" @click="addEditorRow">＋ 新增</button>
+            <button class="sv-audio-btn" @click="addEditorRow">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="square" stroke-linejoin="miter" aria-hidden="true"><path d="M12 5v14M5 12h14" /></svg>
+              新增
+            </button>
             <button class="sv-audio-btn sv-audio-save" @click="savePlaylist">保存</button>
             <button class="sv-audio-btn" @click="closeEditor">取消</button>
           </div>

@@ -110,7 +110,7 @@ watch(
     <div class="sv-modal lg">
       <div class="sv-modal-head">
         <h2 class="flex items-center gap-2">
-          <span class="logo" /> 插件
+          <span class="sv-supreme pink" /> 插件
         </h2>
         <button class="sv-btn ghost sv-btn-square" @click="close">✕</button>
       </div>

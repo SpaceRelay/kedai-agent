@@ -62,7 +62,8 @@ export function useApiSettings() {
       /* 忽略 */
     }
     try {
-      const s = await api.getSettings();
+      // 按当前顶层模式回填:任务模式读 task 覆盖层,否则读 roleplay(扁平字段)。
+      const s = await api.getSettings(store.appMode);
       apiBaseUrl.value = s.openai_base_url;
       apiKeyMasked.value = s.api_key_masked;
       hasApiKey.value = s.has_api_key;

@@ -85,9 +85,15 @@ export class LocalScriptAuthorizationStore {
   }
 }
 
-/** 对会影响匹配、HTML 输出或 JavaScript 执行的字段做稳定 SHA-256。 */
-export async function hashRegexScripts(scripts: RegexScript[]): Promise<string> {
-  const canonical = scripts.map((script) => ({
+/** 对会影响匹配、HTML 输出或 JavaScript 执行的字段做稳定 SHA-256。
+ *  cardScripts(可选):角色卡内嵌酒馆助手卡级脚本(data_raw.extensions.tavern_helper),
+ *  其 content 直接构成执行体,必须进哈希——卡更新卡级脚本后旧授权自动失效;
+ *  缺省/空数组时哈希与历史行为逐字节一致(无卡级脚本的老卡不抖动)。 */
+export async function hashRegexScripts(
+  scripts: RegexScript[],
+  cardScripts?: Array<{ id: string; name: string; content: string; enabled: boolean }>,
+): Promise<string> {
+  const canonical: Array<Record<string, unknown>> = scripts.map((script) => ({
     id: script.id ?? '',
     script_name: script.script_name ?? '',
     find_regex: script.find_regex ?? '',
@@ -95,6 +101,15 @@ export async function hashRegexScripts(scripts: RegexScript[]): Promise<string> 
     enabled: script.enabled !== false,
     markdown_only: script.markdown_only === true,
   }));
+  for (const s of cardScripts ?? []) {
+    canonical.push({
+      kind: 'th-script',
+      id: s.id,
+      name: s.name,
+      content: s.content,
+      enabled: s.enabled,
+    });
+  }
   const bytes = new TextEncoder().encode(JSON.stringify(canonical));
   const digest = await crypto.subtle.digest('SHA-256', bytes);
   return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0')).join('');

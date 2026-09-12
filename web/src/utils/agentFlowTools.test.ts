@@ -7,6 +7,7 @@ import {
   setStepToolsText,
   stepToolMode,
   stepToolsText,
+  stepToolsWarnings,
 } from './agentFlowTools';
 
 function step(tools: AgentFlowStep['tools'] = null): AgentFlowStep {
@@ -30,7 +31,7 @@ describe('stepToolMode(读回)', () => {
     expect(stepToolMode(step(undefined))).toBe('none');
     expect(stepToolMode(step([]))).toBe('all');
     expect(stepToolMode(step(['write']))).toBe('list');
-    expect(stepToolMode(step(['']))).toBe('list', '占位空串应视为 list(白名单输入中)');
+    expect(stepToolMode(step([''])), '占位空串应视为 list(白名单输入中)').toBe('list');
   });
 });
 
@@ -93,5 +94,26 @@ describe('cleanStepTools(保存前清洗)', () => {
     expect(steps[0].tools).toEqual(['write']);
     expect(steps[1].tools).toBeNull();
     expect(steps[2].tools).toEqual([]);
+  });
+});
+
+describe('stepToolsWarnings(F8:工具三态误配警示)', () => {
+  it('全部工具 → 一条警示(点明含编排/写类)', () => {
+    const w = stepToolsWarnings({ tools: [], generates: true });
+    expect(w).toHaveLength(1);
+    expect(w[0]).toContain('全部工具');
+    expect(w[0]).toContain('agentgo');
+  });
+
+  it('不生成正文 + 全部工具 → 两条警示(第二条点名理解意图)', () => {
+    const w = stepToolsWarnings({ tools: [], generates: false });
+    expect(w).toHaveLength(2);
+    expect(w[1]).toContain('不生成正文');
+    expect(w[1]).toContain('理解意图');
+  });
+
+  it('不使用工具 / 白名单 → 无警示', () => {
+    expect(stepToolsWarnings({ tools: null, generates: false })).toHaveLength(0);
+    expect(stepToolsWarnings({ tools: ['read'], generates: false })).toHaveLength(0);
   });
 });

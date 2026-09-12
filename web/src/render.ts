@@ -11,6 +11,19 @@ import sanitizeHtml from 'sanitize-html';
 import type { RegexScript } from './api';
 import { parseUpdateVariable } from './mvu/parser';
 import { renderMarkdown } from './markdown';
+import { applyKeyframeRename, sanitizeScopedCss, sanitizeStyleAttribute, scopeCss } from './cssSanitize';
+
+// CSS 清洗/作用域化实现已抽至 ./cssSanitize(沙箱运行期 <style> 通道复用同一管线);
+// 此处 re-export 保持对外导入面不变
+export {
+  applyKeyframeRename,
+  cssUrlsSafe,
+  sanitizeCssDeclarations,
+  sanitizeScopedCss,
+  sanitizeStyleAttribute,
+  scopeCss,
+  stripCssComments,
+} from './cssSanitize';
 
 /** HTML 转义(防注入) */
 export function escapeHtml(s: string): string {
@@ -39,30 +52,45 @@ export function splitJsRegex(input: string): { pattern: string; flags: string } 
  * 会原样输出 $1——这里补上标准展开。args 为回调原始参数(match, ...groups, offset, input)。
  */
 export function expandReplaceRefs(replaceString: string, args: unknown[]): string {
+  // 对齐 SillyTavern regex 引擎(engine.js runRegexScript):替换串经函数返回值插入,
+  // 引擎只手工展开 {{match}}/$0、$n、$<name>;其余 $ 序列($$、$&、$`、$')一律字面保留——
+  // 作者模板字面量里的 `$` 组合(如 wuwa 卡 `(.*)$\``)不会被吞,且 $& 在 ST 中也是字面量。
+  const withMatch = replaceString.replace(/{{match}}/gi, '$0');
   const match = args[0] as string;
-  const offset = args[args.length - 2] as number;
-  const input = args[args.length - 1] as string;
-  // 捕获组个数 = 总参数 - 3(match + offset + input);$n 超出范围按空串处理(JS 原生语义)
-  const groupCount = args.length - 3;
-  return replaceString.replace(/\$\$|\$(\d+)|\$&|\$`|\$'/g, (m, num: string | undefined) => {
-    if (num !== undefined) {
-      const i = Number(num);
-      if (i === 0) return match;
-      return i <= groupCount ? ((args[i] as string | undefined) ?? '') : '';
-    }
-    switch (m) {
-      case '$$':
-        return '$';
-      case '$&':
-        return match;
-      case '$`':
-        return input.slice(0, offset);
-      case "$'":
-        return input.slice(offset + match.length);
-      default:
-        return m;
-    }
+  // String.replace 回调参数:[match, p1..pn, offset, input] 或带命名组时尾部再跟 groups
+  const maybeGroups = args[args.length - 1];
+  const namedGroups =
+    maybeGroups !== null && typeof maybeGroups === 'object'
+      ? (maybeGroups as Record<string, string | undefined>)
+      : undefined;
+  const offsetIndex = namedGroups ? args.length - 3 : args.length - 2;
+  const groupCount = offsetIndex - 1;
+  return withMatch.replaceAll(/\$(\d+)|\$<([^>]+)>/g, (_m, num: string | undefined, name: string | undefined) => {
+    if (name !== undefined) return namedGroups?.[name] ?? '';
+    const i = Number(num);
+    if (i === 0) return match;
+    return i <= groupCount ? ((args[i] as string | undefined) ?? '') : '';
   });
+}
+
+/** 显示层身份宏上下文:charName 当前角色名,userName 用户名(与后端默认一致为「用户」) */
+export interface DisplayMacroCtx {
+  charName?: string;
+  userName?: string;
+}
+
+/**
+ * 展开脚本 replace_string 注入的身份宏({{user}}/{{char}} 等,大小写不敏感)。
+ * 对齐 SillyTavern:显示层 substituteParams 作用于脚本替换后的完整文本——脚本输出里
+ * 新引入的宏(含 <script> 源码内的 '{{user}}',如 wuwa 状态栏 sex-monitor)也会展开。
+ * 只处理身份宏;变量类宏({{getvar}} 等)由后端 content_display 或 mvu 宿主负责。
+ */
+export function expandDisplayMacros(text: string, ctx: DisplayMacroCtx): string {
+  const charName = ctx.charName ?? '';
+  const userName = ctx.userName ?? '用户';
+  return text
+    .replace(/\{\{\s*(?:user|user_name)\s*\}\}/gi, userName)
+    .replace(/\{\{\s*(?:char|char_name|character_name)\s*\}\}/gi, charName);
 }
 
 /** 提取 <script> 源码(剥掉 import 语句,避免加载外部依赖) */
@@ -99,73 +127,38 @@ export function extractStyles(s: string): string[] {
 }
 
 /**
- * 样式最小化:禁止外部资源、固定定位和可能覆盖应用的高危声明。
- * CSS 解析仍非完整沙箱，因此只保留无 URL/导入/表达式的局部展示规则。
+ * 内联事件处理器降级为数据属性(onclick="fn(this)" → data-kd-onclick="fn(this)")。
+ * 宿主文档绝不执行卡内 inline 代码(安全边界不变:真实 on* 属性仍被清洗);
+ * 宿主按属性生成监听,触发时把代码串 postMessage 回该块脚本所属沙箱,在沙箱内求值
+ * (见 characterScriptSandbox 的 inline-event 分支;sandbox.html CSP 含 unsafe-eval,
+ * 求值对象仅限作者自己的代码,与已授权执行的卡脚本同信任级)。
+ * wuwa 状态栏 72 处 onclick(标签页切换等)依赖此链路。
  */
-export function sanitizeScopedCss(css: string): string {
-  const deniedProperties = new Set([
-    'position', 'z-index', 'inset', 'inset-block', 'inset-inline', 'top', 'right', 'bottom', 'left',
-    'pointer-events', 'behavior', 'binding', '-moz-binding', 'cursor', 'content',
-  ]);
-  const unsafeValue = /url\s*\(|expression\s*\(|@import|javascript:|(?:^|[^\w-])(?:-?\d*\.?\d+)(?:vw|vh|vmin|vmax)(?:[^\w-]|$)/i;
-  const declarations = (input: string): string => splitCssDeclarations(input)
-    .map((declaration) => {
-      const colon = declaration.indexOf(':');
-      if (colon <= 0) return '';
-      const property = declaration.slice(0, colon).trim().toLowerCase();
-      const value = declaration.slice(colon + 1).trim();
-      if (!/^--[\w-]+$|^[a-z-]+$/.test(property)) return '';
-      if (deniedProperties.has(property) || unsafeValue.test(value) || /<\/style/i.test(value)) return '';
-      return `${property}: ${value}`;
-    })
-    .filter(Boolean)
-    .join('; ');
-
-  const cleanBlocks = (input: string, keyframe = false): string => splitCssBlocks(input)
-    .map(({ head, inner, isAt }) => {
-      const name = head.trim();
-      if (isAt) {
-        if (/^@(?:-webkit-)?keyframes\s+[\w-]+$/i.test(name)) {
-          return `${name}{${cleanBlocks(inner, true)}}`;
-        }
-        return '';
-      }
-      const body = declarations(inner);
-      if (!body) return '';
-      if (keyframe && !/^(?:from|to|(?:\d{1,3}(?:\.\d+)?)%)(?:\s*,\s*(?:from|to|(?:\d{1,3}(?:\.\d+)?)%))*$/i.test(name)) return '';
-      return `${name} { ${body} }`;
-    })
-    .filter(Boolean)
-    .join('\n');
-
-  return cleanBlocks(css.replace(/<\/style/gi, ''));
-}
-
-function splitCssDeclarations(input: string): string[] {
-  const declarations: string[] = [];
-  let start = 0;
-  let quote: string | null = null;
-  let parentheses = 0;
-  for (let index = 0; index <= input.length; index++) {
-    const char = input[index];
-    if (quote) {
-      if (char === '\\') index++;
-      else if (char === quote) quote = null;
-    } else if (char === '"' || char === "'") quote = char;
-    else if (char === '(') parentheses++;
-    else if (char === ')') parentheses = Math.max(0, parentheses - 1);
-    else if ((char === ';' || index === input.length) && parentheses === 0) {
-      declarations.push(input.slice(start, index).trim());
-      start = index + 1;
-    }
-  }
-  return declarations;
+export function demoteInlineHandlers(html: string): string {
+  return html.replace(
+    /<([a-zA-Z][a-zA-Z0-9-]*)((?:"[^"]*"|'[^']*'|[^>"'])+)>/g,
+    (whole: string, tag: string, attrs: string): string => {
+      const rewritten = attrs.replace(
+        /\s(on[a-zA-Z]+)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))/g,
+        (_m, name: string, dq?: string, sq?: string, bare?: string): string => {
+          const value = dq ?? sq ?? bare ?? '';
+          // 只转义双引号:& 必须原样透传,否则值内已有实体(&quot; 等)会被二次转义,
+          // 浏览器属性解析只解码一次,二次转义后沙箱拿到的是未解码的残串
+          const escaped = value.replace(/"/g, '&quot;');
+          return ` data-kd-${name.toLowerCase()}="${escaped}"`;
+        },
+      );
+      return `<${tag}${rewritten}>`;
+    },
+  );
 }
 
 /**
- * 可见 HTML 白名单:不允许 style 属性、事件处理器、外部媒体或 javascript URL。
+ * 可见 HTML 白名单:不允许事件处理器、外部媒体或 javascript URL。
  * 链接与图片仅放行 https(与资源界面一致):角色卡作者 HTML 中的外链图(如
  * WuWa 开场界面的 Logo)与站外链接需要保留;data: 仍允许(状态栏内联图)。
+ * style 属性放行(值过 sanitizeStyleAttribute 声明级清洗):作者界面的内联定位/
+ * 显隐依赖它,整段剥掉会破坏布局(renderHtml 为逐卡主动开启的信任模型)。
  * 表单控件(input/select/textarea/option)放行:角色卡开场界面(如 WuWa 开场
  * 身份/版本/区域选择)依赖表单交互;disabled/checked/selected/value 等状态
  * 属性保留,事件处理器一律剥离(交互经 jQuery 子集绑定)。
@@ -182,25 +175,45 @@ export function sanitizeVisibleHtml(html: string): string {
       'form', 'label', 'input', 'select', 'option', 'optgroup', 'textarea', 'fieldset', 'legend',
     ],
     allowedAttributes: {
-      // id 必须保留:状态栏脚本(jQuery 子集)用 #id 选择器定位元素,剥离后脚本静默空转
-      '*': ['class', 'title', 'aria-label', 'role', 'data-*', 'id'],
-      a: ['href', 'title', 'target', 'rel', 'class', 'aria-label'],
-      img: ['src', 'alt', 'title', 'class', 'width', 'height'],
-      th: ['colspan', 'rowspan', 'scope', 'class'],
-      td: ['colspan', 'rowspan', 'class'],
-      form: ['action', 'method', 'class', 'id'],
-      label: ['for', 'class', 'id'],
-      input: ['type', 'name', 'value', 'placeholder', 'checked', 'disabled', 'min', 'max', 'maxlength', 'size', 'class', 'id'],
-      select: ['name', 'multiple', 'disabled', 'size', 'class', 'id'],
-      option: ['value', 'selected', 'disabled', 'class', 'id'],
-      optgroup: ['label', 'disabled', 'class', 'id'],
-      textarea: ['name', 'rows', 'cols', 'placeholder', 'disabled', 'maxlength', 'class', 'id'],
-      fieldset: ['disabled', 'class', 'id'],
+      // id 必须保留:状态栏脚本(jQuery 子集)用 #id 选择器定位元素,剥离后脚本静默空转;
+      // style 值经 transformTags 清洗(声明级,与规则体同一管线)。
+      // width/height 属性保留(实跑问题 5):酒馆状态栏常用 <table width="100%"> 或
+      // <div width=…> 排版,旧白名单只放行 img,表格宽度属性被剥后塌成内容宽,
+      // 表现为「状态栏文案显示不全/错位」。
+      '*': ['class', 'title', 'aria-label', 'role', 'data-*', 'id', 'style'],
+      div: ['style', 'class', 'id', 'width', 'height', 'align'],
+      table: ['style', 'class', 'id', 'width', 'height', 'border', 'cellpadding', 'cellspacing', 'align'],
+      thead: ['style', 'class', 'id', 'align'],
+      tbody: ['style', 'class', 'id', 'align'],
+      tfoot: ['style', 'class', 'id', 'align'],
+      tr: ['style', 'class', 'id', 'align'],
+      a: ['href', 'title', 'target', 'rel', 'class', 'aria-label', 'style'],
+      img: ['src', 'alt', 'title', 'class', 'width', 'height', 'style'],
+      th: ['colspan', 'rowspan', 'scope', 'class', 'style', 'width', 'height', 'align', 'valign'],
+      td: ['colspan', 'rowspan', 'class', 'style', 'width', 'height', 'align', 'valign'],
+      form: ['action', 'method', 'class', 'id', 'style'],
+      label: ['for', 'class', 'id', 'style'],
+      input: ['type', 'name', 'value', 'placeholder', 'checked', 'disabled', 'min', 'max', 'maxlength', 'size', 'class', 'id', 'style'],
+      select: ['name', 'multiple', 'disabled', 'size', 'class', 'id', 'style'],
+      option: ['value', 'selected', 'disabled', 'class', 'id', 'style'],
+      optgroup: ['label', 'disabled', 'class', 'id', 'style'],
+      textarea: ['name', 'rows', 'cols', 'placeholder', 'disabled', 'maxlength', 'class', 'id', 'style'],
+      fieldset: ['disabled', 'class', 'id', 'style'],
     },
     allowedSchemes: ['data', 'https'],
     allowedSchemesByTag: { img: ['data', 'https'] },
     allowProtocolRelative: false,
     transformTags: {
+      // style 属性声明级清洗(与 <style> 规则体同一管线:剥 expression/javascript:/
+      // 非白名单 url() 与 behavior 绑定;position 等布局声明放行,见 sanitizeScopedCss)
+      '*': (tagName, attribs) => {
+        if (typeof attribs.style !== 'string') return { tagName, attribs };
+        const clean = sanitizeStyleAttribute(attribs.style);
+        const next = { ...attribs };
+        if (clean) next.style = clean;
+        else delete next.style;
+        return { tagName, attribs: next };
+      },
       a: (_tagName, attribs) => ({
         tagName: 'a',
         attribs: { ...attribs, target: '_blank', rel: 'noopener noreferrer' },
@@ -222,132 +235,6 @@ function extractBody(s: string): string {
   t = t.replace(/<script\b[\s\S]*?<\/script\s*>/gi, '');
   t = t.replace(/<style\b[\s\S]*?<\/style\s*>/gi, '');
   return t.trim();
-}
-
-/**
- * CSS 作用域化:每条规则加祖先前缀 `[data-kd-scope="scopeId"]`。
- * - 普通规则:选择器加前缀(已是前缀则跳过)
- * - @media/@supports:内部规则递归加前缀
- * - @keyframes:名字重命名(前缀 + 原哈希),并记录映射供引用替换
- * - @font-face/@import 等:原样保留
- */
-export function scopeCss(css: string, scopeId: string): { css: string; keyframes: Map<string, string> } {
-  const attr = `[data-kd-scope="${scopeId}"]`;
-  const kfMap = new Map<string, string>();
-  const out: string[] = [];
-
-  // 按顶层块切分:selector{...} / @rule{...} / 顶层声明
-  const blocks = splitCssBlocks(css);
-  for (const block of blocks) {
-    const { head, inner, isAt } = block;
-    if (isAt) {
-      const name = head.trim();
-      if (/^@(media|supports|container|layer)\b/i.test(name)) {
-        const sub = scopeCss(inner, scopeId);
-        sub.keyframes.forEach((v, k) => kfMap.set(k, v));
-        out.push(`${name}{${sub.css}}`);
-      } else if (/^@keyframes\b/i.test(name)) {
-        // 重命名 keyframes 名字
-        const orig = name.replace(/^@keyframes\s+/i, '').trim();
-        const renamed = `kd-${scopeId}-${orig}`;
-        kfMap.set(orig, renamed);
-        out.push(`@keyframes ${renamed}{${inner}}`);
-      } else {
-        // @font-face / @import / @page / @charset 等原样
-        out.push(inner ? `${name}{${inner}}` : name);
-      }
-    } else {
-      const sel = head.trim();
-      if (!sel) continue;
-      const scopedSel = sel
-        .split(',')
-        .map((s) => (s.trim() ? (s.trim().startsWith(attr) ? s.trim() : `${attr} ${s.trim()}`) : s))
-        .join(', ');
-      out.push(`${scopedSel} {${inner}}`);
-    }
-  }
-  return { css: out.join('\n'), keyframes: kfMap };
-}
-
-/** 应用 keyframes 重命名到 CSS 文本(animation/animation-name 中的名字)。
- *  负向断言排除已带前缀的 keyframes 定义名,避免双重前缀。 */
-export function applyKeyframeRename(css: string, map: Map<string, string>): string {
-  if (map.size === 0) return css;
-  let s = css;
-  for (const [orig, renamed] of map) {
-    const re = new RegExp(`(?<![\\w-])${escapeRegex(orig)}(?![\\w-])`, 'g');
-    s = s.replace(re, renamed);
-  }
-  return s;
-}
-
-function escapeRegex(s: string): string {
-  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-}
-
-/** 切分 CSS 为顶层块:[{head, inner, isAt}] */
-function splitCssBlocks(css: string): Array<{ head: string; inner: string; isAt: boolean }> {
-  const blocks: Array<{ head: string; inner: string; isAt: boolean }> = [];
-  let i = 0;
-  const n = css.length;
-  while (i < n) {
-    // 跳过注释与空白
-    if (css.startsWith('/*', i)) {
-      const end = css.indexOf('*/', i + 2);
-      i = end < 0 ? n : end + 2;
-      continue;
-    }
-    if (/\s/.test(css[i])) {
-      i++;
-      continue;
-    }
-    // 收集 head(直到 '{' 或 ';',跳过引号内的分号)
-    let headStart = i;
-    let j = i;
-    let headQuote: string | null = null;
-    while (j < n) {
-      const ch = css[j];
-      if (headQuote) {
-        if (ch === headQuote) headQuote = null;
-      } else if (ch === '"' || ch === "'") {
-        headQuote = ch;
-      } else if (ch === '{' || ch === ';') {
-        break;
-      }
-      j++;
-    }
-    if (j >= n) break;
-    if (css[j] === ';') {
-      // 顶层声明(如 @import 分号结尾)或空规则,原样保留
-      blocks.push({ head: css.slice(headStart, j + 1), inner: '', isAt: css[headStart] === '@' });
-      i = j + 1;
-      continue;
-    }
-    // 有 '{':扫描匹配的 '}'(注意字符串)
-    let depth = 1;
-    let k = j + 1;
-    let quote: string | null = null;
-    while (k < n && depth > 0) {
-      const ch = css[k];
-      if (quote) {
-        if (ch === quote) quote = null;
-      } else if (ch === '"' || ch === "'") {
-        quote = ch;
-      } else if (ch === '{') {
-        depth++;
-      } else if (ch === '}') {
-        depth--;
-      }
-      k++;
-    }
-    blocks.push({
-      head: css.slice(headStart, j),
-      inner: css.slice(j + 1, depth === 0 ? k - 1 : k),
-      isAt: css[headStart] === '@',
-    });
-    i = depth === 0 ? k : k + 1;
-  }
-  return blocks;
 }
 
 export interface ScopedScriptHtml {
@@ -381,7 +268,8 @@ export function buildScopedScriptHtml(replaceString: string, seed?: string): Sco
 
   const styles = extractStyles(s);
   const scripts = extractScripts(s);
-  const body = sanitizeVisibleHtml(extractBody(s));
+  // inline 事件先降级为 data-kd-on*(可存活过白名单),宿主绑监听转发沙箱求值
+  const body = sanitizeVisibleHtml(demoteInlineHandlers(extractBody(s)));
   // 替换值经清洗后无可见内容且无脚本(如「状态栏代码块」把占位符包成围栏,
   // 围栏内标签被白名单丢弃)时返回空,调用方跳过注入,避免消息尾部出现空容器
   if (!body.trim() && scripts.length === 0) {
@@ -405,13 +293,27 @@ export function buildScopedScriptHtml(replaceString: string, seed?: string): Sco
  * 1) 原文上按脚本链顺序把命中片段替换为占位符(控制字符,不受转义影响)
  * 2) 整体 HTML 转义(LLM 输出不可信)
  * 3) 占位符还原为脚本 replaceString(作者可信,清洗后保留 HTML)
+/**
+ * 酒馆楼层深度过滤:depth 0 = 最新一条消息,向历史递增。脚本带 min_depth/max_depth
+ * 时仅对范围内楼层生效(如 wuwa 卡「删除远楼层开场标记」minDepth=2,只清理历史
+ * 楼层,当前开场的占位符须留给渲染脚本)。depth 未传表示不过滤(兼容旧调用)。
+ */
+export function scriptAppliesAtDepth(script: RegexScript, depth: number | undefined): boolean {
+  if (depth === undefined) return true;
+  if (script.min_depth != null && depth < script.min_depth) return false;
+  if (script.max_depth != null && depth > script.max_depth) return false;
+  return true;
+}
+
+/**
  * 无效正则 / 空替换串 / 禁用的脚本跳过。
  */
-export function renderScriptedHtml(text: string, scripts: RegexScript[]): string {
+export function renderScriptedHtml(text: string, scripts: RegexScript[], depth?: number, macros?: DisplayMacroCtx): string {
   // 第 1 步:原文占位符化
   const placeholders: Array<{ ph: string; value: string }> = [];
   let source = text;
   for (const script of scripts) {
+    if (!scriptAppliesAtDepth(script, depth)) continue;
     if (!script.enabled) continue;
     if (!script.replace_string) continue;
     const parsed = splitJsRegex(script.find_regex);
@@ -423,8 +325,10 @@ export function renderScriptedHtml(text: string, scripts: RegexScript[]): string
       continue; // 无效正则跳过
     }
     source = source.replace(re, (...args: unknown[]) => {
-      const ph = `\u0000KDAI_PH_${placeholders.length}\u0000`;
-      placeholders.push({ ph, value: cleanScriptHtml(expandReplaceRefs(script.replace_string, args)) });
+      const ph = `KDAI_PH_${placeholders.length}`;
+      let value = expandReplaceRefs(script.replace_string, args);
+      if (macros) value = expandDisplayMacros(value, macros);
+      placeholders.push({ ph, value: cleanScriptHtml(value) });
       return ph;
     });
   }
@@ -474,6 +378,8 @@ export function renderScopedScripts(
   text: string,
   scripts: RegexScript[],
   seed?: string,
+  depth?: number,
+  macros?: DisplayMacroCtx,
 ): ScopedRenderResult | null {
   // 先剥离 mvu <UpdateVariable> 块(仅用于变量更新,不进入任何渲染)
   const { cleaned } = parseUpdateVariable(text);
@@ -483,6 +389,7 @@ export function renderScopedScripts(
   //    的「对AI隐藏状态栏」等仅注入提示词,显示层剥掉会把渲染脚本要用的
   //    <StatusPlaceHolderImpl/> 占位符一并移除,导致界面不渲染。
   for (const script of scripts) {
+    if (!scriptAppliesAtDepth(script, depth)) continue;
     if (!script.enabled) continue;
     if (script.replace_string && script.replace_string.trim()) continue; // 只处理隐藏类
     if (!script.markdown_only) continue; // 显示层只应用 markdown_only 脚本
@@ -503,6 +410,7 @@ export function renderScopedScripts(
   );
   const placeholders: Array<{ ph: string; value: string }> = [];
   for (const script of ordered) {
+    if (!scriptAppliesAtDepth(script, depth)) continue;
     if (!script.enabled) continue;
     if (!script.replace_string) continue;
     const parsed = splitJsRegex(script.find_regex);
@@ -514,8 +422,10 @@ export function renderScopedScripts(
       continue;
     }
     source = source.replace(re, (...args: unknown[]) => {
-      const ph = `\u0000KDAI_PH_${placeholders.length}\u0000`;
-      placeholders.push({ ph, value: expandReplaceRefs(script.replace_string, args) });
+      const ph = `KDAI_PH_${placeholders.length}`;
+      let value = expandReplaceRefs(script.replace_string, args);
+      if (macros) value = expandDisplayMacros(value, macros);
+      placeholders.push({ ph, value });
       return ph;
     });
   }
@@ -594,9 +504,10 @@ export function buildMessageRenderText(
  * 把命中片段替换为空,用于 HTML 渲染关闭时剥掉 `<StatusPlaceHolderImpl/>` 等占位符,
  * 避免其裸露在 markdown 正文中。
  */
-export function stripHiddenPlaceholders(text: string, scripts: RegexScript[]): string {
+export function stripHiddenPlaceholders(text: string, scripts: RegexScript[], depth?: number): string {
   let out = text;
   for (const script of scripts) {
+    if (!scriptAppliesAtDepth(script, depth)) continue;
     if (!script.enabled) continue;
     if (script.replace_string && script.replace_string.trim()) continue; // 只处理隐藏类
     const parsed = splitJsRegex(script.find_regex);
@@ -658,19 +569,47 @@ export function isSafeResourceUrl(url: string): boolean {
  * 本函数只生成卡片壳(标题栏 + iframe + 说明),投递由调用方 hydrate 完成。
  * seed 用于生成稳定容器 id(同一消息重渲染复用,避免 iframe 重复创建)。
  */
+/**
+ * 资源/面板 iframe nonce 稳定派生:同一 (url + seed) 每次渲染得到同一 nonce。
+ * 早期用 Date.now+Math.random 生成,消息 computed 每次重算都会产出不同的
+ * iframe src → v-html 变化 → iframe 被重建,资源页(吸血鬼卡 1.25MB)反复重新
+ * 下载、下载进度全部丢失。稳定 nonce 使重渲染产出相同 HTML,v-html 不变则不
+ * 触 DOM,iframe 得以存活;nonce 同时是 ready/boot 双向认证令牌。
+ * (非安全随机:认证强度依赖父页面隔离,而非不可猜测性。)
+ */
+export function stableFrameNonce(input: string): string {
+  // FNV-1a 64bit(拆两个 32bit 累加,避免 BigInt 依赖)
+  let h1 = 0x811c9dc5;
+  let h2 = 0x01000193;
+  for (let i = 0; i < input.length; i++) {
+    const c = input.charCodeAt(i);
+    h1 = Math.imul(h1 ^ (c & 0xff), 0x01000193);
+    h2 = Math.imul(h2 ^ (c >>> 8), 0x85ebca6b);
+    h1 >>>= 0;
+    h2 >>>= 0;
+  }
+  return `kd${h1.toString(36)}${h2.toString(36)}`;
+}
+
 export function buildRemoteResourceHtml(url: string, seed?: string): string {
   const id = seed ? `sv-res-${seed}` : `sv-res-${Date.now().toString(36)}${(scopeSeq++).toString(36)}`;
   const escUrl = escapeHtml(url);
   const urlAttr = encodeURIComponent(url);
-  // 随机 nonce 放 URL fragment(不随 HTTP 请求发送),宿主文档 ready/boot 双向认证
-  const nonce = `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 10)}`;
+  // nonce 按 (url+seed) 稳定派生(见 stableFrameNonce);放 URL fragment(不随 HTTP 请求发送)
+  const nonce = stableFrameNonce(`${url}${seed ?? ''}`);
   return (
     `<div class="sv-resource-card" id="${escapeHtml(id)}" data-kd-resource="1" data-kd-resource-url="${escapeHtml(urlAttr)}" data-kd-resource-nonce="${escapeHtml(nonce)}">` +
     `<div class="sv-resource-card-head">` +
     `<span class="sv-resource-card-title">角色卡资源界面</span>` +
+    `<span class="sv-resource-card-side">` +
+    // 宽屏切换:作者页(如吸血鬼卡)的游戏界面为全屏设计,沙箱 iframe 无法把
+    // 撑满样式注入宿主文档(见 resource_frame_template 的 parent shim),由宿主
+    // 侧把整卡 fixed 撑满视口来补足;点击委托在 ChatWindow(scrollArea 全局委托)。
+    `<button type="button" class="sv-resource-card-wide" data-kd-resource-wide="1">宽屏</button>` +
     `<a class="sv-resource-card-open" href="${escUrl}" target="_blank" rel="noopener noreferrer">在新窗口打开</a>` +
+    `</span>` +
     `</div>` +
-    `<iframe class="sv-resource-card-frame" data-kd-resource-frame="1" sandbox="allow-scripts allow-popups allow-forms" ` +
+    `<iframe class="sv-resource-card-frame" data-kd-resource-frame="1" sandbox="allow-scripts allow-popups allow-forms allow-modals" ` +
     `referrerpolicy="no-referrer" src="/resource-frame.html#${escapeHtml(nonce)}" title="角色卡资源界面"></iframe>` +
     `<div class="sv-resource-card-note">资源页面由角色卡作者提供,已隔离加载;若未显示,请使用上方链接在新窗口打开。</div>` +
     `</div>`

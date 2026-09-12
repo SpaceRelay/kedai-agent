@@ -149,7 +149,7 @@ onMounted(() => {
       <!-- 头部 -->
       <div class="sv-modal-head">
         <h2 class="flex items-center gap-2">
-          <span class="logo" /> 聊天记录
+          <span class="sv-supreme pink" /> 聊天记录
         </h2>
         <div class="flex items-center gap-2">
           <button class="sv-btn primary sv-btn-sm" :disabled="busy" @click="newSession">＋ 新建</button>

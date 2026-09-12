@@ -136,4 +136,43 @@ describe('collectFromInitVarContent', () => {
     expect(statValue(pathGet(out, '芽衣.好感度'))).toBe(15);
     expect(statValue(pathGet(out, '身体资讯.情绪'))).toBe('平静');
   });
+
+  it('wuwa 备用开场 initvar 真实片段(注释/三层嵌套/布尔/空容器)', () => {
+    // 取自 wuwa 卡备用开场 1(花房)尾部 <UpdateVariable><initvar> 原文的关键子集
+    const out = collectFromInitVarContent(
+      [
+        '# === 核心时空 ===',
+        '当前时间: "第1年 10月13日 周日 14:00"',
+        '所在地点: "黑海岸-泰缇斯枢纽-花房"',
+        '',
+        '# === 剧情进度锁 自动修正至最新版本后日谈) ===',
+        '_storyState:',
+        '  majorVerIdx: 100',
+        '  isPostScript: true',
+        '  _anchorPart: "100"',
+        '主角信息:',
+        '  是否是漂泊者: true',
+        '  性爱状态:',
+        '    是否正在性爱: false',
+        '    高潮进度: 0',
+        '  物品栏: {}',
+        '女性角色:',
+        '  守岸人:',
+        '    好感度: 80',
+        '    私密资料:',
+        '      性爱日志: []',
+      ].join('\n'),
+    );
+    expect(statValue(pathGet(out, '当前时间'))).toBe('第1年 10月13日 周日 14:00');
+    expect(statValue(pathGet(out, '所在地点'))).toBe('黑海岸-泰缇斯枢纽-花房');
+    expect(statValue(pathGet(out, '_storyState.majorVerIdx'))).toBe(100);
+    expect(statValue(pathGet(out, '_storyState.isPostScript'))).toBe(true);
+    expect(statValue(pathGet(out, '主角信息.是否是漂泊者'))).toBe(true);
+    expect(statValue(pathGet(out, '主角信息.性爱状态.是否正在性爱'))).toBe(false);
+    expect(statValue(pathGet(out, '主角信息.性爱状态.高潮进度'))).toBe(0);
+    expect(statValue(pathGet(out, '女性角色.守岸人.好感度'))).toBe(80);
+    // 空容器:{} 保持为对象叶子,[] 包装为成对数组
+    expect(pathGet(out, '主角信息.物品栏')).toEqual({});
+    expect(statValue(pathGet(out, '女性角色.守岸人.私密资料.性爱日志'))).toEqual([]);
+  });
 });

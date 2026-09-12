@@ -6,7 +6,7 @@ import * as api from '../api';
 
 export function useAgentPromptEditor() {
   const store = useAppStore();
-  const { currentSessionId, currentCharacterId } = storeToRefs(store);
+  const { currentSessionId, currentCharacterId, appMode } = storeToRefs(store);
 
   const agentPromptMd = ref('');
   const promptPreview = ref<api.PromptPreview | null>(null);
@@ -21,6 +21,7 @@ export function useAgentPromptEditor() {
       promptPreview.value = await api.getPromptPreview(
         currentSessionId.value ?? undefined,
         currentCharacterId.value ?? undefined,
+        appMode.value,
       );
     } catch (e) {
       previewError.value = `预览失败:${(e as Error).message}`;

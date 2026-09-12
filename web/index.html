@@ -2,7 +2,8 @@
 <html lang="zh-CN">
   <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <!-- viewport-fit=cover:配合 env(safe-area-inset-*) 处理刘海屏/手势条(移动端布局见 style.css 末尾) -->
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
     <!-- 禁止缓存:WebView2/浏览器会缓存旧 index.html,导致加载旧 hash 资源,表现为「重启后还是旧界面」 -->
     <meta http-equiv="Cache-Control" content="no-store, no-cache, must-revalidate, max-age=0" />
     <meta http-equiv="Pragma" content="no-cache" />

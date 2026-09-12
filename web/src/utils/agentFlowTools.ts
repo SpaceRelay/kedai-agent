@@ -67,3 +67,27 @@ export function cleanStepsTools(steps: AgentFlowStep[]): void {
     s.tools = cleanStepTools(s.tools);
   }
 }
+
+/**
+ * 步骤工具配置的警示文案(F8,2026-09-10 六模式实跑修复)。
+ * 背景:`tools: []` 语义是「全部工具」(非「不使用」),极易误配——实测「理解意图」
+ * 这类 generates=false 的分析步骤被配成全部工具,实际下发 11 个工具(含编排/写类)。
+ * 返回需展示的警示列表(空数组 = 无警示);纯函数便于单测。
+ */
+export function stepToolsWarnings(
+  s: Pick<AgentFlowStep, 'tools' | 'generates'>,
+): string[] {
+  const mode = stepToolMode(s);
+  const out: string[] = [];
+  if (mode === 'all') {
+    out.push(
+      '「全部工具」会下发全部已注册工具(含 agentgo/agentend 等编排类与 write 等写类);仅需要自由选用工具的生成步骤才选它。',
+    );
+  }
+  if (s.generates === false && mode === 'all') {
+    out.push(
+      '本步骤已设为「不生成正文」(如「理解意图」),通常只需只读工具或不用工具;选「全部工具」会把它当作执行步骤,建议改为「不使用工具」或「白名单」。',
+    );
+  }
+  return out;
+}

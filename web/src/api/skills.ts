@@ -14,10 +14,21 @@ export async function importSkills(items: SkillImportItem[]): Promise<{ ok: bool
   return request('/skills', { method: 'POST', body: JSON.stringify(body) });
 }
 
-/** 更新技能(启用/停用、改名、改内容,仅提供字段生效) */
+/** 更新技能(启用/停用、改名、改内容、工具白名单/子智能体/模型覆盖,仅提供字段生效) */
 export async function updateSkill(
   id: string,
-  patch: { enabled?: boolean; name?: string; description?: string; content?: string },
+  patch: {
+    enabled?: boolean;
+    name?: string;
+    description?: string;
+    content?: string;
+    /** 工具白名单(JSON 数组字符串;空串/空数组 = 不限) */
+    allowed_tools?: string;
+    /** 是否允许作为子智能体派发 */
+    run_as_subagent?: boolean;
+    /** 技能级模型覆盖(空 = 沿用当前连接器模型) */
+    model?: string;
+  },
 ): Promise<{ ok: boolean; skill: SkillRecord }> {
   return request(`/skills/${id}`, { method: 'PUT', body: JSON.stringify(patch) });
 }

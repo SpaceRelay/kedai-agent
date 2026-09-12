@@ -13,6 +13,16 @@ export async function testConnect(): Promise<{ ok: boolean; message: string; mod
   return request('/settings/connect', { method: 'POST', body: '{}' });
 }
 
+/** POST /api/settings/embedding/test:测试向量化连接(嵌入固定文本,回传实际维度与耗时) */
+export async function testEmbedding(): Promise<{
+  ok: boolean;
+  dim?: number;
+  latency_ms?: number;
+  message: string;
+}> {
+  return request('/settings/embedding/test', { method: 'POST', body: '{}' });
+}
+
 export async function settingsInfo(): Promise<ConnectorInfo> {
   return request('/settings/info');
 }
@@ -31,9 +41,10 @@ export async function listModels(): Promise<string[]> {
   return data.models;
 }
 
-/** GET /api/settings:读取运行期设置(API Key 脱敏) */
-export async function getSettings(): Promise<RuntimeSettings> {
-  return request('/settings');
+/** GET /api/settings:读取运行期设置(API Key 脱敏);mode 指定读取哪个模式的合并值 */
+export async function getSettings(mode?: 'roleplay' | 'task'): Promise<RuntimeSettings> {
+  const q = mode ? `?mode=${mode}` : '';
+  return request(`/settings${q}`);
 }
 
 /** POST /api/settings/refresh-models:向已保存的 API 请求可用模型列表 */
@@ -45,9 +56,10 @@ export async function refreshModels(): Promise<{ models: string[]; message: stri
   return { models: data.models, message: data.message ?? null };
 }
 
-/** PUT /api/settings:保存运行期设置(部分字段;Base URL/Key 变更立即重建连接器) */
-export async function saveSettings(patch: RuntimeSettingsPatch): Promise<{ ok: boolean; settings: RuntimeSettings }> {
-  return request('/settings', { method: 'PUT', body: JSON.stringify(patch) });
+/** PUT /api/settings:保存运行期设置(部分字段;Base URL/Key 变更立即重建连接器);mode 指定写入哪个模式 */
+export async function saveSettings(patch: RuntimeSettingsPatch, mode?: 'roleplay' | 'task'): Promise<{ ok: boolean; settings: RuntimeSettings }> {
+  const q = mode ? `?mode=${mode}` : '';
+  return request(`/settings${q}`, { method: 'PUT', body: JSON.stringify(patch) });
 }
 
 /** GET /api/settings/agent-prompt:读取项目级运行时主 Agent 提示词(项目根 AGENTS_RUNTIME.md,注入模型) */
@@ -60,11 +72,13 @@ export async function saveAgentPromptMd(content: string): Promise<{ ok: boolean;
   return request('/settings/agent-prompt', { method: 'PUT', body: JSON.stringify({ content }) });
 }
 
-/** GET /api/settings/prompt-preview：按来源、角色、层级与顺序查看最终提示词；历史正文已脱敏。 */
-export async function getPromptPreview(sessionId?: string, characterId?: string): Promise<PromptPreview> {
+/** GET /api/settings/prompt-preview：按来源、角色、层级与顺序查看最终提示词；历史正文已脱敏。
+ *  mode 指定按哪个模式的合并设置预览(task 走 for_mode 覆盖层并追加三层固定提示词)。 */
+export async function getPromptPreview(sessionId?: string, characterId?: string, mode?: 'roleplay' | 'task'): Promise<PromptPreview> {
   const query = new URLSearchParams();
   if (sessionId) query.set('session_id', sessionId);
   if (characterId) query.set('character_id', characterId);
+  if (mode) query.set('mode', mode);
   return request(`/settings/prompt-preview${query.size ? `?${query}` : ''}`);
 }
 

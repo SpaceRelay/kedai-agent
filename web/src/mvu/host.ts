@@ -8,6 +8,7 @@ import type { MvuVariables } from './variables';
 import { pathGet, pathSet } from './variables';
 import { miniJQuery, setJQueryRoot, flushJqReady } from './mini-jquery';
 import { parseUpdateVariable } from './parser';
+import { unwrapStatLeaf } from './unwrap';
 
 /** 脚本执行时的上下文:注入容器 + 当前消息变量树 */
 export interface MvuHostContext {
@@ -52,14 +53,15 @@ const isPlainObject = (v: unknown): v is Record<string, unknown> =>
 
 /**
  * lodash 子集(状态栏/界面脚本常用:_get/_set/_isEmpty/_forEach/_has 等)。
- * stat_data 叶子为 [新值, 更新条件] 成对数组,_.get 自动解包取 [0](MagVarUpdate 生态约定)。
+ * stat_data 叶子为 [新值, 更新条件] 成对数组,_.get 自动解包取 [0](MagVarUpdate 生态约定,
+ * 解包实现收敛于 unwrap.ts 的 unwrapStatLeaf)。
  * 抽出为纯函数便于单测;installMvuGlobals 挂到 window._。
  */
 export function createLodashShim(): Record<string, unknown> {
   return {
     get: (obj: unknown, path: string, def?: unknown) => {
-      let v = pathGet(obj, path);
-      if (Array.isArray(v) && v.length >= 1) v = v[0];
+      // 叶子对自动解包取 [0](共享实现);null/undefined → 默认值是 lodash get 语义,保留在本层
+      const v = unwrapStatLeaf(pathGet(obj, path));
       return v === undefined || v === null ? def : v;
     },
     set: (obj: Record<string, unknown>, path: string, value: unknown) => {

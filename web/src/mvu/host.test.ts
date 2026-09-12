@@ -1,8 +1,23 @@
 import { describe, it, expect } from 'vitest';
 import { createLodashShim } from './host';
 
+/** createLodashShim 返回 Record<string, unknown>(src 故意宽松:动态挂 window._ 的酒馆生态 shim,
+ *  不适合在 src 固化签名);测试侧窄化为本套件用到的方法签名集合,断言行为不变 */
+interface LodashShim {
+  get: (obj: unknown, path: string, def?: unknown) => unknown;
+  set: (obj: Record<string, unknown>, path: string, value: unknown) => void;
+  isEmpty: (v: unknown) => boolean;
+  forEach: (collection: unknown, fn: (value: unknown, key: string | number) => void) => void;
+  has: (obj: unknown, path: string) => boolean;
+  keys: (v: unknown) => unknown[];
+  values: (v: unknown) => unknown[];
+  isArray: (v: unknown) => boolean;
+  isObject: (v: unknown) => boolean;
+  isNil: (v: unknown) => boolean;
+}
+
 describe('createLodashShim', () => {
-  const _ = createLodashShim();
+  const _ = createLodashShim() as unknown as LodashShim;
 
   it('_.get 支持路径与默认值,stat_data 叶子自动解包取 [0]', () => {
     const data = { user: { name: '指挥官' }, pair: ['勇气', '条件'] };

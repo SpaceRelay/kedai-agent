@@ -14,8 +14,8 @@ function entry(ts: number, event: SseEvent, sessionId = 's1'): ApiEventLogEntry 
 }
 
 describe('事件类型标签映射(6c)', () => {
-  it('9 类事件全覆盖', () => {
-    expect(EVENT_TYPES).toHaveLength(9);
+  it('10 类事件全覆盖', () => {
+    expect(EVENT_TYPES).toHaveLength(10);
     expect(EVENT_TYPE_LABELS).toEqual({
       token: '文本流',
       step: '步骤',
@@ -26,6 +26,7 @@ describe('事件类型标签映射(6c)', () => {
       interrupted: '中断',
       error: '错误',
       finish: '完成',
+      task: '任务',
     });
   });
 
@@ -42,11 +43,12 @@ describe('事件过滤(6c)', () => {
     entry(2, { type: 'step', step: '计划', detail: 'x' }, 's1'),
     entry(3, { type: 'token', text: 'b' }, 's2'),
     entry(4, { type: 'error', code: 'E', message: 'm', retryable: false }, 's1'),
+    entry(5, { type: 'task', task_id: 't1', title: '目标', status: 'running', detail: '执行已启动' }, ''),
   ];
 
   it('全部(空/all)返回原列表', () => {
-    expect(filterEventLog(log, '', '')).toHaveLength(4);
-    expect(filterEventLog(log, 'all', '')).toHaveLength(4);
+    expect(filterEventLog(log, '', '')).toHaveLength(5);
+    expect(filterEventLog(log, 'all', '')).toHaveLength(5);
   });
 
   it('按类型过滤', () => {
@@ -57,10 +59,19 @@ describe('事件过滤(6c)', () => {
     ]);
   });
 
-  it('按会话过滤', () => {
+  it('按会话过滤(任务事件始终可见)', () => {
     const got = filterEventLog(log, '', 's2');
-    expect(got).toHaveLength(1);
-    expect(got[0].event.type).toBe('token');
+    expect(got).toHaveLength(2);
+    expect(got.map((e) => e.event.type)).toEqual(['token', 'task']);
+  });
+
+  it('任务事件不隶属会话:会话过滤下始终可见', () => {
+    const got = filterEventLog(log, '', 's1');
+    expect(got).toHaveLength(4);
+    expect(got.map((e) => e.event.type)).toContain('task');
+    const onlyTask = filterEventLog(log, 'task', 's2');
+    expect(onlyTask).toHaveLength(1);
+    expect(onlyTask[0].event.type).toBe('task');
   });
 
   it('类型 + 会话组合过滤', () => {
