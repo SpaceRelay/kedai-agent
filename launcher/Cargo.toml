@@ -1,6 +1,6 @@
 [package]
 name = "kedai-launcher"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 description = "Kedai 图形启动器:双击即用,失败弹窗给出可读原因"
 

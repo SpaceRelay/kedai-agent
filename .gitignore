@@ -2,21 +2,37 @@
 node_modules/
 dist/
 server-rs/target/
+launcher/target/
+src-tauri/target/
+portable-target/
 
-# 本地环境与密钥(API Key 经 .env 或 data/settings.json 提供,均不入库)
+# Tauri 生成物(src-tauri/build.rs 的 tauri_build::build() 产出,构建时自动重建)
+src-tauri/gen/schemas/
+
+# 图形启动器产物(build.ps1 从 launcher/target 复制而来)
+/Kedai.exe
+/Kedai.lnk
+
+# 本地环境与密钥(API Key 经 .env 或 <数据目录>/settings.json 提供,均不入库)
 .env
 .DS_Store
 *.log
 
-# 运行期用户数据:data/ 默认全部忽略,仅白名单放行仓库自带内容
-data/*
-!data/AGENTS_RUNTIME.md
-!data/agent_flows.json
-!data/characters/
-data/characters/*
-!data/characters/builtin-system.json
-!data/plugins/
-data/plugins/*
-!data/plugins/tools/
-data/plugins/tools/*
-!data/plugins/tools/greeting.json
+# 日志目录(服务以 server-rs/ 为 cwd 运行时落在 server-rs/logs/)
+/logs/
+/server-rs/logs/
+
+# 本机专用调试脚本(硬编码本机绝对路径,已被 tools/cargo-vcvars.cmd 取代)
+server-rs/cargo-run.bat
+server-rs/probe.ps1
+
+# 运行期用户数据:数据目录默认在 %APPDATA%\com.kedai.app\(见 README 目录结构一节);
+# 仅当 DATA_DIR 指回项目根时才会出现 data/,一律忽略
+data/
+data.retired-*/
+
+# 仓库索引(派生数据,可重建;详见 .kedai-index/README.md)
+.kedai-index/
+
+# 六模式实跑回归的隔离测试脚手架(临时数据/脚本/日志,不入仓库)
+.shakedown/

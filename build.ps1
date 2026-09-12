@@ -1,28 +1,55 @@
-﻿# Kedai 一键构建脚本
+﻿# Kedai 一键构建脚本(默认双端同步)
 # 1) 构建前端 web/dist(Vue 3 + Vite)
-# 2) 编译 Rust 后端(内嵌 web/dist 的单二进制 kedai-server.exe)
-# 3) -Tauri 时额外打包桌面应用(NSIS 安装程序)
+# 2) 编译 Rust 后端(内嵌 web/dist 的单二进制 kedai-server.exe)→ dist\
+# 3) 默认继续构建便携版 dist\Kedai-portable\Kedai.exe:两版各自把编译那一刻的
+#    web/dist 冻结进二进制,分开构建必然漂移,因此双端同步产出是默认行为而非选项。
 #
 # 用法:
-#   .\build.ps1            # 前端 + Rust release,exe 复制到 dist\ 后删除 server-rs\target
-#   .\build.ps1 -Dev       # 前端 + Rust debug(供 cargo run 开发调试;保留编译缓存不清理)
-#   .\build.ps1 -NoWeb     # 仅 Rust release(复用现有 web/dist),exe 复制到 dist\ 后清理
-#   .\build.ps1 -Tauri     # 前端 + Rust release + Tauri 桌面打包(需 tauri CLI;打包后清理 server-rs 与 src-tauri 的 target)
+#   .\build.ps1               # 前端 + Rust release + 便携版(双端同步;发布/交付/日常构建用这条)
+#   .\build.ps1 -TestOnly     # 仅测试版(快速迭代);结尾会警告便携版未同步
+#   .\build.ps1 -Dev          # 前端 + Rust debug(供 cargo run 开发调试;保留编译缓存,仅按需清 kedai-server 指纹)
+#   .\build.ps1 -NoWeb        # 复用现有 web/dist,仅重编 Rust(双端)
+#   .\build.ps1 -Tauri        # 双端同步之外再追加 NSIS 安装包(需 tauri CLI)
+#   .\build.ps1 -WithPortable # 兼容旧用法;双端同步已是默认,此开关为无操作
+#
+# 前端新鲜度:web/dist 在编译期经 include_dir! 嵌入 kedai-server(见 server-rs/src/api/mod.rs),
+# 由 server-rs/build.rs 声明 rerun-if-changed 保证 cargo 感知;脚本另做 mtime 检测兜底。
+# 末尾删除 target 仅用于释放磁盘,不是新鲜度的保证手段。
+#
+# 构建指纹:每个 dist 产物写出 <exe>.build.json(version/build_time/dist_hash,
+# 见 tools/Write-BuildStamp.ps1),供 start.ps1 与 launcher 启动前比对两版是否同步;
+# server-rs/build.rs 另把 KEDAI_DIST_HASH/KEDAI_BUILD_TIME 编进二进制,经 /api/health 暴露。
 
 param(
     [switch]$Dev,
     [switch]$NoWeb,
-    [switch]$Tauri
+    [switch]$Tauri,
+    [switch]$WithPortable,
+    [switch]$TestOnly
 )
 
 $ErrorActionPreference = "Stop"
 $Root = Split-Path -Parent $MyInvocation.MyCommand.Path
+. (Join-Path $Root "tools\Write-BuildStamp.ps1")
+
+if ($Dev -and $WithPortable) {
+    throw "-Dev 与 -WithPortable 不能同时使用:便携版构建会清理 -Dev 需要保留的编译缓存"
+}
+if ($TestOnly -and $WithPortable) {
+    throw "-TestOnly 与 -WithPortable 语义相反:双端同步已是默认行为,请去掉 -WithPortable"
+}
+if ($TestOnly -and $Dev) {
+    throw "-TestOnly 与 -Dev 语义重叠:-Dev 本就只构建测试版,请去掉 -TestOnly"
+}
+
+# 双端同步是默认行为;-TestOnly / -Dev 是明确的单端快速通道
+$BuildPortable = -not $TestOnly -and -not $Dev
 
 Write-Host "========== Kedai Build ==========" -ForegroundColor Cyan
 
 # 1) 前端构建
 if (-not $NoWeb) {
-    Write-Host "[1/2] 构建前端 (web/dist) ..." -ForegroundColor Green
+    Write-Host "[1/3] 构建前端 (web/dist) ..." -ForegroundColor Green
     Push-Location $Root
     try {
         if (-not (Test-Path "$Root\package-lock.json")) {
@@ -50,8 +77,32 @@ if (-not $NoWeb) {
     Write-Host "[OK] 前端构建完成" -ForegroundColor Green
 }
 
-# 2) Rust 编译
-Write-Host "[2/2] 编译 Rust 后端 ..." -ForegroundColor Green
+# 2) 前端新鲜度检测(兜底):kedai-server 用 include_dir! 在编译期嵌入 web/dist,
+#    build.rs 已声明 rerun-if-changed 让 cargo 自动感知;此处再加 mtime 检测,
+#    防止旧 exe 残留导致增量编译复用旧前端。仅当 exe 已存在且比 dist 旧时,
+#    清掉 kedai-server 的编译指纹强制重编(不会触发 500 个 crate 全量重编)。
+if (-not $NoWeb) {
+    $distIndex = "$Root\web\dist\index.html"
+    $exeCheck = if ($Dev) { "$Root\server-rs\target\debug\kedai-server.exe" } else { "$Root\server-rs\target\release\kedai-server.exe" }
+    if ((Test-Path $distIndex) -and (Test-Path $exeCheck)) {
+        $distTime = (Get-Item $distIndex).LastWriteTime
+        $exeTime = (Get-Item $exeCheck).LastWriteTime
+        if ($distTime -gt $exeTime) {
+            Write-Host "[检测] 前端更新于 $distTime,晚于现有 exe($exeTime),清 kedai-server 指纹强制重编" -ForegroundColor Yellow
+            Push-Location "$Root\server-rs"
+            try {
+                $ErrorActionPreference = "Continue"
+                & $env:ComSpec /d /c "cargo clean -p kedai-server 2>&1"
+            } finally {
+                $ErrorActionPreference = "Stop"
+                Pop-Location
+            }
+        }
+    }
+}
+
+# 3) Rust 编译
+Write-Host "[2/3] 编译 Rust 后端 ..." -ForegroundColor Green
 Push-Location "$Root\server-rs"
 try {
     # cargo 的编译进度写 stderr;PowerShell 5.1 会把 native stderr 包成 NativeCommandError
@@ -79,9 +130,9 @@ if (-not (Test-Path $exe)) {
 }
 Write-Host "[OK] 后端编译完成: $exe" -ForegroundColor Green
 
-# 3) Tauri 桌面打包(可选)
+# 附加) Tauri NSIS 安装包(可选;-Tauri 时)
 if ($Tauri) {
-    Write-Host "[3/3] 打包 Tauri 桌面应用 ..." -ForegroundColor Green
+    Write-Host "[附加] 打包 Tauri 桌面应用(NSIS) ..." -ForegroundColor Green
     Push-Location $Root
     try {
         $ErrorActionPreference = "Continue"
@@ -108,17 +159,31 @@ if ($Tauri) {
 }
 
 # 编译完成,清除编译产物目录(释放磁盘;下次构建全量重编,即约 500 个 crate)。
-# - 生产构建(默认 / -NoWeb):先把 kedai-server.exe 复制到 dist\ 保留,
+# - 生产构建(非 -Dev):先把 kedai-server.exe 复制到 dist\ 保留并写构建指纹 sidecar,
 #   再删除整个 server-rs\target(含缓存与中间产物,回收数 GB 磁盘)。
-# - -Tauri:额外删除整个 src-tauri\target(安装包已复制到 dist\)。
+# - -Tauri 且本次不构建便携版:额外删除整个 src-tauri\target(安装包已复制到 dist\);
+#   本次要构建便携版时保留,交由 build-portable.ps1 复用缓存并统一清理。
 # - -Dev(开发调试):保留,便于 cargo run 增量编译。
 # 文件被占用时删除可能失败,仅警告不中止。
 if (-not $Dev) {
     if (Test-Path $exe) {
         $distDir = Join-Path $Root "dist"
         New-Item -ItemType Directory -Force -Path $distDir | Out-Null
-        Copy-Item $exe (Join-Path $distDir (Split-Path $exe -Leaf)) -Force
+        $dest = Join-Path $distDir (Split-Path $exe -Leaf)
+        try {
+            Copy-Item $exe $dest -Force -ErrorAction Stop
+        } catch [System.IO.IOException] {
+            # 目标 exe 正在运行时 Windows 不允许覆盖,但允许改名:改名让位后新产物即可就位,
+            # 旧进程继续跑旧代码不受影响,下次启动自动用新版
+            $stale = "$dest.old"
+            Move-Item $dest $stale -Force -ErrorAction Stop
+            Copy-Item $exe $dest -Force -ErrorAction Stop
+            Write-Host "[提示] 旧 $(Split-Path $exe -Leaf) 正在运行,已改名为 $(Split-Path $stale -Leaf) 让位;旧进程退出后可删除" -ForegroundColor Yellow
+        }
         Write-Host "[保留] 已复制 $(Split-Path $exe -Leaf) 到 dist\" -ForegroundColor Green
+        # 构建指纹 sidecar:start.ps1 / launcher 据此比对两版是否同步
+        $stampPath = Write-KedaiBuildStamp -Root $Root -ExePath $dest
+        Write-Host "[指纹] 已写出 $(Split-Path $stampPath -Leaf)" -ForegroundColor Green
     }
     if (Test-Path "$Root\server-rs\target") {
         try {
@@ -129,12 +194,82 @@ if (-not $Dev) {
         }
     }
 }
-if ($Tauri -and (Test-Path "$Root\src-tauri\target")) {
+# 本次要构建便携版时保留 src-tauri\target,交由 build-portable.ps1 复用缓存并统一清理。
+if ($Tauri -and -not $BuildPortable -and (Test-Path "$Root\src-tauri\target")) {
     try {
         Remove-Item -Recurse -Force "$Root\src-tauri\target" -ErrorAction Stop
         Write-Host "[清理] 已删除 $Root\src-tauri\target" -ForegroundColor Yellow
+        # target 删除会让 Android 构建留下的 jniLibs .so 符号链接悬空(压缩/备份会报
+        # 「系统找不到指定的路径」);派生文件,一并清理。
+        Clear-KedaiDanglingJniLibs -Root $Root | Out-Null
     } catch {
         Write-Host "[警告] 清理 $Root\src-tauri\target 失败: $($_.Exception.Message)" -ForegroundColor Yellow
+    }
+}
+
+# 4) 便携版构建(默认行为):复用刚产出的 web/dist 与 src-tauri\target 编译缓存,
+#    由 build-portable.ps1 组装 dist\Kedai-portable、写 sidecar 并统一清理 src-tauri\target。
+#    被调脚本失败会以终止错误传播,此处无需再判退出码。
+if ($BuildPortable) {
+    Write-Host "[3/3] 构建便携版 dist\Kedai-portable\Kedai.exe(与测试版同一份前端) ..." -ForegroundColor Green
+    & "$Root\tools\build-portable.ps1" -NoWeb
+}
+
+# 5) 图形启动器与快捷方式(幂等):项目根 Kedai.exe 是双击正式入口(过期询问重建/
+#    端口探测/数据迁移/进程存活确认,见 launcher/src/main.rs)。Kedai.lnk 必须指向它,
+#    而不是 dist 里的裸便携版 exe——后者双击没有任何新鲜度校验,是版本漂移的入口。
+if (-not $Dev) {
+    $launcherExe = Join-Path $Root "Kedai.exe"
+    $launcherBuilt = Join-Path $Root "launcher\target\release\Kedai.exe"
+
+    $launcherSrcNewer = $true
+    if (Test-Path $launcherBuilt) {
+        $srcLatest = Get-ChildItem (Join-Path $Root "launcher\src") -Recurse -File -ErrorAction SilentlyContinue |
+            Measure-Object -Property LastWriteTime -Maximum |
+            Select-Object -ExpandProperty Maximum
+        $launcherSrcNewer = ($null -ne $srcLatest -and $srcLatest -gt (Get-Item $launcherBuilt).LastWriteTime) -or
+            ((Get-Item (Join-Path $Root "launcher\Cargo.toml")).LastWriteTime -gt (Get-Item $launcherBuilt).LastWriteTime)
+    }
+    if ($launcherSrcNewer) {
+        Write-Host "[附加] 编译图形启动器(launcher,零依赖秒级) ..." -ForegroundColor Green
+        Push-Location $Root
+        try {
+            $ErrorActionPreference = "Continue"
+            & $env:ComSpec /d /c "cargo build --release --manifest-path `"$Root\launcher\Cargo.toml`" 2>&1"
+            $code = $LASTEXITCODE
+            if ($code -ne 0) { throw "launcher 编译失败(exit=$code)" }
+        } finally {
+            $ErrorActionPreference = "Stop"
+            Pop-Location
+        }
+    }
+    if ((Test-Path $launcherBuilt) -and ((-not (Test-Path $launcherExe)) -or
+        ((Get-Item $launcherBuilt).LastWriteTime -gt (Get-Item $launcherExe).LastWriteTime))) {
+        try {
+            Copy-Item $launcherBuilt $launcherExe -Force -ErrorAction Stop
+            Write-Host "[附加] 已更新项目根 Kedai.exe(图形启动器)" -ForegroundColor Green
+        } catch [System.IO.IOException] {
+            Write-Host "[警告] 项目根 Kedai.exe 正在运行,本次未能更新启动器;关闭后重跑构建即可" -ForegroundColor Yellow
+        }
+    }
+
+    # 快捷方式:仅修正目标与工作目录,图标等其余字段保持不动;lnk 缺失时顺手创建
+    $lnkPath = Join-Path $Root "Kedai.lnk"
+    try {
+        $wshell = New-Object -ComObject WScript.Shell
+        $sc = $wshell.CreateShortcut($lnkPath)
+        if (($sc.TargetPath -ne $launcherExe) -or ($sc.WorkingDirectory -ne $Root)) {
+            $sc.TargetPath = $launcherExe
+            $sc.WorkingDirectory = $Root
+            if ([string]::IsNullOrEmpty($sc.IconLocation)) {
+                $portableForIcon = Join-Path $Root "dist\Kedai-portable\Kedai.exe"
+                if (Test-Path $portableForIcon) { $sc.IconLocation = "$portableForIcon,0" }
+            }
+            $sc.Save()
+            Write-Host "[附加] Kedai.lnk 已指向图形启动器(双击自带过期检测)" -ForegroundColor Green
+        }
+    } catch {
+        Write-Host "[警告] 更新 Kedai.lnk 失败: $($_.Exception.Message)" -ForegroundColor Yellow
     }
 }
 
@@ -142,6 +277,21 @@ Write-Host "==================================" -ForegroundColor Cyan
 if ($Dev) {
     Write-Host "启动方式: $exe"
 } else {
-    Write-Host "后端产物: $Root\dist\kedai-server.exe"
+    Write-Host "测试版: $Root\dist\kedai-server.exe"
 }
 if ($Tauri) { Write-Host "桌面安装包: $Root\dist\" -ForegroundColor Green }
+
+if ($BuildPortable) {
+    Write-Host "便携版: $Root\dist\Kedai-portable\Kedai.exe" -ForegroundColor Green
+    # 同步结论:两个 sidecar 的 dist_hash 必须一致;不一致说明构建链路出了裂缝,直接红字报警
+    $hTest = Read-KedaiDistHash -ExePath (Join-Path $Root "dist\kedai-server.exe")
+    $hPort = Read-KedaiDistHash -ExePath (Join-Path $Root "dist\Kedai-portable\Kedai.exe")
+    if ($hTest -and $hPort -and ($hTest -eq $hPort)) {
+        Write-Host "[同步] 测试版与便携版指纹一致(dist_hash=$($hTest.Substring(0,12))…)" -ForegroundColor Green
+    } else {
+        Write-Host "[严重] 两端指纹不一致或缺失(test=$hTest portable=$hPort),请立即重跑 .\build.ps1" -ForegroundColor Red
+    }
+} elseif ($TestOnly) {
+    Write-Host "[警告] 本次为 -TestOnly 单端构建:便携版 dist\Kedai-portable\Kedai.exe 未更新。" -ForegroundColor Yellow
+    Write-Host "       交付或日常使用 exe 版之前,请执行一次 .\build.ps1(默认双端同步)。" -ForegroundColor Yellow
+}

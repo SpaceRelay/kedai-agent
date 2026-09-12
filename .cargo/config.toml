@@ -1,0 +1,26 @@
+# Kedai:Cargo 配置(仓库根,cargo 从任意子目录向上查找都会命中)。
+#
+# 16KB page size 对齐(Android 15+ 新设备要求):
+# Android 15 起,部分设备使用 16KB 内存页;未按 16KB 对齐的原生库(含 Rust .so)
+# 在这些设备上会加载失败。用链接参数把 ELF 段对齐从默认 4KB 提升到 16KB 即可兼容
+# 两类设备(4KB 设备同样可运行 16KB 对齐的库,只是略增体积)。
+#
+# 只对 Android 目标生效 —— 桌面三平台不受影响,`cargo test` / 桌面构建行为不变。
+# 注意:此项会让 Android 侧 Rust 首次全量重编。
+#
+# 校验方式(构建后):
+#   node -e "..." 读 ELF program header,断言 p_align == 0x4000(或 >= 0x4000)。
+#
+# 参考:https://developer.android.com/guide/practices/page-sizes
+
+[target.aarch64-linux-android]
+rustflags = ["-C", "link-arg=-Wl,-z,max-page-size=16384"]
+
+[target.x86_64-linux-android]
+rustflags = ["-C", "link-arg=-Wl,-z,max-page-size=16384"]
+
+[target.armv7-linux-androideabi]
+rustflags = ["-C", "link-arg=-Wl,-z,max-page-size=16384"]
+
+[target.i686-linux-android]
+rustflags = ["-C", "link-arg=-Wl,-z,max-page-size=16384"]
