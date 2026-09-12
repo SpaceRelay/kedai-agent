@@ -92,9 +92,12 @@ kedai 落点：
 | `agents/engine/` | L2 | Agent 编排（run 流程、消息构建、mvu 应用） |
 | `agents/planner.rs` / `reflector.rs` / `state_machine.rs` | L2 | 计划/反思/状态机 |
 | `services/` | L2 | 业务服务（角色/会话/世界书/注入/设置/密钥） |
+| `services/task_engine/` | L2 | 六模式任务引擎（EventSink/ModeExecutor 底座 + solo/multi/plan/team/custom 执行器;legacy 仍驻 task_service）——语义见 `docs/任务引擎六模式.md` |
 | `api/` | L2 | 路由 + 鉴权 + SSE |
 | `connectors/` | L2 | LLM 后端适配 |
 | `tools/` | L3 | 工具系统（registry/calculator/memory/search） |
+| `services/undo_service.rs` + `api/undo.rs`（批次 6.1） | L3 | 回退快照/undo：写工具（write/replace/create/update_variables/memory_write）执行前取逆操作负载落 `undo_snapshots` 表，`POST /api/undo/{id}/restore` 逆序恢复；默认开，`undo_enabled` 设置开关隔离（命名避开 contracts 的 checkpoint/StateCheckpoint） |
+| `mcp/`（批次 6.2） | L3 | MCP stdio 客户端：JSON-RPC 2.0（NDJSON 行帧）托管子进程，工具以 `mcp_{server}_{tool}` 前缀注册进 ToolRegistry（未知工具默认 Dangerous 裁决自动覆盖）；默认关，`mcp_enabled` 设置开关 + `mcp_servers` 列表隔离，仅启动时装配（改设置需重启生效，无热重连） |
 | `web/src/mvu/`（前端） | L1+L3 | 变量树展示/回放（L1 协议）+ 宿主集成（L3） |
 | `web/src/components/` | L3 | UI 组件 |
 | 测试套件（`tests/` + `*.test.ts`） | L1 | 经验库，晋升门槛的裁判 |
