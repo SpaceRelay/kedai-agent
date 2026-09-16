@@ -9,10 +9,10 @@ use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use tauri::Manager;
-// 关闭确认弹窗用的 DialogExt 扩展(trait 需在作用域内才能调用 window.dialog());
-// 该确认流程仅桌面存在(Android 无 window CloseRequested 事件,见 run() 的 RunEvent 分支)
+// Rust→前端下发「用户点了窗口关闭」需要 Emitter trait 在作用域内(emit);
+// 该事件仅桌面存在(Android 无 WindowEvent::CloseRequested,见 run() 的 RunEvent 分支)
 #[cfg(desktop)]
-use tauri_plugin_dialog::DialogExt;
+use tauri::Emitter;
 
 mod native_bridge;
 
@@ -23,6 +23,32 @@ const READY_INTERVAL: Duration = Duration::from_millis(250);
 /// 仅桌面读取(Android 无端口清理流程),故标注 desktop 以消除移动端 dead_code 警告。
 #[cfg(desktop)]
 struct ResolvedPort(u16);
+
+/// 关闭确认的二次关闭兜底标记(2026-09-16 批次 5)。
+///
+/// 为什么需要:关闭确认从「Tauri 原生对话框」改为「前端自绘弹窗」后,壳在
+/// CloseRequested 里 prevent_close 并等前端响应。若前端崩溃、页面未加载完或弹窗
+/// chunk 加载失败,确认框永远不会出现,窗口就再也关不掉——比没有确认框更糟。
+/// 这枚标记让第二次点击关闭直接退出:第一次置位(交给前端弹),已是置位态即强退。
+#[cfg(desktop)]
+#[derive(Default)]
+struct ExitGuard(std::sync::atomic::AtomicBool);
+
+/// 登记一次关闭请求,返回「是否应当强制退出」。
+///
+/// 首次调用(false→true)返回 false:交给前端弹确认框;再次调用(已是 true)返回 true:
+/// 前端没响应,不再阻止关闭。抽成纯函数是为了可单测——窗口关不掉是用户可感的硬故障。
+#[cfg(desktop)]
+fn register_close_request(flag: &std::sync::atomic::AtomicBool) -> bool {
+    flag.swap(true, std::sync::atomic::Ordering::SeqCst)
+}
+
+/// 前端取消退出时复位兜底标记:否则「取消一次」之后,下一次单击关闭会因标记仍是
+/// 置位态而跳过确认直接退出。
+#[cfg(desktop)]
+fn reset_close_request(flag: &std::sync::atomic::AtomicBool) {
+    flag.store(false, std::sync::atomic::Ordering::SeqCst);
+}
 
 /// 结束占用指定端口的**其它**进程(排除自身):关闭 Kedai 时一并清理可能存在的
 /// 独立后端残留(例如上次直接运行 dist\kedai-server.exe 未退出、或旧桌面版未回收)。
@@ -109,6 +135,38 @@ pub unsafe extern "C" fn JNI_OnLoad(vm: *mut std::ffi::c_void, _reserved: *mut s
 /// 语义与桌面版一致:后端与壳同进程,退出即整体结束,无残留服务。
 const EXIT_APP_EVENT: &str = "kedai://exit-app";
 
+/// 壳→前端下发「用户点了窗口关闭,请弹退出确认」(仅桌面)。
+///
+/// 为什么走事件而不是原生对话框:关闭确认要出前端至上主义样式,而 Tauri 的
+/// `window.dialog()` 是 Windows MessageBox,外观不受前端 CSS 控制。
+/// 方向与 EXIT_APP_EVENT 相反(Rust→前端),但同样复用事件系统权限
+/// (core:default 内含 core:event:default = allow-listen/allow-emit),无需改 capabilities。
+#[cfg(desktop)]
+const CLOSE_REQUESTED_EVENT: &str = "kedai://close-requested";
+
+/// 前端→壳:用户在确认框点了「取消」,复位二次关闭兜底标记(仅桌面)。
+/// 没有它,取消一次之后的下一次关闭会被兜底标记直接放行。
+#[cfg(desktop)]
+const CLOSE_CANCELLED_EVENT: &str = "kedai://close-cancelled";
+
+/// 退出应用:先清理端口上的其它 Kedai 残留(独立后端/旧实例),再结束本进程。
+/// 关闭确认与前端退出事件共用此出口,保证「退出 = 全部结束」。
+#[cfg(desktop)]
+fn exit_now(app: &tauri::AppHandle) {
+    // 先清理端口上的其它 Kedai 残留(独立后端等),再退出本进程
+    if let Some(port) = app.try_state::<ResolvedPort>() {
+        terminate_other_port_owners(port.0);
+    }
+    app.exit(0);
+}
+
+/// Android:无端口残留清理流程(无 netstat/taskkill,且系统 launcher 保证单实例),
+/// 后端与壳同进程,退出即整体结束。
+#[cfg(mobile)]
+fn exit_now(app: &tauri::AppHandle) {
+    app.exit(0);
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -123,8 +181,21 @@ pub fn run() {
                 let handle = app.handle().clone();
                 app.listen(EXIT_APP_EVENT, move |_| {
                     tracing::info!("收到前端退出请求,结束进程");
-                    handle.exit(0);
+                    // 走统一退出出口:清理端口残留后再退(此前事件路径漏了清理,
+                    // 只有原生对话框回调清理,留下「点退出后 kedai-server 还在跑」的缺口)
+                    exit_now(&handle);
                 });
+
+                // 前端取消退出:复位二次关闭兜底标记,让下一次关闭仍走确认框。
+                #[cfg(desktop)]
+                {
+                    let handle = app.handle().clone();
+                    app.listen(CLOSE_CANCELLED_EVENT, move |_| {
+                        if let Some(guard) = handle.try_state::<ExitGuard>() {
+                            reset_close_request(&guard.0);
+                        }
+                    });
+                }
 
                 // 原生能力事件(外链/分享/保活):同样是「前端 emit → 原生执行」,
                 // 绕开 remote origin 下的自定义命令 ACL 限制。
@@ -157,6 +228,12 @@ pub fn run() {
                 app.listen(native_bridge::KEEPALIVE_STOP_EVENT, |_| {
                     if let Err(e) = native_bridge::keepalive_stop() {
                         tracing::warn!(error = e, "停止前台服务保活失败");
+                    }
+                });
+                // 命令执行层的 Shizuku 授权请求(阶段 E):弹系统授权框
+                app.listen(native_bridge::SHIZUKU_REQUEST_EVENT, |_| {
+                    if let Err(e) = native_bridge::request_shizuku_permission() {
+                        tracing::warn!(error = e, "请求 Shizuku 授权失败");
                     }
                 });
             }
@@ -209,6 +286,9 @@ pub fn run() {
             // 托管端口供退出清理使用(见 terminate_other_port_owners);仅桌面消费该状态
             #[cfg(desktop)]
             app.manage(ResolvedPort(config.port));
+            // 关闭确认的二次关闭兜底标记(仅桌面有 CloseRequested 事件)
+            #[cfg(desktop)]
+            app.manage(ExitGuard::default());
             let app_handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 if let Err(error) = start_and_wait_ready(config, app_handle.clone(), log_dir.clone()).await {
@@ -226,12 +306,15 @@ pub fn run() {
             // Android 不使用 app_handle(退出无需清理端口),显式忽略以避免未使用告警
             #[cfg(mobile)]
             let _ = &app_handle;
-            // 关闭确认(实跑问题 8):拦截窗口关闭,弹「确定退出」确认框;
-            // 用户确认才退出进程(后端与桌面壳同进程,exit 即整体结束,无残留服务)。
-            // 注意:on_window_event 在主线程,不可用 blocking_show,走异步 show 回调。
+            // 关闭确认(实跑问题 8):拦截窗口关闭,下发事件让前端弹「确定退出」确认框;
+            // 用户确认后前端发 EXIT_APP_EVENT,才真正退出。
+            //
+            // 为什么不用原生 window.dialog()(2026-09-16 批次 5 改动):它是 Windows
+            // MessageBox,外观不受前端 CSS 影响,做不出至上主义样式;改为前端自绘弹窗。
             //
             // 平台差异:Android 没有 WindowEvent::CloseRequested(Activity 不会被「关闭」),
-            // 退出由系统返回键/最近任务驱动,故整段确认流程仅桌面编译。
+            // 退出由系统返回键/最近任务驱动(返回键无处可退时前端弹同一个确认框),
+            // 故整段确认流程仅桌面编译。
             #[cfg(desktop)]
             if let tauri::RunEvent::WindowEvent {
                 event: tauri::WindowEvent::CloseRequested { api, .. },
@@ -239,29 +322,20 @@ pub fn run() {
             } = event
             {
                 api.prevent_close();
-                let handle = app_handle.clone();
-                let window = app_handle.get_webview_window("main");
-                // 对话框挂到窗口(无窗口时退回 app handle 的问询对话框)
-                if let Some(window) = window {
-                    window
-                        .dialog()
-                        .message("确定要退出 Kedai 吗?")
-                        .title("Kedai")
-                        .kind(tauri_plugin_dialog::MessageDialogKind::Warning)
-                        .buttons(tauri_plugin_dialog::MessageDialogButtons::OkCancelCustom(
-                            "退出".into(),
-                            "取消".into(),
-                        ))
-                        .show(move |confirmed| {
-                            if confirmed {
-                                // 先清理端口上的其它 Kedai 残留(独立后端等),
-                                // 再退出本进程;确保「关闭 = 全部结束」。
-                                if let Some(port) = handle.try_state::<ResolvedPort>() {
-                                    terminate_other_port_owners(port.0);
-                                }
-                                handle.exit(0);
-                            }
-                        });
+                // 二次关闭兜底:前端不响应(页面未加载完/弹窗 chunk 加载失败/脚本异常)
+                // 时仍要能关掉窗口,否则比没有确认框更糟。
+                let force = app_handle
+                    .try_state::<ExitGuard>()
+                    .map(|guard| register_close_request(&guard.0))
+                    .unwrap_or(false);
+                if force {
+                    tracing::warn!("前端未响应关闭确认,第二次关闭直接退出");
+                    exit_now(&app_handle);
+                } else if let Err(e) = app_handle.emit(CLOSE_REQUESTED_EVENT, ()) {
+                    // 事件下发失败(无 webview 等)意味着确认框不可能出现:
+                    // 用户点了关闭就必须关得掉,直接退出比挂住强。
+                    tracing::warn!(error = e.to_string(), "关闭确认事件下发失败,直接退出");
+                    exit_now(&app_handle);
                 }
             }
 
@@ -659,5 +733,30 @@ mod tests {
         config.host = "0.0.0.0".into();
         config.port = 4321;
         assert_eq!(service_url(&config), "http://127.0.0.1:4321/");
+    }
+
+    /// 二次关闭兜底(批次 5):关闭确认改前端弹窗后,前端不响应时窗口也必须关得掉。
+    /// 首次关闭交给前端弹确认框;第二次直接强退;用户取消后复位,回到确认流程。
+    #[cfg(desktop)]
+    #[test]
+    fn close_request_guard_forces_exit_only_on_second_request() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let flag = AtomicBool::new(false);
+        assert!(
+            !register_close_request(&flag),
+            "首次关闭应交给前端弹确认框,不得直接退出"
+        );
+        assert!(
+            register_close_request(&flag),
+            "前端未响应时,第二次关闭必须强制退出(否则窗口关不掉)"
+        );
+        // 用户点了取消:复位后应恢复「先弹确认框」的行为,
+        // 不得因上一轮的置位标记把下一次关闭直接放行
+        reset_close_request(&flag);
+        assert!(
+            !register_close_request(&flag),
+            "取消退出后应回到确认流程,而不是下一次点击就退出"
+        );
+        assert!(flag.load(Ordering::SeqCst), "复位后应被本次请求重新置位");
     }
 }

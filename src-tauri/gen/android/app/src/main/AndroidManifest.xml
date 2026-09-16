@@ -7,6 +7,15 @@
     <!-- Android 13+:前台服务通知可见所需(拒绝仅导致通知不可见,不影响保活) -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
+    <!-- 命令执行(阶段 D):Shizuku 授权。Shizuku 以 ADB shell 权限提供 API,
+         应用需声明其权限名;未安装 Shizuku 时该声明无副作用。 -->
+    <uses-permission android:name="moe.shizuku.manager.permission.API_V23" />
+
+    <!-- Shizuku 服务包可见性(Android 11+ 包可见性限制):用于探测是否已安装 Shizuku -->
+    <queries>
+        <package android:name="moe.shizuku.privileged.api" />
+    </queries>
+
     <!-- AndroidTV support -->
     <uses-feature android:name="android.software.leanback" android:required="false" />
 

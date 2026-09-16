@@ -39,6 +39,18 @@
 # 前台服务由清单按类名声明,混淆后系统找不到(虽非 JNI,但同样必须保留类名)
 -keep class com.kedai.app.KeepAliveService { *; }
 
+# ============================================================================
+# Kedai:命令执行桥(阶段 D)同样被 native 按名调用
+# (server-rs/src/services/exec/android.rs 经 jni_bridge 的
+#  FindClass("com/kedai/app/ShellExecutorBridge") + CallStaticMethod 反射调用)。
+# 方法:detectTier / refreshTier / exec / requestShizukuPermission。
+# 整类保留(逐成员签名写法在 KeystoreBridge 上已证明不可靠)。
+#
+# 另:本类经**反射**访问 rikka.shizuku.Shizuku(编译期不强依赖,未装 Shizuku 时
+# 静默降级为沙箱档)。Shizuku 的类名/方法名是外部契约,按字符串查找、不参与本包混淆。
+# ============================================================================
+-keep class com.kedai.app.ShellExecutorBridge { *; }
+
 # If your project uses WebView with JS, uncomment the following
 # and specify the fully qualified class name to the JavaScript interface
 # class:

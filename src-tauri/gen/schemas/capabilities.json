@@ -1,1 +1,1 @@
-{"default":{"identifier":"default","description":"Kedai 桌面应用能力(窗口 + 导出保存对话框与文件写入)","remote":{"urls":["http://127.0.0.1:*/"]},"local":true,"windows":["main"],"permissions":["core:default","dialog:allow-save",{"identifier":"fs:allow-write-text-file","allow":[{"path":"**"}]}]}}
+{"default":{"identifier":"default","description":"Kedai 桌面应用能力(窗口 + 导出保存对话框与文件写入)","remote":{"urls":["http://127.0.0.1:*/"]},"local":true,"windows":["main"],"permissions":["core:default","dialog:allow-save",{"identifier":"fs:allow-write-text-file","allow":[{"path":"**"}]},"core:window:allow-close"]}}

@@ -47,6 +47,14 @@ object KedaiNative {
     private fun requireContext(): Context =
         appContext ?: throw IllegalStateException("KedaiNative 未初始化:MainActivity 未注入 Context")
 
+    /**
+     * 取应用上下文(未注入时返回 null)。供 [ShellExecutorBridge] 等兄弟桥类做
+     * 「可用性探测」——探测路径不应因上下文缺失而抛异常(抛了会让整段探测失败)。
+     */
+    @JvmStatic
+    @Keep
+    fun appContextOrNull(): Context? = appContext
+
     /** 用系统浏览器打开外链 */
     @JvmStatic
     @Keep
