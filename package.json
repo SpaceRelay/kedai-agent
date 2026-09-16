@@ -1,6 +1,6 @@
 {
   "name": "kedai",
-  "version": "0.2.1",
+  "version": "0.3.0-B-beta",
   "private": true,
   "description": "文学创作 / 角色扮演交互工具 —— 前端 Vue 3,后端 Rust(axum)",
   "workspaces": [
@@ -19,6 +19,14 @@
     "desktop": "dist\\Kedai-portable\\Kedai.exe",
     "start": "powershell -NoProfile -ExecutionPolicy Bypass -File start.ps1",
     "check": "powershell -NoProfile -ExecutionPolicy Bypass -File tools/check-all.ps1",
+    "check:contract": "node tools/check-contract.mjs",
+    "check:arch": "node tools/check-arch.mjs",
+    "check:lock": "node tools/check-lock-sync.mjs",
+    "check:docs": "node tools/check-docs.mjs",
+    "check:lint": "node tools/check-frontend-lint.mjs",
+    "check:tests": "node tools/count-tests.mjs --check",
+    "count:tests": "node tools/count-tests.mjs",
+    "hooks:install": "powershell -NoProfile -ExecutionPolicy Bypass -File tools/install-hooks.ps1",
     "perf": "node tools/perf-baseline.mjs",
     "inspect:card": "node tools/inspect-card.mjs"
   },

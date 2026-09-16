@@ -1,0 +1,39 @@
+#!/bin/sh
+# Kedai pre-push 门禁:推送前跑一次完整本地检查,失败即阻止推送。
+#
+# 安装:tools/install-hooks.ps1(或手动复制到 .git/hooks/pre-push 并 chmod +x)
+# 绕过:git push --no-verify(仅限真正紧急;交付前必须补跑 tools/check-all.ps1)
+#
+# 设计说明:
+#   - 调 check-all.ps1 而非重复实现检查逻辑(单一事实源,见 MAINTENANCE §0 门禁纪律)。
+#   - check-all.ps1 需要 vcvars64 环境,该脚本内部已自行导入(见其 17-39 行),故此处直接调。
+#   - -Quick 跳过前端 vite build:构建产物正确性由 build.ps1 保证,推送门禁只需
+#     测试与静态检查通过即可,避免每次推送都等一次完整打包。
+
+REPO_ROOT=$(git rev-parse --show-toplevel)
+CHECK="$REPO_ROOT/tools/check-all.ps1"
+
+if [ ! -f "$CHECK" ]; then
+    echo "[pre-push] 未找到 $CHECK,跳过门禁" >&2
+    exit 0
+fi
+
+echo "[pre-push] 运行本地门禁 check-all.ps1 -Quick(可用 git push --no-verify 跳过)..."
+
+# Windows: 用 powershell 执行;非 Windows 用 pwsh。
+if command -v powershell >/dev/null 2>&1; then
+    powershell -NoProfile -ExecutionPolicy Bypass -File "$CHECK" -Quick
+else
+    pwsh -NoProfile -File "$CHECK" -Quick
+fi
+
+status=$?
+if [ $status -ne 0 ]; then
+    echo "" >&2
+    echo "[pre-push] 门禁未通过,推送已中止。" >&2
+    echo "[pre-push] 修复后重试;确需紧急推送可 git push --no-verify,但交付前必须补跑完整检查。" >&2
+    exit $status
+fi
+
+echo "[pre-push] 门禁通过,继续推送"
+exit 0

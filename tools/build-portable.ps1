@@ -52,6 +52,10 @@ try {
     # NativeCommandError 中止脚本,且经 powershell -File 调用时退出码可能为 0(失败被吞)。
     # 经 cmd 内联合并流,成败以退出码判断,保证失败如实传播。
     $ErrorActionPreference = "Continue"
+    # 占用让位:运行中的 kedai-portable.exe(直接跑 src-tauri\target 产物时)会锁住链接目标,
+    # 导致 cargo 报「failed to remove file ... os error 5」;编译前改名让位,无需杀进程。
+    [void](Clear-KedaiLockedBuildArtifact -ExePath $DesktopExe)
+    [void](Clear-KedaiLockedBuildArtifact -ExePath (Join-Path $Root "src-tauri\target\release\kedai-desktop.exe"))
     & $env:ComSpec /d /c "cargo build --release --manifest-path `"$(Join-Path $Root 'src-tauri\Cargo.toml')`" --bin kedai-portable 2>&1"
     $code = $LASTEXITCODE
     $ErrorActionPreference = "Stop"
@@ -108,7 +112,23 @@ Write-Host "入口:$OutputDir\Kedai.exe"
 
 # 打包完成,清除编译产物目录(释放磁盘;下次构建需重新编译)。
 # 文件被占用(如 Kedai.exe 仍在运行)时删除可能失败,仅警告不中止。
-$CleanDirs = @((Join-Path $Root "server-rs\target"), (Join-Path $Root "src-tauri\target"))
+# server-rs 产物目录:构建可能把后端产物外置(CARGO_TARGET_DIR)——2026-09-13 批次 1 起跟随;
+# **但外置目录可能与他人共用**(本机 D:\kedai-build 下挂着 Android 构建的 junction 目标
+# android-app-build),整删会连带删掉 → APK 构建报「无法创建目录」。故外置时只清 cargo 子目录。
+$ServerRustTarget = if ($env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR }
+                    else { Join-Path $Root "server-rs\target" }
+$DefaultServerTarget = Join-Path $Root "server-rs\target"
+if ($ServerRustTarget -eq $DefaultServerTarget) {
+    $CleanDirs = @($ServerRustTarget, (Join-Path $Root "src-tauri\target"))
+} else {
+    $CleanDirs = @(
+        (Join-Path $ServerRustTarget "debug"), (Join-Path $ServerRustTarget "release"),
+        (Join-Path $ServerRustTarget "tmp"), (Join-Path $ServerRustTarget "CACHEDIR.TAG"),
+        (Join-Path $ServerRustTarget ".rustc_info.json"),
+        (Join-Path $Root "src-tauri\target")
+    )
+    Write-Host "[提示] 外置产物目录只清 cargo 子目录,保留同目录下其它数据: $ServerRustTarget" -ForegroundColor DarkGray
+}
 foreach ($dir in $CleanDirs) {
     if (Test-Path $dir) {
         try {

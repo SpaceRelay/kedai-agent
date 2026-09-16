@@ -1,0 +1,28 @@
+# cargo-audit 配置(仓库根;cargo-audit 从当前目录向上查找 .cargo/audit.toml,
+# 因此 tools/check-all.ps1 在任意子目录运行都能命中)。
+#
+# 用途:忽略**无法在本仓库内修复**的 RustSec 信息类告警(informational = "unmaintained",
+# patched = [] 即上游无修复版本)。这里只登记「非漏洞、无 CVE、纯维护状态」的条目;
+# 任何**真实漏洞**(vulnerabilities,含 CVE/影响函数)一律不 ignore,出现即由硬门禁拦截。
+#
+# 逐条复审时机:每次 Tauri / gtk-rs / tauri-utils 版本升级后重跑
+#   cargo audit -f src-tauri/Cargo.lock
+# 若下列 crate 已从依赖树消失,应及时删除对应 ignore(不留僵尸条目)。
+
+[advisories]
+ignore = [
+    # glib 0.18.5 的 proc-macro 宏依赖(glib-macros -> proc-macro-error 1.0.4)。
+    # 依赖路径:glib -> gtk 0.18 -> {webkit2gtk, wry, tao, tauri} —— 仅 Linux 目标编译,
+    # Windows/Android 产物不含该树。上游 2 年无维护、无修复版本(patched = []);
+    # 本地无法替换(由 Tauri 的 GTK 后端固定 gtk-rs 0.18 代)。
+    "RUSTSEC-2024-0370",
+    # 以下 5 条为 open-i18n/rust-unic 全系 unmaintained(patched = [])。
+    # 依赖路径:tauri-utils 2.9.3 -> urlpattern 0.3 -> unic-ucd-ident -> unic-*。
+    # 该链在 Windows/Android 均编入,但属 Tauri 框架自身的传递依赖,只能等上游
+    # 让 tauri-utils 弃用 urlpattern/rust-unic;本地无可行的版本升级路径。
+    "RUSTSEC-2025-0081", # unic-char-property 0.9.0
+    "RUSTSEC-2025-0075", # unic-char-range 0.9.0
+    "RUSTSEC-2025-0080", # unic-common 0.9.0
+    "RUSTSEC-2025-0100", # unic-ucd-ident 0.9.0
+    "RUSTSEC-2025-0098", # unic-ucd-version 0.9.0
+]

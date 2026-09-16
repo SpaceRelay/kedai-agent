@@ -25,12 +25,60 @@ param(
     [switch]$NoWeb,
     [switch]$Tauri,
     [switch]$WithPortable,
-    [switch]$TestOnly
+    [switch]$TestOnly,
+    [switch]$SkipChecks,
+    # 后端 cargo target 根(仅作用于 server-rs,不影响 src-tauri 便携版产物路径)。
+    # 默认 server-rs\target。当该目录被安全软件拦截「新建可执行文件的执行」时
+    # (build script exe 报 os error 5),用本参数把后端产物外置到白名单目录,例如:
+    #   .\build.ps1 -RustTargetDir D:\kedai-build
+    [string]$RustTargetDir
 )
 
 $ErrorActionPreference = "Stop"
 $Root = Split-Path -Parent $MyInvocation.MyCommand.Path
 . (Join-Path $Root "tools\Write-BuildStamp.ps1")
+
+# 版本一致性断言:全仓自身版本号必须一致,任一漏改即构建失败。
+# 覆盖 7 处声明(package.json / web/package.json / package-lock.json /
+# server-rs|src-tauri|launcher 的 Cargo.toml / tauri.conf.json)。
+# 由 tools/bump-version.ps1 统一维护;此处只读校验,不代改。
+function Assert-VersionConsistency {
+    $declared = [ordered]@{}
+    # 统一口径:取文件第一处 "version" 字段(与 tools/bump-version.ps1 同语义)。
+    # 不用 ConvertFrom-Json:PS 5.1 解析 package-lock.json 会因依赖键名报错。
+    function Get-JsonVersion([string]$rel) {
+        $p = Join-Path $Root $rel
+        if (-not (Test-Path $p)) { return "(缺失)" }
+        $m = [regex]::Match([System.IO.File]::ReadAllText($p), '"version"\s*:\s*"([^"]*)"')
+        if ($m.Success) { return $m.Groups[1].Value }
+        return "(解析失败)"
+    }
+    function Get-TomlVersion([string]$rel) {
+        $p = Join-Path $Root $rel
+        if (-not (Test-Path $p)) { return "(缺失)" }
+        $m = [regex]::Match([System.IO.File]::ReadAllText($p), '(?m)^version\s*=\s*"([^"]*)"')
+        if ($m.Success) { return $m.Groups[1].Value }
+        return "(解析失败)"
+    }
+    $declared["package.json"] = Get-JsonVersion "package.json"
+    $declared["web/package.json"] = Get-JsonVersion "web\package.json"
+    $declared["package-lock.json"] = Get-JsonVersion "package-lock.json"
+    $declared["server-rs/Cargo.toml"] = Get-TomlVersion "server-rs\Cargo.toml"
+    $declared["src-tauri/Cargo.toml"] = Get-TomlVersion "src-tauri\Cargo.toml"
+    $declared["launcher/Cargo.toml"] = Get-TomlVersion "launcher\Cargo.toml"
+    $declared["src-tauri/tauri.conf.json"] = Get-JsonVersion "src-tauri\tauri.conf.json"
+
+    $distinct = @($declared.Values | Select-Object -Unique)
+    if ($distinct.Count -gt 1) {
+        Write-Host "[FAIL] 版本号不一致,构建中止。请跑 npm run version:bump -- <x.y.z> 统一:" -ForegroundColor Red
+        foreach ($k in $declared.Keys) {
+            Write-Host ("       {0,-30} {1}" -f $k, $declared[$k]) -ForegroundColor Red
+        }
+        throw "版本号不一致(详见上列)"
+    }
+    Write-Host "版本一致性校验通过:$($distinct[0])(7 处声明)" -ForegroundColor DarkGray
+}
+
 
 if ($Dev -and $WithPortable) {
     throw "-Dev 与 -WithPortable 不能同时使用:便携版构建会清理 -Dev 需要保留的编译缓存"
@@ -44,6 +92,60 @@ if ($TestOnly -and $Dev) {
 
 # 双端同步是默认行为;-TestOnly / -Dev 是明确的单端快速通道
 $BuildPortable = -not $TestOnly -and -not $Dev
+
+# 后端产物目录(仅 server-rs):优先级 -RustTargetDir 参数 > CARGO_TARGET_DIR 环境变量
+# > 默认 server-rs\target。
+#
+# 为何需要:某些机器的安全软件会拦截「在 server-rs\target 下新建的可执行文件」的**执行**
+# (实测 build.rs 编译出的 build-script-build.exe 报「拒绝访问 os error 5」;同目录下
+# 复制进去的既有 exe 却能正常运行,说明不是目录权限问题,而是对新建 exe 的实时防护)。
+# 此时用 -RustTargetDir 把后端产物外置到白名单目录即可正常构建。
+#
+# 注意:这里**只解析路径并显式传给 server-rs 的 cargo 命令(--target-dir)**,
+# 不设置 CARGO_TARGET_DIR 环境变量——否则会一并作用于 src-tauri,使便携版产物
+# 落到错误位置(build-portable.ps1 期望 src-tauri\target\release\kedai-portable.exe)。
+$CargoTargetDir = if ($RustTargetDir) {
+    if ([System.IO.Path]::IsPathRooted($RustTargetDir)) { $RustTargetDir }
+    else { Join-Path $Root $RustTargetDir }
+} elseif ($env:CARGO_TARGET_DIR) {
+    if ([System.IO.Path]::IsPathRooted($env:CARGO_TARGET_DIR)) { $env:CARGO_TARGET_DIR }
+    else { Join-Path $Root $env:CARGO_TARGET_DIR }
+} else {
+    "$Root\server-rs\target"
+}
+$null = New-Item -ItemType Directory -Force -Path $CargoTargetDir -ErrorAction SilentlyContinue
+if ($CargoTargetDir -ne "$Root\server-rs\target") {
+    Write-Host "[信息] 后端产物目录外置: $CargoTargetDir(仅 server-rs;src-tauri 仍用自身 target)" -ForegroundColor DarkGray
+}
+
+# 产物占用让位:若开发时用 cargo run / start.ps1 起过 kedai-server,运行中的 exe 会让
+# cargo 重新链接报「failed to remove file ... os error 5」(见 Write-BuildStamp.ps1 说明)。
+# 编译前统一做一次改名让位,无需杀进程;门禁(check-all)与下面的 [2/3] 编译都受益。
+Clear-KedaiLockedServerArtifacts -TargetDir $CargoTargetDir
+
+# 0) 门禁:先跑测试与静态检查,失败即中止(避免先花十分钟构建才发现测试红)。
+#    -Quick 跳过 check-all 内部的前端 vite build(下方 [1/3] 会再构建一次,避免重复)。
+#    逃生开关 -SkipChecks 仅限本地应急;交付前必须补跑一次完整的 tools/check-all.ps1。
+if (-not $SkipChecks) {
+    Write-Host "[0/3] 门禁检查(check-all.ps1 -Quick) ..." -ForegroundColor Green
+    # 把后端产物目录一并传给门禁,使 check-all 的 cargo fmt/clippy/test 与本次构建
+    # 使用同一 target 根(否则外置产物时门禁会走默认 server-rs\target 而失败)。
+    $checkArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass',
+        '-File', (Join-Path $Root 'tools\check-all.ps1'), '-Quick')
+    if ($CargoTargetDir -ne "$Root\server-rs\target") {
+        $checkArgs += @('-RustTargetDir', $CargoTargetDir)
+    }
+    & powershell @checkArgs
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "[FAIL] 门禁未通过,构建中止(仅本地应急可加 -SkipChecks)" -ForegroundColor Red
+        exit 1
+    }
+    Write-Host "[OK] 门禁通过" -ForegroundColor Green
+} else {
+    Write-Host "[0/3] 已跳过门禁检查(-SkipChecks);交付前请补跑完整 check-all" -ForegroundColor Yellow
+}
+
+Assert-VersionConsistency
 
 Write-Host "========== Kedai Build ==========" -ForegroundColor Cyan
 
@@ -83,7 +185,7 @@ if (-not $NoWeb) {
 #    清掉 kedai-server 的编译指纹强制重编(不会触发 500 个 crate 全量重编)。
 if (-not $NoWeb) {
     $distIndex = "$Root\web\dist\index.html"
-    $exeCheck = if ($Dev) { "$Root\server-rs\target\debug\kedai-server.exe" } else { "$Root\server-rs\target\release\kedai-server.exe" }
+    $exeCheck = if ($Dev) { "$CargoTargetDir\debug\kedai-server.exe" } else { "$CargoTargetDir\release\kedai-server.exe" }
     if ((Test-Path $distIndex) -and (Test-Path $exeCheck)) {
         $distTime = (Get-Item $distIndex).LastWriteTime
         $exeTime = (Get-Item $exeCheck).LastWriteTime
@@ -92,7 +194,7 @@ if (-not $NoWeb) {
             Push-Location "$Root\server-rs"
             try {
                 $ErrorActionPreference = "Continue"
-                & $env:ComSpec /d /c "cargo clean -p kedai-server 2>&1"
+                & $env:ComSpec /d /c "cargo clean -p kedai-server --target-dir `"$CargoTargetDir`" 2>&1"
             } finally {
                 $ErrorActionPreference = "Stop"
                 Pop-Location
@@ -110,9 +212,9 @@ try {
     # 不再产生 ErrorRecord;成败以退出码判断(不附加 exit 语句,见前端构建处说明)。
     $ErrorActionPreference = "Continue"
     if ($Dev) {
-        & $env:ComSpec /d /c "cargo build 2>&1"
+        & $env:ComSpec /d /c "cargo build --target-dir `"$CargoTargetDir`" 2>&1"
     } else {
-        & $env:ComSpec /d /c "cargo build --release 2>&1"
+        & $env:ComSpec /d /c "cargo build --release --target-dir `"$CargoTargetDir`" 2>&1"
     }
     $code = $LASTEXITCODE
     if ($code -ne 0) {
@@ -124,7 +226,7 @@ try {
     Pop-Location
 }
 
-$exe = if ($Dev) { "$Root\server-rs\target\debug\kedai-server.exe" } else { "$Root\server-rs\target\release\kedai-server.exe" }
+$exe = if ($Dev) { "$CargoTargetDir\debug\kedai-server.exe" } else { "$CargoTargetDir\release\kedai-server.exe" }
 if (-not (Test-Path $exe)) {
     throw "Rust 编译失败:未生成 $exe"
 }
@@ -185,13 +287,34 @@ if (-not $Dev) {
         $stampPath = Write-KedaiBuildStamp -Root $Root -ExePath $dest
         Write-Host "[指纹] 已写出 $(Split-Path $stampPath -Leaf)" -ForegroundColor Green
     }
-    if (Test-Path "$Root\server-rs\target") {
-        try {
-            Remove-Item -Recurse -Force "$Root\server-rs\target" -ErrorAction Stop
-            Write-Host "[清理] 已删除 $Root\server-rs\target" -ForegroundColor Yellow
-        } catch {
-            Write-Host "[警告] 清理 $Root\server-rs\target 失败: $($_.Exception.Message)" -ForegroundColor Yellow
+    # 清理产物释放磁盘(下次构建全量重编,是有意取舍)。
+    # 路径必须与实际产物目录一致(2026-09-13 批次 1 修正):外置时硬编码 server-rs\target
+    # 会清理不到。**但外置目录可能与他人共用**(本机 D:\kedai-build 下还挂着 Android 构建的
+    # junction 目标 android-app-build)——2026-09-13 实测踩坑:整删外置目录把 Android 构建目录
+    # 一并删除,导致 APK 构建在 `app:mergeUniversalReleaseJniLibsFolders` 报「无法创建目录」。
+    # 故:默认路径整删(整个 target 都是 cargo 的);外置目录只清 cargo 自己的 profile 子目录。
+    if ($CargoTargetDir -eq "$Root\server-rs\target") {
+        if (Test-Path $CargoTargetDir) {
+            try {
+                Remove-Item -Recurse -Force $CargoTargetDir -ErrorAction Stop
+                Write-Host "[清理] 已删除 $CargoTargetDir" -ForegroundColor Yellow
+            } catch {
+                Write-Host "[警告] 清理 $CargoTargetDir 失败: $($_.Exception.Message)" -ForegroundColor Yellow
+            }
         }
+    } else {
+        foreach ($sub in @("debug", "release", "tmp", "CACHEDIR.TAG", ".rustc_info.json")) {
+            $p = Join-Path $CargoTargetDir $sub
+            if (Test-Path $p) {
+                try {
+                    Remove-Item -Recurse -Force $p -ErrorAction Stop
+                    Write-Host "[清理] 已删除 $p" -ForegroundColor Yellow
+                } catch {
+                    Write-Host "[警告] 清理 $p 失败: $($_.Exception.Message)" -ForegroundColor Yellow
+                }
+            }
+        }
+        Write-Host "[提示] 外置产物目录只清 cargo 子目录,保留同目录下其它数据: $CargoTargetDir" -ForegroundColor DarkGray
     }
 }
 # 本次要构建便携版时保留 src-tauri\target,交由 build-portable.ps1 复用缓存并统一清理。

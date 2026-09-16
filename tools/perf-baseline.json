@@ -1,0 +1,35 @@
+{
+  "_README": [
+    "Kedai 性能门禁基线(p95,毫秒)。由 tools/perf-baseline.mjs 读取并与实测值比对。",
+    "",
+    "判定规则:当前 p95 <= 本文件 p95 × --max-p95-factor(默认 1.25),且 errors == 0,视为达标。",
+    "低于绝对地板(5ms)的端点跳过判定——本机数据量小、抖动大,微秒级差异无意义。",
+    "",
+    "重要:绝对延迟强依赖机器、构建类型与数据量。本文件记录的是「本机 release 构建 + 隔离",
+    "数据目录」的实测值,仅作**回归对比基准**(防止改动导致劣化),不是跨机器的 SLA。",
+    "换机器或在 debug 构建下跑,应先重采样再更新本文件。",
+    "",
+    "更新方式:node tools/perf-baseline.mjs 取实测 JSON 行的 p95,写入对应端点。",
+    "数据量变化(如灌入大量消息)后必须重采样,否则门禁会误报。"
+  ],
+  "measuredAt": "2026-09-14",
+  "measuredWith": {
+    "build": "release (lto=true, strip=true)",
+    "dataDir": "隔离数据目录(2 角色 / 1 会话 / 54 条世界书条目)",
+    "concurrency": 20,
+    "requestsPerEndpoint": 100,
+    "note": "本机 Windows 11;绝对值为本机口径"
+  },
+  "endpoints": {
+    "characters_list": {
+      "p95": 86.6,
+      "p50": 45.3,
+      "note": "GET /api/characters(角色列表 + 会话计数)"
+    },
+    "chat_history": {
+      "p95": 48.3,
+      "p50": 31.9,
+      "note": "GET /api/chat/history?session_id=…(历史消息 + 变量)"
+    }
+  }
+}

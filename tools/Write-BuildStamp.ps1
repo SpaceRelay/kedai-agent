@@ -90,6 +90,59 @@ function Clear-KedaiDanglingJniLibs {
     return $removed
 }
 
+# ---------------------------------------------------------------- 构建产物被占用时的「改名让位」
+# 背景:Windows 不允许删除 / 覆盖正在运行的 exe。开发时若用 `cargo run` 或 start.ps1 起了
+# kedai-server,随后在同一份 target 上跑 build.ps1 或 tools\check-all.ps1,cargo 重新链接时报:
+#     error: failed to remove file `...\target\debug\kedai-server.exe`
+#     Caused by: 拒绝访问。 (os error 5)
+# 该文案看似权限 / 杀软问题,**实为产物被运行中的进程占用**(与 MAINTENANCE 踩坑 22 的
+# 「杀软拦截新建 exe 的执行」是两回事:那里失败在「执行」,这里失败在「删除」),且会让
+# 门禁与整段构建中止,报错不指向真因。
+#
+# 处置:沿用 build.ps1 对 dist 产物既有的「改名让位」策略——Windows 允许重命名运行中的
+# exe(不允许删除 / 覆盖),把被占用的产物改名为 <exe>.old,cargo 随即写入同名新文件;
+# 旧进程继续跑旧代码不受影响,**无需杀进程**。target 目录后续由构建收尾整体清理,残留 .old 无害。
+#
+# 判据:用 FileShare.None 独占打开探测占用。运行中的 exe 会失败(占用);未被占用的文件
+# 打开成功则**不动它**——避免把 cargo 判定「无需重编」的既有产物改名,导致产物缺失。
+function Clear-KedaiLockedBuildArtifact {
+    param([Parameter(Mandatory = $true)][string]$ExePath)
+
+    if (-not (Test-Path -LiteralPath $ExePath)) { return $false }
+
+    $locked = $false
+    try {
+        $fs = [System.IO.File]::Open($ExePath,
+            [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+        $fs.Close()
+    } catch {
+        $locked = $true
+    }
+    if (-not $locked) { return $false }
+
+    $stale = "$ExePath.old"
+    if (Test-Path -LiteralPath $stale) { Remove-Item -LiteralPath $stale -Force -ErrorAction SilentlyContinue }
+    try {
+        Move-Item -LiteralPath $ExePath -Destination $stale -Force -ErrorAction Stop
+    } catch {
+        # 上一轮让位留下的 .old 仍被更早的进程占用:换带时间戳的名字,保证本次让位不失败
+        $stale = "$ExePath.old.$((Get-Date).ToString('yyyyMMdd-HHmmss'))"
+        Move-Item -LiteralPath $ExePath -Destination $stale -Force -ErrorAction Stop
+    }
+    Write-Host "[占用] $(Split-Path $ExePath -Leaf) 正在运行,已改名为 $(Split-Path $stale -Leaf) 让位;cargo 将写入新产物,旧进程继续用旧代码" -ForegroundColor Yellow
+    return $true
+}
+
+# 对给定 target 根下的 kedai-server 产物(debug/release)逐个做占用检测 + 让位。
+# 供 build.ps1 / check-all.ps1 / build-portable.ps1 在编译前统一调用,幂等。
+function Clear-KedaiLockedServerArtifacts {
+    param([Parameter(Mandatory = $true)][string]$TargetDir)
+
+    foreach ($profile in @("debug", "release")) {
+        [void](Clear-KedaiLockedBuildArtifact -ExePath (Join-Path $TargetDir "$profile\kedai-server.exe"))
+    }
+}
+
 # 读取 sidecar 的 dist_hash;文件缺失或字段缺失返回 $null(调用方按「无法判定」处理,
 # 绝不允许因为 sidecar 缺失而误报同步)。
 function Read-KedaiDistHash {

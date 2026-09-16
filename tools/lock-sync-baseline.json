@@ -1,0 +1,4 @@
+{
+  "_comment": "双 Cargo.lock 漂移基线(见 tools/check-lock-sync.mjs)。2026-09-13 批次 1 已把 17 处历史漂移全部对齐,当前为 0 处。若确遇不可避免的漂移(上游精确 pin 等),在此登记 crate name 并在变更说明记录原因;修复后请删除条目(脚本会提示可收紧项)。",
+  "allowedDrift": []
+}

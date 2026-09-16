@@ -1,8 +1,10 @@
-﻿# 统一修改全仓库版本号(单一入口,避免 6 处手工同步漏改)。
+﻿# 统一修改全仓库版本号(单一入口,避免 7 处手工同步漏改)。
 # 覆盖:根 package.json、web/package.json、server-rs/Cargo.toml、
 #       src-tauri/Cargo.toml、launcher/Cargo.toml、src-tauri/tauri.conf.json、
+#       package-lock.json(顶层 + packages[""] 两处;依赖项版本不动)、
 #       MAINTENANCE.md 的版本行与「最后更新」日期。
 # Cargo.lock 中包自身版本无需手改,下次 cargo 构建会自动同步。
+# 一致性由 build.ps1 开头的 Assert-VersionConsistency 把关(改漏即构建报错)。
 #
 # 用法:
 #   .\tools\bump-version.ps1 0.3.0            # 把全仓库版本号改为 0.3.0
@@ -17,8 +19,12 @@ param(
 $ErrorActionPreference = "Stop"
 $Root = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
 
-if ($Version -notmatch '^\d+\.\d+\.\d+$') {
-    throw "版本号格式非法:「$Version」。仅支持 x.y.z 纯数字形式(预发布/构建后缀请手工评估 NSIS 兼容性后再加)。"
+# 版本号须为合法 semver:核心三段 + 可选预发布后缀(`-beta` / `-rc.1` 等)。
+# 注意:后缀必须用 `-` 连接——cargo 只接受 `0.3.0-beta`,**不接受** `0.3.0beta`
+# (报 unexpected character 'b' after patch version number),故按 semver 校验,
+# 并在拒绝时给出可操作的提示。
+if ($Version -notmatch '^\d+\.\d+\.\d+(?:-[0-9A-Za-z][0-9A-Za-z.-]*)?$') {
+    throw "版本号格式非法:「$Version」。支持 x.y.z 或 x.y.z-预发布(如 0.3.0-beta);预发布后缀必须用 - 连接,不能写成 0.3.0beta。"
 }
 
 $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
@@ -44,6 +50,46 @@ function Update-JsonVersion([string]$RelativePath) {
         return
     }
     Write-Host "[$(if ($DryRun) { '预览' } else { '修改' })] $RelativePath : $old -> `"version`": `"$Version`"" -ForegroundColor Green
+    if (-not $DryRun) { [System.IO.File]::WriteAllText($path, $new, $utf8NoBom) }
+    $script:changed++
+}
+
+# lock 文件:package-lock.json v3 中前两处 "version" 恰为顶层与 packages[""] 的自身版本
+# (其余 version 都属于依赖包,一律不动)。逐个替换,不整文件重排格式。
+#
+# 注意:必须**推进搜索偏移**再找第二处。早期实现每轮都从文件头 Match/Replace(count=1),
+# 结果第二处始终命中已被替换的同一位置(替换后仍是合法匹配),导致 packages[""] 的版本
+# 永远改不到——顶层改了、workspaces 根没改,校验严格时会被 npm ci 判为 lock 与 package.json
+# 不一致。
+function Update-LockFileVersion([string]$RelativePath) {
+    $path = Join-Path $Root $RelativePath
+    $content = [System.IO.File]::ReadAllText($path)
+    $regex = New-Object regex '("version"\s*:\s*")[^"]*(")'
+    $new = $content
+    $offset = 0
+    $replaced = 0
+    for ($i = 0; $i -lt 2; $i++) {
+        $m = $regex.Match($new, $offset)
+        if (-not $m.Success) { break }
+        $prefix = $m.Groups[1].Value
+        $suffix = $m.Groups[2].Value
+        $new = $new.Substring(0, $m.Index) + $prefix + $Version + $suffix +
+               $new.Substring($m.Index + $m.Length)
+        # 跳过本次替换结果,使下一轮匹配到「下一处」而非原地
+        $offset = $m.Index + $prefix.Length + $Version.Length + $suffix.Length
+        $replaced++
+    }
+    if ($replaced -lt 2) {
+        Write-Host "[警告] $RelativePath 只匹配到 $replaced 处自身版本(预期 2),已跳过写入" -ForegroundColor Yellow
+        $script:skipped++
+        return
+    }
+    if ($new -eq $content) {
+        Write-Host "[跳过] $RelativePath 已是 $Version" -ForegroundColor DarkGray
+        $script:skipped++
+        return
+    }
+    Write-Host "[$(if ($DryRun) { '预览' } else { '修改' })] $RelativePath : 自身版本 x$replaced 处 -> $Version" -ForegroundColor Green
     if (-not $DryRun) { [System.IO.File]::WriteAllText($path, $new, $utf8NoBom) }
     $script:changed++
 }
@@ -77,7 +123,7 @@ function Update-MaintenanceDoc([string]$RelativePath) {
     $content = [System.IO.File]::ReadAllText($path)
     $today = Get-Date -Format "yyyy-MM-dd"
     $new = $content
-    $verRegex = New-Object regex '(版本:v)\d+\.\d+\.\d+'
+    $verRegex = New-Object regex '(版本:v)\d+\.\d+\.\d+(?:-[0-9A-Za-z][0-9A-Za-z.-]*)?'
     $m = $verRegex.Match($new)
     if ($m.Success) {
         $new = $verRegex.Replace($new, "`${1}$Version", 1)
@@ -106,6 +152,7 @@ Update-TomlVersion "server-rs\Cargo.toml"
 Update-TomlVersion "src-tauri\Cargo.toml"
 Update-TomlVersion "launcher\Cargo.toml"
 Update-JsonVersion "src-tauri\tauri.conf.json"
+Update-LockFileVersion "package-lock.json"
 Update-MaintenanceDoc "MAINTENANCE.md"
 
 Write-Host "======================================================" -ForegroundColor Cyan

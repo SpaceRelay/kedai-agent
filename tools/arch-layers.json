@@ -1,0 +1,248 @@
+{
+  "$comment": [
+    "Kedai「三结合」代际归属与依赖方向的唯一机器可读事实源(SSOT)。",
+    "消费方:tools/check-arch.mjs 规则 I(归属完整性)、规则 J(跨代依赖方向)。",
+    "权威叙述:docs/契约-架构与数据.md;分析依据:docs/功能-变更史.md。",
+    "纪律:新增/删除/改名顶层模块必须同步本文件——否则规则 I 直接判 FAIL(不静默放过)。",
+    "registeredEdges 是「已知偏离登记」:登记在案的边不判 FAIL,但新增未登记的越代边立即 FAIL。",
+    "只减不增:偿还一条债务就从 registeredEdges 删除一条,并同步下调计数;绝不允许为了过检查而加条目。"
+  ],
+  "version": 1,
+
+  "generations": {
+    "L1": {
+      "name": "老层 · 稳",
+      "alias": "Anchored Core(基石层)",
+      "criterion": "长期验证的兼容契约:数据/协议形状一旦改变即破坏既有用户数据或外部生态兼容。改动成本最高,且不依赖任何上层。",
+      "discipline": "不可变契约优先;改动须先写失败测试 + 声明兼容影响 + 过评审;禁止 use crate::services / agents / api / tools。",
+      "guardRules": ["D", "I", "J"]
+    },
+    "L2": {
+      "name": "中层 · 干",
+      "alias": "Orchestration(骨干层)",
+      "criterion": "业务编排与协议翻译:依赖 L1 契约完成业务流程,自身不被 L1 感知。",
+      "discipline": "不得绕过 L1 契约直接改数据层语义;协议翻译集中在本层;禁止 use crate::tools / mcp / plugins / scripts(青层能力需经显式接缝注入)。",
+      "guardRules": ["C", "J"]
+    },
+    "L3": {
+      "name": "青层 · 活",
+      "alias": "Frontier(探索层)",
+      "criterion": "新能力、实验与隔离执行:失败必须被隔离(沙箱/开关/注册表),不得反向定义 L1/L2 的语义。",
+      "discipline": "新能力默认隔离;成熟后按晋升通道升级;禁止 use crate::services(core 能力应由宿主经接口注入,参照 TaskBackend 先例)。",
+      "guardRules": ["H", "J"]
+    },
+    "entry": {
+      "name": "入口 · 装配",
+      "alias": "Composition Root",
+      "criterion": "进程入口与最终装配:负责把各层拼装成可运行系统,不承载业务语义。",
+      "discipline": "只做装配与配置解析;业务逻辑不得沉淀于此(否则无法被测试与复用)。",
+      "guardRules": ["I"]
+    }
+  },
+
+  "backend": {
+    "parsing": {
+      "generation": "L1",
+      "responsibility": "角色卡 V2/V3、世界书、宏/预设/正则脚本、mvu 协议与 EJS 解释器的兼容解析",
+      "notes": "EJS 自研解释器已冻结(见 MAINTENANCE.md §0 与规则 H):只接受安全修复,新模板能力走 scripts/runtime.rs 的 rquickjs 沙箱"
+    },
+    "models": {
+      "generation": "L1",
+      "responsibility": "SQLite 表结构与全部数据契约类型 + 工具策略领域词汇(tool_policy)",
+      "notes": "types.rs 混装传输类型(LlmMessage/SseEvent 等)为已登记知情接受项,已由规则 D 豁免;拆分只改 import 不改线格式。tool_policy.rs 于 2026-09-14 承接自 tools/ 下沉的 AuthorizationMode/ToolRisk/CommandRisk(消除 services→tools 的 2 条越代边)"
+    },
+    "contracts": {
+      "generation": "L1",
+      "responsibility": "万花筒契约 DSL:定义、注册表、操作与求值语义",
+      "notes": "registry 曾反向依赖 services,已于 2026-09-13 改为闭包注入"
+    },
+    "migration": {
+      "generation": "L1",
+      "responsibility": "数据迁移:快照备份、双库合并、幂等 DDL 升级、冲突处理",
+      "notes": "2026-09-14 补登记:此前未列入任何代际清单。零 crate:: 出边,是纯基石模块——它直接决定「老层经验」能否跨版本延续,属 L1 的核心载体"
+    },
+    "utils": {
+      "generation": "L1",
+      "responsibility": "基础工具:结构化日志(tracing)、原子文件写入、截断重试纯函数",
+      "notes": "2026-09-14 补登记:此前未列入任何代际清单。零 crate:: 出边"
+    },
+    "agents": {
+      "generation": "L2",
+      "responsibility": "Agent 引擎编排:run 流程、消息构建、工具循环、planner/reflector/状态机",
+      "notes": "engine/mod.rs 依赖 9 个 services,同时 services/task_engine 反向依赖 agents::engine——L2 内部双向,见 registeredEdges"
+    },
+    "services": {
+      "generation": "L2",
+      "responsibility": "业务服务:角色/会话/世界书/注入/设置/密钥/任务引擎/undo",
+      "notes": "含子域 exec/(命令审计)。task_engine 已对 task_service 断环(规则 C);但整体仍与 agents、tools 双向"
+    },
+    "api": {
+      "generation": "L2",
+      "responsibility": "HTTP 路由层、鉴权、SSE 流、请求/响应契约",
+      "notes": "app_state.rs 承担进程级装配(与 entry 的边界见 generation=entry 说明)"
+    },
+    "connectors": {
+      "generation": "L2",
+      "responsibility": "LLM 后端适配(mock / openai 兼容协议的请求与流式解析)",
+      "notes": ""
+    },
+    "slash": {
+      "generation": "L2",
+      "responsibility": "slash 命令系统:注册表 + 内置命令 + 参数解析;经 API 与脚本桥两条链路暴露",
+      "notes": "2026-09-14 补登记:此前未列入任何代际清单。被 scripts(L3)反向依赖,见 registeredEdges"
+    },
+    "tools": {
+      "generation": "L2",
+      "responsibility": "工具系统:注册表、内置工具集(读取/写入/搜索/agent 域)、授权裁决与命令分级",
+      "notes": "**2026-09-14 归属修正:L3 → L2(名义 L3、实测 L2)**。依据三结合代际判定程序(docs/契约-架构与数据.md §2.2):① P3 隔离性不满足——本目录内无沙箱、无设置开关、无实验隔离,仅有 ToolRegistry 注册表,而注册表是 L2 骨干设施而非 L3 的失败隔离手段;② P5 复用度命中——被 agents/services/api 共 32 处复用,是**核心必需设施**而非可隔离的探索能力(它若失败整个应用不可用,与 L3『失败必须被隔离』的语义相反)。故原登记的 5 条 tools 相关 debt 属**归属画错**,不是需要偿还的债——已全部删除。真正的 L3 隔离能力在同批相邻模块:scripts/(rquickjs 沙箱)、mcp/(默认关)、plugins/(受控求值器)、services/exec/(默认关)。"
+    },
+    "mcp": {
+      "generation": "L3",
+      "responsibility": "MCP stdio 客户端:JSON-RPC 2.0 托管子进程,工具以 mcp_{server}_{tool} 前缀注册",
+      "notes": "默认关;仅启动时装配。反向依赖 services,见 registeredEdges"
+    },
+    "plugins": {
+      "generation": "L3",
+      "responsibility": "工具插件加载器:data/plugins/tools/*.json 定义的受控指令脚本工具",
+      "notes": "2026-09-14 补登记:此前未列入任何代际清单"
+    },
+    "scripts": {
+      "generation": "L3",
+      "responsibility": "脚本系统:rquickjs 运行时沙箱 + TavernHelper 兼容桥 + 脚本树装载",
+      "notes": "2026-09-14 补登记:此前未列入任何代际清单。新模板能力的唯一合法落点(见 EJS 冻结纪律);反向依赖 slash,见 registeredEdges"
+    },
+    "bin": {
+      "generation": "entry",
+      "responsibility": "kedai-server 命令行入口",
+      "notes": ""
+    }
+  },
+
+  "entryFiles": {
+    "config.rs": { "generation": "entry", "responsibility": "环境与 DATA_DIR 解析、AppConfig 组装" },
+    "lib.rs": { "generation": "entry", "responsibility": "库入口、模块声明、测试应用装配、run_server" },
+    "main.rs": { "generation": "entry", "responsibility": "bin 入口" }
+  },
+
+  "frontend": {
+    "api": { "generation": "L1", "responsibility": "后端接口契约封装与类型定义(线格式的单一来源)" },
+    "contracts": { "generation": "L1", "responsibility": "契约差异计算等纯函数" },
+    "mvu": { "generation": "L1", "responsibility": "mvu 变量树协议解析/回放(与 Rust 侧同读 docs/fixtures 对拍)" },
+    "utils": { "generation": "L1", "responsibility": "纯工具函数" },
+    "stores": { "generation": "L2", "responsibility": "Pinia 状态编排:唯一的状态变更入口(action)" },
+    "composables": { "generation": "L2", "responsibility": "组合式编排逻辑(可复用业务流程)" },
+    "components": { "generation": "L3", "responsibility": "UI 组件(展示层;不承载业务规则)" },
+    "sandbox": { "generation": "L3", "responsibility": "角色卡脚本沙箱宿主(iframe 生命周期/协议/净化)" }
+  },
+  "frontendEntryFiles": {
+    "App.vue": { "generation": "entry", "responsibility": "根组件与弹窗装配" },
+    "main.ts": { "generation": "entry", "responsibility": "应用引导" },
+    "modals.ts": { "generation": "entry", "responsibility": "弹窗注册表(单一事实源,check-arch 白名单由此派生)" },
+    "store.ts": { "generation": "entry", "responsibility": "store 门面聚合" },
+
+    "cssSanitize.ts": { "generation": "L1", "responsibility": "CSS 声明级清洗与容器作用域化(渲染安全边界;被静态渲染管道与沙箱 <style> 通道共用)" },
+    "markdown.ts": { "generation": "L1", "responsibility": "消息 Markdown 渲染(html:false 转义 + mvu 协议块剥离;输出契约稳定)" },
+    "platform.ts": { "generation": "L1", "responsibility": "运行平台判定(浏览器/桌面 Tauri/Android;纯能力探测,零依赖)" },
+    "render.ts": { "generation": "L1", "responsibility": "消息 HTML 渲染管道(正则占位→转义→还原;与后端渲染协议对锁)" },
+    "renderHints.ts": { "generation": "L1", "responsibility": "引导条可见性真值表(纯函数)" },
+    "renderPanel.ts": { "generation": "L1", "responsibility": "渲染面板约定判定与源码提取(纯函数)" },
+    "sseReducer.ts": { "generation": "L1", "responsibility": "SSE 事件→状态变更纯函数(与后端 SseEvent 线格式一一对应)" },
+    "taskResult.ts": { "generation": "L1", "responsibility": "任务 result 拆段契约(与 task_engine team/plan 输出标记对锁)" },
+    "taskStatus.ts": { "generation": "L1", "responsibility": "三类任务状态映射与配色(与后端状态枚举对锁)" },
+    "contextStats.ts": { "generation": "L1", "responsibility": "上下文健康度与推荐设置纯函数" },
+    "devTools.ts": { "generation": "L1", "responsibility": "开发者工具纯函数(事件类型映射/过滤/截断)" },
+    "exportFile.ts": { "generation": "L1", "responsibility": "导出文件保存抽象(平台分支:Android 分享/桌面对话框/浏览器下载)" },
+    "lastPosition.ts": { "generation": "L1", "responsibility": "上次浏览位置 localStorage 存储层(纯存储,零依赖)" },
+    "renderHtmlPreference.ts": { "generation": "L1", "responsibility": "HTML 渲染开关按角色卡记忆的存储层(纯存储)" },
+    "scriptAuthorization.ts": { "generation": "L1", "responsibility": "脚本授权台账存储层 + 规范化脚本哈希(与后端授权门共享哈希契约)" },
+    "scriptTreeIO.ts": { "generation": "L1", "responsibility": "脚本树导入导出纯函数(id 重分配、export_with 剥离)" },
+    "plugins.ts": { "generation": "L1", "responsibility": "角色卡内嵌插件前端兜底检测(与后端 detect_card_plugins 同逻辑)" },
+    "cardScripts.ts": { "generation": "L1", "responsibility": "角色卡卡级脚本收集与规范化(纯数据函数:递归拉平扩展形态 + cardScriptCanonical 哈希规范;与后端脚本授权门共享哈希契约,故属契约层而非沙箱层)" },
+
+    "asyncModal.ts": { "generation": "L2", "responsibility": "弹窗懒加载包装(失败重试 + uiPrefs.modalLoadError 上报)" },
+    "globalErrorHandlers.ts": { "generation": "L2", "responsibility": "全局错误兜底接线(Vue errorHandler / unhandledrejection / window error;上报走注入回调,不直连 store)" },
+    "audioController.ts": { "generation": "L2", "responsibility": "音频控制器注册表(宿主能力桥;被 sandbox 音频 RPC 调用)" },
+    "chatStreamService.ts": { "generation": "L2", "responsibility": "聊天流服务编排(依赖注入 streamChat/stopChat,可测编排层)" },
+    "resourceStore.ts": { "generation": "L2", "responsibility": "资源界面存储快照桥(localStorage + IndexedDB 持久化编排)" },
+
+    "cardScriptHost.ts": { "generation": "L3", "responsibility": "卡级脚本长驻沙箱宿主(事件流/轮询/宿主 RPC 转发)" },
+    "characterScriptSandbox.ts": { "generation": "L3", "responsibility": "角色卡脚本沙箱门面(re-export sandbox/,对外导入面)" },
+    "chatMessageScriptScheduler.ts": { "generation": "L3", "responsibility": "消息脚本执行调度(授权短路 + 渲染时机)" },
+    "scriptRunner.ts": { "generation": "L3", "responsibility": "消息脚本受控执行器(授权硬门 + 容器级变量上下文)" }
+  },
+
+  "dependencyRules": {
+    "$comment": "允许的跨代方向。后端与前端**分开定义**:两者的 L1/L2/L3 是同一套代际词汇,但依赖位置不同(见 docs/契约-架构与数据.md §2.3)。",
+    "$backendModel": "隔离模型:L3(工具/沙箱)与 L2(编排)互斥——青层反向依赖骨干层会使「隔离」名存实亡,故 L2->L3 与 L3->L2 双向禁止。",
+    "$frontendModel": "层次模型:L3(展示)-> L2(状态编排)-> L1(纯契约) 是严格向下的正常依赖(组件读 store、store 调 composable),故额外允许 L3->L2;真正禁止的是 L2->L3(编排依赖 UI/沙箱)与 L1->L2/L3(纯逻辑依赖状态)。",
+    "backendAllowed": [
+      "L1->L1",
+      "L2->L1",
+      "L2->L2",
+      "L3->L1",
+      "L3->L3"
+    ],
+    "frontendAllowed": [
+      "L1->L1",
+      "L2->L1",
+      "L2->L2",
+      "L3->L1",
+      "L3->L2",
+      "L3->L3"
+    ],
+    "allowed": [
+      "L1->L1",
+      "L2->L1",
+      "L2->L2",
+      "L3->L1",
+      "L3->L3"
+    ],
+    "forbidden": [
+      "L1->L2",
+      "L1->L3",
+      "L2->L3",
+      "L3->L2"
+    ]
+  },
+
+  "registeredEdges": [
+    {
+      "from": "scripts",
+      "to": "slash",
+      "class": "wiring",
+      "reason": "TavernHelper.triggerSlash 兼容桥需要 slash 注册表。属兼容桥的显式接线,语义上是「外部协议 → 内部命令」的翻译,登记为可接受的装配依赖。",
+      "remediation": "如需彻底解耦,可改为由宿主注册 slash 执行回调"
+    },
+    {
+      "from": "api",
+      "to": "mcp",
+      "class": "wiring",
+      "reason": "app_state 持有 MCP 客户端句柄以支持启动装配与关闭。属组合根装配。",
+      "remediation": "无(装配点)"
+    },
+    {
+      "from": "api",
+      "to": "plugins",
+      "class": "wiring",
+      "reason": "插件管理 API 路由直接暴露插件解析器(列出/重载/导入),注册动作由本层执行。属 HTTP 面暴露青层能力 + 组合根装配。",
+      "remediation": "无(暴露面)"
+    }
+  ],
+
+  "frontendRegisteredEdges": [
+    {
+      "from": "composables",
+      "to": "components",
+      "class": "debt",
+      "reason": "唯一回边:composables/useMemoryPanel.ts 从 components/memoryPanel 导入 pruneSuccessText/nextPendingPrune(值导入,非纯类型)。components/ 是 L3 展示层,不应向 L2 提供业务函数。",
+      "remediation": "把 memoryPanel 的纯逻辑函数从 components/ 移入 composables/ 或 utils/,组件只保留渲染"
+    },
+    {
+      "from": "stores",
+      "to": "characterScriptSandbox",
+      "class": "debt",
+      "reason": "stores/chat.ts:11 从 characterScriptSandbox(L3 沙箱)导入 broadcastCardEvent/broadcastMvuUpdate——L2 状态编排反向依赖 L3 沙箱宿主。2026-09-14 修好门禁分桶与根文件代际后首次暴露(此前因 characterScriptSandbox.ts 未登记代际而被静默跳过)。语义上是「状态变更后通知沙箱」,属事件通知而非能力调用。",
+      "remediation": "反转依赖:把事件广播改为 store 侧 emit 到一个 L2/L1 事件总线,由沙箱宿主(cardScriptHost/scriptRunner)订阅,store 不再 import 沙箱;或把两个纯广播函数下沉到 L1(它们只是事件发射,无沙箱实现依赖)"
+    }
+  ]
+}

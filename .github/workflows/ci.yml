@@ -1,0 +1,63 @@
+# Kedai CI(批次 1,2026-09-13)
+#
+# 背景:仓库此前只有本地门禁(tools/check-all.ps1 + pre-push hook),可被
+# `git push --no-verify` / `build.ps1 -SkipChecks` 绕过,且换机后 hook 需重装
+# (tools/install-hooks.ps1)。本工作流把同一套门禁搬到服务端强制执行。
+#
+# 触发:push(任意分支)+ PR。环境:windows-latest(需 MSVC;check-all.ps1 内已内置
+# vcvars64 定位逻辑,runner 自带 VS 即可)。
+#
+# 说明:本机当前**未配置 git 远端**,本文件在配置远端并推送后自动生效;
+# 本地等价命令:`powershell -NoProfile -ExecutionPolicy Bypass -File tools/check-all.ps1`
+# (只跑快速档加 `-Quick`;跳过后端加 `-SkipRust`)。
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  check:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            server-rs/target
+            src-tauri/target
+          key: cargo-${{ hashFiles('server-rs/Cargo.lock', 'src-tauri/Cargo.lock') }}
+
+      - name: Install cargo-audit
+        shell: pwsh
+        run: |
+          if (-not (Get-Command cargo-audit -ErrorAction SilentlyContinue)) {
+            cargo install cargo-audit --locked
+          }
+
+      - name: Install npm deps (lockfile 严格一致)
+        run: npm ci
+
+      # 审计口径与本地一致(批次 6.1):check-all.ps1 的独立「审计段」同时扫描
+      # server-rs/Cargo.lock 与 src-tauri/Cargo.lock 两把锁(cargo audit 硬门禁),
+      # 并执行 npm audit --omit=dev 生产依赖硬门禁。无法本地修复的 unmaintained 告警
+      # 由仓库根 .cargo/audit.toml 逐条 ignore(随 checkout 带入,无需额外步骤)。
+      # 注意:本仓库当前**未配置 git 远端**,本工作流在配置远端并推送后才会真正运行。
+      - name: Local gates (fmt / clippy / test / audit[两锁+npm] / contract / arch / lock-sync / typecheck / vitest / build)
+        shell: pwsh
+        run: ./tools/check-all.ps1
