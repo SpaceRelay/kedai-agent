@@ -70,7 +70,21 @@ describe('getCacheDiagnostics', () => {
   });
 
   it('非 2xx 时抛出后端 error 文案', async () => {
-    mockFetchSequence({ body: { error: '读取缓存统计失败: db locked' }, status: 500 });
-    await expect(getCacheDiagnostics()).rejects.toThrow('读取缓存统计失败: db locked');
+    // 状态码与后端实现对齐:失败走 500 + code(见 api/diagnostics.rs 的 err_with_code)
+    mockFetchSequence({ body: { error: '读取缓存统计失败', code: 'DB' }, status: 500 });
+    await expect(getCacheDiagnostics()).rejects.toThrow('服务端错误,请查看日志');
+  });
+
+  it('200 但载荷是 {error} 时抛错,不透传给调用方', async () => {
+    // 回归:后端曾「失败也返回 200」,载荷为 {error};若直接透传,调用方访问
+    // data.totals.hit_rate 会抛 TypeError(可选链挡不住形状不对的真值对象)。
+    // 形状闸门应把它变成可捕获的 Error,并透出后端原文便于定位。
+    mockFetchSequence({ body: { error: '读取缓存统计失败: Wrong number of parameters passed to query' } });
+    await expect(getCacheDiagnostics()).rejects.toThrow(/Wrong number of parameters/);
+  });
+
+  it('200 但缺少 totals/entries/watermark 时抛格式异常', async () => {
+    mockFetchSequence({ body: { window: 20, session_id: null } });
+    await expect(getCacheDiagnostics()).rejects.toThrow('缓存统计响应格式异常');
   });
 });

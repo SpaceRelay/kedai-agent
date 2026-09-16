@@ -1,11 +1,12 @@
 <script setup lang="ts">
 // 根组件:左侧功能区 + 中间消息区 + 右侧 Agent 抽屉 + 启动动画
-// 弹窗懒加载(前端性能优化):13 个弹窗/浮层组件改 defineAsyncComponent,
+// 弹窗懒加载(前端性能优化):模态弹窗组件统一在 web/src/modals.ts 注册表声明,
 // 首屏 bundle 不再包含其实现,首次打开对应弹窗时才加载 chunk;
-// <Transition name="sv-modal"> 包裹与 v-if 条件保持不变(开合过渡语义不变)。
+// <Transition name="sv-modal"> 包裹与开合过渡语义不变(由注册表 v-for 派生)。
 import { nextTick, onMounted, onUnmounted, watch } from 'vue';
 import { useAppStore } from './store';
 import { lazyModal } from './asyncModal';
+import { MODALS, MODAL_FLAGS } from './modals';
 import { inTauri } from './platform';
 import { useExternalLinks } from './composables/useExternalLinks';
 import { useKeepAlive } from './composables/useKeepAlive';
@@ -15,27 +16,24 @@ import TaskBoard from './components/TaskBoard.vue';
 import AgentPanel from './components/AgentPanel.vue';
 import SplashScreen from './components/SplashScreen.vue';
 
-// ===== 懒加载弹窗(各自/分组拆 chunk,见 vite.config.ts manualChunks) =====
-// 统一经 lazyModal 包装:chunk 加载失败自动重试一次,仍失败显示全局错误条(可手动重试),
-// 不再静默「点了没反应」。第二参数为面板名,第三参数为 uiPrefs 中对应的开关 ref 名。
-const SettingsHub = lazyModal(() => import('./components/SettingsHub.vue'), '综合设置', 'settingsOpen');
-const WorldBooksModal = lazyModal(() => import('./components/WorldBooksModal.vue'), '世界书', 'worldBooksOpen');
-const ChatRecords = lazyModal(() => import('./components/ChatRecords.vue'), '聊天记录', 'chatRecordsOpen');
-const PluginsModal = lazyModal(() => import('./components/PluginsModal.vue'), '插件', 'pluginsOpen');
-const SkillsModal = lazyModal(() => import('./components/SkillsModal.vue'), '技能库', 'skillsOpen');
-const ContractsModal = lazyModal(() => import('./components/ContractsModal.vue'), '契约编辑', 'contractsOpen');
-const PromptManager = lazyModal(() => import('./components/PromptManager.vue'), '提示词管理', 'promptsOpen');
-const ScriptsModal = lazyModal(() => import('./components/ScriptsModal.vue'), '脚本管理', 'scriptsOpen');
-const MacrosModal = lazyModal(() => import('./components/MacrosModal.vue'), '宏调试', 'macrosOpen');
-const DevToolsModal = lazyModal(() => import('./components/DevToolsModal.vue'), '事件监控', 'eventsOpen');
-const OptimizeModal = lazyModal(() => import('./components/OptimizeModal.vue'), '优化面板', 'optimizeOpen');
-const MemoryModal = lazyModal(() => import('./components/MemoryModal.vue'), '记忆库', 'memoryOpen');
-const RepoIndexModal = lazyModal(() => import('./components/RepoIndexModal.vue'), '仓库索引', 'repoIndexOpen');
-const QuickRepliesModal = lazyModal(() => import('./components/QuickRepliesModal.vue'), '快速回复', 'quickRepliesOpen');
-// 音频播放器:右下角浮层,非首屏(默认收起为开关按钮),一并懒加载
+// 音频播放器:右下角浮层,非首屏(默认收起为开关按钮),一并懒加载。
+// 它是常驻浮层而非模态弹窗,故不进 modals.ts 注册表。
 const AudioPlayer = lazyModal(() => import('./components/AudioPlayer.vue'), '音频播放器', 'audioOpen');
 
 const store = useAppStore();
+
+/** 壳事件监听的注销句柄(listen 返回的 unlisten;未注册成功时为 null) */
+let unlistenCloseRequested: (() => void) | null = null;
+
+/** 动态 flag 访问的统一收口:ModalDecl.flag 是运行期字符串,无法静态索引 store,
+ *  故只在此处做一次类型放宽(而非每个使用点各自断言);合法 flag 集合由
+ *  web/src/modals.ts 单点定义,并由 web/src/modals.test.ts 元测试锁定。 */
+const storeFlags = store as unknown as Record<string, boolean | undefined>;
+
+/** 按 flag 名读弹窗开关(渲染与返回键共用同一来源)。 */
+function isModalOpen(flag: string): boolean {
+  return storeFlags[flag] === true;
+}
 
 /** 窄屏(<768px)判定:抽屉与底部导航仅在窄屏有意义。
  *  用 matchMedia 而非 CSS 之外的 UA 嗅探:桌面端该查询恒为 false,行为与改动前一致。 */
@@ -43,10 +41,12 @@ const narrowViewport = typeof window !== 'undefined' && typeof window.matchMedia
   ? window.matchMedia('(max-width: 767px)')
   : null;
 
-/** 收起全部移动端抽屉(遮罩点击、切换模式、打开设置时调用) */
+/** 收起全部移动端抽屉(遮罩点击、切换模式、打开设置时调用)。
+ *  Agent 面板走 collapseAgentPanel(收起时记抑制标记,本会话生成不再自动弹);
+ *  直接置 agentPanelOpen=false 会漏掉该标记,导致刚收起又被生成撑开。 */
 function closeDrawers(): void {
   store.sidebarOpen = false;
-  store.agentPanelOpen = false;
+  store.collapseAgentPanel();
 }
 
 /** 底部导航抽屉互斥开合:开一个时收起另一个,避免两层抽屉叠加。
@@ -87,23 +87,19 @@ function toggleAudio(): void {
  * WebView 历史里有两条记录,系统返回键会退回 about:blank —— 表现为整页白屏且无法恢复。
  *
  * 处理顺序(符合 Android 习惯):
- *   1) 有打开的弹窗 → 关掉最上层的那个;
+ *   1) 有打开的弹窗 → 关掉最上层的那个(MODAL_FLAGS 按渲染逆序,先关最上层);
  *   2) 有打开的抽屉 → 收起;
- *   3) 都没有 → 退出应用(与桌面版「关闭即退出」语义一致,后端与壳同进程一并结束)。
+ *   3) 都没有 → 弹出退出确认弹窗(与桌面端「关闭窗口」同一个弹窗,两平台语义一致;
+ *      此前是直接退出,误触返回键即丢未保存内容)。
  *
  * 注册本监听后,壳不再自行处理返回键(见 AppPlugin 的 hasListener 分支)。
  */
-const MODAL_FLAGS = [
-  'settingsOpen', 'promptsOpen', 'worldBooksOpen', 'chatRecordsOpen', 'pluginsOpen',
-  'skillsOpen', 'contractsOpen', 'scriptsOpen', 'macrosOpen', 'eventsOpen',
-  'optimizeOpen', 'memoryOpen', 'repoIndexOpen', 'quickRepliesOpen',
-] as const;
-
 async function handleAndroidBack(): Promise<void> {
-  const flags = store as unknown as Record<string, boolean | undefined>;
-  for (const key of MODAL_FLAGS) {
-    if (flags[key]) {
-      flags[key] = false;
+  // 弹窗 flag 集合单点定义在 web/src/modals.ts;逆序即「后声明者在上层」
+  for (let i = MODAL_FLAGS.length - 1; i >= 0; i--) {
+    const key = MODAL_FLAGS[i];
+    if (storeFlags[key]) {
+      storeFlags[key] = false;
       return;
     }
   }
@@ -115,20 +111,41 @@ async function handleAndroidBack(): Promise<void> {
     store.audioOpen = false;
     return;
   }
-  // 无处可退 → 请求壳退出应用(后端与壳同进程,退出即整体结束,无残留服务)。
-  //
-  // 为什么用事件而不是命令:
-  // - 页面来自 http://127.0.0.1:<port>/(remote origin),Tauri 的 IPC 会做 ACL 校验,
-  //   而框架不为自定义 #[tauri::command] 生成权限条目,实测报
-  //   "exit_app not allowed. Plugin not found";
-  // - plugin:app|exit 亦被拒(无 Rust 侧权限声明);
-  // - getCurrentWindow().close() 在 Android 上不结束 Activity(进程仍在且 Promise 悬挂)。
-  // 事件系统的 emit 权限(core:event:allow-emit)已含在 core:default 中,无需额外授权。
+  // 无处可退 → 打开退出确认弹窗(与桌面端「关闭窗口」走同一个弹窗,两平台语义一致)。
+  // 此前是直接 emit 退出,误触返回键即丢未保存内容,且与桌面需二次确认的行为不一致。
+  store.exitConfirmOpen = true;
+}
+
+/**
+ * 监听壳下发的「用户点了窗口关闭」(仅桌面)。
+ *
+ * 这是本仓库前端第一处 `listen`(其余原生桥都是「前端 emit → 原生执行」单向):
+ * 关闭确认要出前端至上主义样式,而 Tauri 的 window.dialog() 是 Windows MessageBox,
+ * 外观不受前端 CSS 影响,故改为「壳 prevent_close + 下发事件 → 前端自绘弹窗」。
+ * 必须在 onUnmounted 注销:否则热更新/重挂载会累积监听器,一次关闭弹出多个确认框。
+ */
+async function registerCloseRequestListener(): Promise<void> {
+  if (!inTauri) return;
   try {
-    const { emit } = await import('@tauri-apps/api/event');
-    await emit('kedai://exit-app');
+    const { listen } = await import('@tauri-apps/api/event');
+    unlistenCloseRequested = await listen('kedai://close-requested', () => {
+      store.exitConfirmOpen = true;
+    });
   } catch (e) {
-    console.warn('[kedai] 返回键退出失败', e);
+    // 非桌面平台或 API 不可用时静默忽略:桌面壳另有二次关闭兜底,窗口仍关得掉
+    console.debug('[kedai] 关闭确认事件监听未注册', e);
+  }
+}
+
+/** 注销壳事件监听(存在才注销;未注册成功时为 null) */
+function unregisterCloseRequestListener(): void {
+  const off = unlistenCloseRequested;
+  unlistenCloseRequested = null;
+  if (!off) return;
+  try {
+    off();
+  } catch (e) {
+    console.warn('[kedai] 关闭确认事件注销失败', e);
   }
 }
 
@@ -151,10 +168,9 @@ async function retryModalLoad(): Promise<void> {
   const err = store.modalLoadError;
   if (!err) return;
   store.modalLoadError = null;
-  const flags = store as unknown as Record<string, unknown>;
-  flags[err.flag] = false;
+  storeFlags[err.flag] = false;
   await nextTick();
-  flags[err.flag] = true;
+  storeFlags[err.flag] = true;
 }
 
 /** 面板 chunk 加载失败后的兜底恢复:整页刷新重新拉取 index.html(带最新 chunk hash)。
@@ -216,10 +232,12 @@ onMounted(() => {
   if (shouldOpenSettings()) store.settingsOpen = true;
   window.addEventListener('hashchange', onHashChange);
   void registerBackButton();
+  void registerCloseRequestListener();
 });
 
 onUnmounted(() => {
   window.removeEventListener('hashchange', onHashChange);
+  unregisterCloseRequestListener();
 });
 
 watch(
@@ -263,6 +281,12 @@ watch(
       <span class="sv-global-error-text">{{ store.dataLoadError }}</span>
       <button class="sv-btn ghost sv-btn-sm" @click="retryDataLoad">重试</button>
       <button class="sv-btn ghost sv-btn-sm" @click="store.dataLoadError = null">关闭</button>
+    </div>
+    <!-- 未捕获异常兜底(计划批次 5.1):只给「关闭」——异常没有对应的重试动作,
+         给重试按钮会让用户以为点一下能修复,而实际只有刷新页面可能有用 -->
+    <div v-if="store.globalError" class="sv-global-error" role="alert">
+      <span class="sv-global-error-text">界面出现未捕获异常:{{ store.globalError }}</span>
+      <button class="sv-btn ghost sv-btn-sm" @click="store.globalError = null">关闭</button>
     </div>
     <div v-if="store.modalLoadError" class="sv-global-error" role="alert">
       <span class="sv-global-error-text">「{{ store.modalLoadError.name }}」面板加载失败(前端已更新,需刷新页面)</span>
@@ -355,62 +379,11 @@ watch(
       </button>
     </nav>
 
-    <!-- 各模态弹窗:统一 <Transition name="sv-modal"> 开合过渡 -->
-    <!-- 综合设置弹窗 -->
-    <Transition name="sv-modal">
-      <SettingsHub v-if="store.settingsOpen" />
-    </Transition>
-    <!-- 世界书模态框 -->
-    <Transition name="sv-modal">
-      <WorldBooksModal v-if="store.worldBooksOpen" />
-    </Transition>
-    <!-- 聊天记录面板 -->
-    <Transition name="sv-modal">
-      <ChatRecords v-if="store.chatRecordsOpen" />
-    </Transition>
-    <!-- 插件管理弹窗 -->
-    <Transition name="sv-modal">
-      <PluginsModal v-if="store.pluginsOpen" />
-    </Transition>
-    <!-- 技能库弹窗 -->
-    <Transition name="sv-modal">
-      <SkillsModal v-if="store.skillsOpen" />
-    </Transition>
-    <!-- 契约编辑弹窗(P6 面板) -->
-    <Transition name="sv-modal">
-      <ContractsModal v-if="store.contractsOpen" />
-    </Transition>
-    <!-- 提示词顺序管理弹窗 -->
-    <Transition name="sv-modal">
-      <PromptManager v-if="store.promptsOpen" />
-    </Transition>
-    <!-- 用户脚本管理弹窗(阶段三) -->
-    <Transition name="sv-modal">
-      <ScriptsModal v-if="store.scriptsOpen" />
-    </Transition>
-    <!-- 宏调试弹窗(阶段六 6b) -->
-    <Transition name="sv-modal">
-      <MacrosModal v-if="store.macrosOpen" />
-    </Transition>
-    <!-- 事件监控弹窗(阶段六 6c) -->
-    <Transition name="sv-modal">
-      <DevToolsModal v-if="store.eventsOpen" />
-    </Transition>
-    <!-- 优化面板弹窗(阶段六 6d) -->
-    <Transition name="sv-modal">
-      <OptimizeModal v-if="store.optimizeOpen" />
-    </Transition>
-    <!-- 记忆库弹窗(侧边栏一级入口;与优化面板内的记忆库分区同源同组件) -->
-    <Transition name="sv-modal">
-      <MemoryModal v-if="store.memoryOpen" />
-    </Transition>
-    <!-- 仓库索引面板(只读展示 .kedai-index 生成的代码索引) -->
-    <Transition name="sv-modal">
-      <RepoIndexModal v-if="store.repoIndexOpen" />
-    </Transition>
-    <!-- 快速回复管理弹窗(阶段四 4b) -->
-    <Transition name="sv-modal">
-      <QuickRepliesModal v-if="store.quickRepliesOpen" />
+    <!-- 各模态弹窗:统一 <Transition name="sv-modal"> 开合过渡。
+         列表/组件/顺序均来自 web/src/modals.ts 单点注册表(声明顺序 = 渲染顺序,
+         后声明者叠在上层);Android 返回键按同表逆序关闭。 -->
+    <Transition v-for="modal in MODALS" :key="modal.flag" name="sv-modal">
+      <component :is="modal.component" v-if="isModalOpen(modal.flag)" />
     </Transition>
 
     <!-- 音频播放器(阶段五 5a):右下角悬浮 -->

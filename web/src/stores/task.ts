@@ -1,13 +1,19 @@
 // 任务模式 store:顶层模式(roleplay/task)切换与持久化、任务列表/详情、
 // 任务事件 SSE 订阅(WP5:取代原 1s REST 轮询与本地合成伪事件)。
-// 从 store.ts 按领域拆分。跨 store 引用(genSettings.loadSettings / uiPrefs.agentPanelOpen /
-// chat.onSseEvent 事件上报)均在动作运行时解析,setup 阶段不实例化其他 store。
+// 从 store.ts 按领域拆分。依赖方向(M5 断环后):本 store 是依赖图汇点——
+//   - appMode 是本 store 状态;genSettings 顶层 import 本 store 直读(loadSettings/
+//     saveSettings 取覆盖层用),该边单向、不构成环,故未设 appMode 桥;
+//   - 对 chat/genSettings/uiPrefs 的三处能力(事件上报 / 设置重载 / 界面偏好)
+//     经回调桥(storeBridge.ts)调用。
+//   整图因此无环(见 tools/check-arch.mjs)。
 import { defineStore } from 'pinia';
 import { ref, watch } from 'vue';
 import * as api from '../api';
-import { useChatStore } from './chat';
-import { useGenSettingsStore } from './genSettings';
-import { useUiPrefsStore } from './uiPrefs';
+import {
+  reloadSettings,
+  reportChatEvent,
+  uiPrefsBridge,
+} from './storeBridge';
 
 /** 顶层模式持久化键:刷新后停留在上次模式 */
 const APP_MODE_KEY = 'kedai.appMode';
@@ -140,6 +146,7 @@ export const useTaskStore = defineStore('app.task', () => {
       /* 忽略 */
     }
   }
+
 
   /** 持久化新建任务模式(仿 persistAppMode:try/catch 容错,写失败静默) */
   function persistTaskRunMode(): void {
@@ -318,12 +325,12 @@ export const useTaskStore = defineStore('app.task', () => {
     if (mode === 'task') {
       void loadTasks().then(() => restoreSelectedTask());
       void loadGlobalTaskUsage();
-      useUiPrefsStore().agentPanelOpen = false;
+      uiPrefsBridge().collapseAgentPanel();
       startTaskEvents();
     } else {
       stopTaskEvents();
     }
-    void useGenSettingsStore().loadSettings();
+    reloadSettings();
     persistAppMode();
   }
 
@@ -331,7 +338,7 @@ export const useTaskStore = defineStore('app.task', () => {
 
   /** 事件分发:按 kind 驱动局部刷新;所有事件原样透传事件监控面板(DevTools) */
   function onTaskEvent(ev: api.TaskEvent): void {
-    useChatStore().onSseEvent(ev);
+    reportChatEvent(ev);
     switch (ev.kind) {
       case 'created':
         void loadTasks();
@@ -354,7 +361,7 @@ export const useTaskStore = defineStore('app.task', () => {
       case 'llm_call':
         // LLM 调用落库:仅当前任务且「调用情况」tab 被记忆为激活时才拉取(避免无谓请求;
         // 面板合并后 callTraceOpen 语义为合并面板内部 tab 记忆,判断逻辑不变)
-        if (ev.task_id === currentTaskId.value && useUiPrefsStore().callTraceOpen) {
+        if (ev.task_id === currentTaskId.value && uiPrefsBridge().isCallTraceOpen()) {
           void loadTaskCalls(ev.task_id);
         }
         // 批次 R4 流式缓冲对齐:该调用的暂态 delta 已由落库行取代,清对应缓冲
@@ -393,9 +400,18 @@ export const useTaskStore = defineStore('app.task', () => {
           clearAllLiveDeltas(); // 批次 R4:任务删除,其流式缓冲一并失效
         }
         break;
-      default:
-        // kind 缺失(向后兼容):仅透传事件面板,不触发刷新
+      case undefined:
+        // kind 缺失(旧服务端/未知分类):仅透传事件面板,不触发刷新。
+        // 这是**契约允许**的向后兼容分支(后端 kind 为 Option + skip_serializing_if),
+        // 故显式列出而不靠 default 兜底。
         break;
+      default: {
+        // 穷尽性断言:后端 TaskEventKind 新增分类而此处漏接线时**编译失败**。
+        // 原实现是 default 静默 break,漏改不报错——正是本轮要堵的静默失效点。
+        const unhandled: never = ev.kind;
+        void unhandled;
+        break;
+      }
     }
   }
 
@@ -404,6 +420,12 @@ export const useTaskStore = defineStore('app.task', () => {
     closeTaskEvents = api.streamTaskEvents(onTaskEvent, onTaskEventsClosed);
     settleTimer = setTimeout(() => {
       settleTimer = null;
+      // 可观测性(批次 5.3):settle 窗口内未再断开即视为恢复。此处 reconnectDelay 仍大于
+      // 起步值,说明本次是「断线后的重连」而非首次连接,才记一行——否则每次进任务模式都会刷。
+      // 纯观测,不参与任何判定(退避与重连策略见下方两处,未改)。
+      if (reconnectDelay > RECONNECT_BASE_MS) {
+        console.info('[kedai] 任务事件流已恢复(settle 窗口内未再断开),退避复位');
+      }
       reconnectDelay = RECONNECT_BASE_MS;
       stopTaskPolling();
       // 补偿断开期间可能遗漏的变更
@@ -414,13 +436,16 @@ export const useTaskStore = defineStore('app.task', () => {
   }
 
   /** SSE 关闭回调(对端断开/网络错误):启动兜底轮询,按指数退避安排重连 */
-  function onTaskEventsClosed(_err?: Error): void {
+  function onTaskEventsClosed(err?: Error): void {
     closeTaskEvents = null;
     if (settleTimer) {
       clearTimeout(settleTimer);
       settleTimer = null;
     }
     if (appMode.value !== 'task') return; // 已退出任务模式,不再重连
+    // 可观测性(批次 5.3):重连过程此前在控制台完全不可见,排查「当时发生了什么」只能靠猜。
+    // 记录本次退避值(即下方 setTimeout 实际使用的值)与兜底轮询状态,只加信号不改策略。
+    console.warn(`[kedai] 任务事件流断开,${reconnectDelay}ms 后重连(期间 5s 兜底轮询保活)`, err);
     startTaskPolling();
     reconnectTimer = setTimeout(() => {
       reconnectTimer = null;
@@ -448,6 +473,7 @@ export const useTaskStore = defineStore('app.task', () => {
     }
     stopTaskPolling();
     if (closeTaskEvents) {
+      console.debug('[kedai] 任务事件流订阅已关闭(退出任务模式)');
       closeTaskEvents();
       closeTaskEvents = null;
     }
@@ -456,6 +482,7 @@ export const useTaskStore = defineStore('app.task', () => {
   // ===== 兜底轮询(SSE 断开期间的 5s 低频保活:仅列表 + 当前任务详情) =====
   function startTaskPolling(): void {
     if (taskPollTimer) return;
+    console.debug('[kedai] 任务兜底轮询启动(SSE 断开期间 5s 保活)');
     taskPollTimer = setInterval(() => {
       void loadTasks();
       if (currentTaskId.value) void loadTaskDetail(currentTaskId.value);
@@ -464,6 +491,7 @@ export const useTaskStore = defineStore('app.task', () => {
 
   function stopTaskPolling(): void {
     if (taskPollTimer) {
+      console.debug('[kedai] 任务兜底轮询停止(事件流已恢复)');
       clearInterval(taskPollTimer);
       taskPollTimer = null;
     }
@@ -482,7 +510,7 @@ export const useTaskStore = defineStore('app.task', () => {
   async function runTask(id: string): Promise<void> {
     await api.runTask(id);
     // 任务开始执行时自动展开一次 Agent 面板(进度可见性);用户若已主动收起则不打扰
-    useUiPrefsStore().autoOpenAgentPanel();
+    uiPrefsBridge().autoOpenAgentPanel();
     await loadTaskDetail(id);
   }
 
@@ -495,7 +523,7 @@ export const useTaskStore = defineStore('app.task', () => {
   async function approveTask(id: string, plan?: api.TaskStep[]): Promise<void> {
     await api.approveTask(id, plan);
     // 批准后任务进入执行:同样自动展开一次
-    useUiPrefsStore().autoOpenAgentPanel();
+    uiPrefsBridge().autoOpenAgentPanel();
     await loadTaskDetail(id);
   }
 

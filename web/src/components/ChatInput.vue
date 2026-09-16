@@ -304,7 +304,7 @@ async function onModelChange(e: Event): Promise<void> {
           :key="m.key"
           :class="{ active: agentMode === m.key }"
           :title="m.title"
-          @click="store.agentMode = m.key"
+          @click="store.setAgentMode(m.key)"
         >
           <span class="sv-mode-idx">{{ (i + 1).toString().padStart(2, '0') }}</span>{{ m.label }}
         </button>

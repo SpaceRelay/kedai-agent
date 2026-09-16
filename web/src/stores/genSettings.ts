@@ -1,14 +1,22 @@
 // 生成设置 store:生成参数(温度/Top-P/长度/上下文/工具轮次)、上下文压缩、记忆蒸馏、
 // 子代理参数、Agent 设置草稿(系统提示词/搜索端点/变量注入位置/反思系列)、授权模式、
 // 提示词注入配置、自定义 Agent 执行流程库,以及 loadSettings/saveSettings 读写服务端设置。
-// 从 store.ts 按领域拆分。跨 store 引用(model / appMode / renderHtml 默认)均在动作运行时解析,
-// setup 阶段不实例化其他 store,避免初始化环;本 store 被 chat/uiPrefs/task 引用,不反向引用其 setup。
+// 从 store.ts 按领域拆分。跨 store 依赖实况(2026-09-13 批次 5.1 核对):
+//   - appMode 顶层 import useTaskStore 直读(loadSettings/saveSettings 按模式取覆盖层);
+//     该边单向(task 不 import 本 store),storeBridge 无 appMode 桥;
+//   - 对 uiPrefs 的两个写点(全局 render_html 默认值 + 生效值同步)改走回调桥
+//     (storeBridge.ts 的 notifyRenderHtmlDefault),本 store 不 import uiPrefs;
+//   - modelConn 是叶子 store(不反向引用本 store),保留直接引用。
 import { defineStore } from 'pinia';
 import { ref } from 'vue';
 import * as api from '../api';
 import { useModelConnStore } from './modelConn';
-import { useUiPrefsStore } from './uiPrefs';
 import { useTaskStore } from './task';
+import {
+  notifyRenderHtmlDefault,
+  registerSettingsLoader,
+  registerSettingsSaver,
+} from './storeBridge';
 
 /** 读取授权模式:新字段优先;旧配置只有 bypass_mode 时按 true→bypass / false→strict 映射 */
 function readAuthorizationMode(s: api.RuntimeSettings): api.AuthorizationMode {
@@ -60,6 +68,12 @@ export const useGenSettingsStore = defineStore('app.genSettings', () => {
   const mcpEnabled = ref(false);
   /** MCP 服务器列表(全量替换语义;服务端默认空) */
   const mcpServers = ref<api.McpServerConfig[]>([]);
+  /** 命令执行总开关(阶段 E;服务端默认 false = 关闭,须用户显式开启) */
+  const execEnabled = ref(false);
+  /** Android 执行层档位放行(默认全关;仅 Android 有意义,桌面恒走沙箱档) */
+  const execAllowRoot = ref(false);
+  const execAllowShizuku = ref(false);
+  const execAllowSandbox = ref(false);
   /** 授权模式三档(服务端默认 loose):strict=读/写/删都需授权;loose=读/写放行、删需授权;bypass=除系统路径写删外全放行 */
   const authorizationMode = ref<api.AuthorizationMode>('loose');
   /** 「始终需授权」清单(名单内工具在三档模式下都需授权) */
@@ -127,10 +141,8 @@ export const useGenSettingsStore = defineStore('app.genSettings', () => {
       toolAuthorizationTimeoutSecs.value = s.tool_authorization_timeout_secs ?? 300;
       taskToolPolicy.value = s.task_tool_policy ?? 'deny_dangerous';
       taskToolAllowlist.value = Array.isArray(s.task_tool_allowlist) ? s.task_tool_allowlist : [];
-      const uiPrefs = useUiPrefsStore();
-      uiPrefs.defaultRenderHtml = s.render_html ?? false;
-      // 无角色卡记忆时,当前生效值跟随全局默认(角色卡记忆优先)
-      uiPrefs.syncRenderHtmlToCurrent();
+      // 全局默认变更经回调桥通知 uiPrefs(其内部写 defaultRenderHtml 并按卡记忆重算生效值)
+      notifyRenderHtmlDefault(s.render_html ?? false);
       compactionMode.value = (s.compaction_mode as 'off' | 'manual' | 'auto') ?? 'off';
       compactionThreshold.value = s.compaction_threshold ?? 0.8;
       compactionKeepRecent.value = s.compaction_keep_recent ?? 4;
@@ -146,6 +158,10 @@ export const useGenSettingsStore = defineStore('app.genSettings', () => {
       undoEnabled.value = s.undo_enabled ?? true;
       mcpEnabled.value = s.mcp_enabled ?? false;
       mcpServers.value = Array.isArray(s.mcp_servers) ? s.mcp_servers : [];
+      execEnabled.value = s.exec_enabled ?? false;
+      execAllowRoot.value = s.exec_allow_root ?? false;
+      execAllowShizuku.value = s.exec_allow_shizuku ?? false;
+      execAllowSandbox.value = s.exec_allow_sandbox ?? false;
       const modelConn = useModelConnStore();
       if (!modelConn.model) modelConn.model = s.model;
     } catch {
@@ -181,9 +197,7 @@ export const useGenSettingsStore = defineStore('app.genSettings', () => {
     toolAuthorizationTimeoutSecs.value = s.tool_authorization_timeout_secs ?? 300;
     taskToolPolicy.value = s.task_tool_policy ?? 'deny_dangerous';
     taskToolAllowlist.value = Array.isArray(s.task_tool_allowlist) ? s.task_tool_allowlist : [];
-    const uiPrefs = useUiPrefsStore();
-    uiPrefs.defaultRenderHtml = s.render_html ?? false;
-    uiPrefs.syncRenderHtmlToCurrent();
+    notifyRenderHtmlDefault(s.render_html ?? false);
     compactionMode.value = (s.compaction_mode as 'off' | 'manual' | 'auto') ?? 'off';
     compactionThreshold.value = s.compaction_threshold ?? 0.8;
     compactionKeepRecent.value = s.compaction_keep_recent ?? 4;
@@ -199,6 +213,10 @@ export const useGenSettingsStore = defineStore('app.genSettings', () => {
     undoEnabled.value = s.undo_enabled ?? true;
     mcpEnabled.value = s.mcp_enabled ?? false;
     mcpServers.value = Array.isArray(s.mcp_servers) ? s.mcp_servers : [];
+    execEnabled.value = s.exec_enabled ?? false;
+    execAllowRoot.value = s.exec_allow_root ?? false;
+    execAllowShizuku.value = s.exec_allow_shizuku ?? false;
+    execAllowSandbox.value = s.exec_allow_sandbox ?? false;
   }
 
   // 设置写入统一串行,避免 renderHtml 自动保存与设置面板保存交错回写旧响应。
@@ -208,6 +226,27 @@ export const useGenSettingsStore = defineStore('app.genSettings', () => {
     settingsSaveQueue = queued.catch(() => { /* 保持队列可继续使用 */ });
     return queued;
   }
+
+  // 注册给回调桥(M5 断环):uiPrefs 保存全局 render_html 时经 queueSettingsSave 走
+  // 同一串行队列——「设置写入统一串行」口径不变,同时免去 uiPrefs → genSettings 的
+  // 顶层 import。
+  registerSettingsSaver(queueSettingsSave);
+
+  /**
+   * 请求 Shizuku 权限(阶段 E):经 Tauri 事件转 Rust → JNI → Kotlin
+   * (与 openExternal/shareFile 同一模式,绕开 remote origin 下的自定义命令 ACL)。
+   * 仅 Android 有效;桌面/浏览器调用会得到明确错误(便于面板给出可读提示)。
+   */
+  async function requestShizukuPermission(): Promise<void> {
+    const { isAndroidTauri } = await import('../platform');
+    if (!isAndroidTauri) {
+      throw new Error('Shizuku 仅在 Android 上可用');
+    }
+    const { emit } = await import('@tauri-apps/api/event');
+    await emit('kedai://shizuku-request');
+  }
+  // 切换顶层模式后 task store 需按新模式覆盖层重载设置(经桥调用)
+  registerSettingsLoader(loadSettings);
 
   /** 切换授权模式并持久化(输入框底部三档开关;失败回滚本地值) */
   async function setAuthorizationMode(mode: api.AuthorizationMode): Promise<void> {
@@ -287,11 +326,16 @@ export const useGenSettingsStore = defineStore('app.genSettings', () => {
     undoEnabled,
     mcpEnabled,
     mcpServers,
+    execEnabled,
+    execAllowRoot,
+    execAllowShizuku,
+    execAllowSandbox,
     authorizationMode,
     authorizationAlwaysRequired,
     toolAuthorizationTimeoutSecs,
     taskToolPolicy,
     taskToolAllowlist,
+    requestShizukuPermission,
     setAuthorizationMode,
     agentSystemPrompt,
     searchEndpoint,

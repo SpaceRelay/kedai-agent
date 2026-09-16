@@ -53,7 +53,7 @@ function togglePause(): void {
 }
 
 function clearLog(): void {
-  store.eventLog = [];
+  store.clearEventLog();
   frozen.value = [];
   expandedTs.value = null;
 }

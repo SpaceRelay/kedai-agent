@@ -18,9 +18,11 @@ import { createChatStreamService } from '../chatStreamService';
 import { saveExportFile } from '../exportFile';
 import { writeLastSessionId } from '../lastPosition';
 import type { ApiEventLogEntry } from '../devTools';
-import { useCharacterStore } from './character';
 import { useGenSettingsStore } from './genSettings';
 import { useUiPrefsStore } from './uiPrefs';
+// 当前角色 id 与事件上报口经回调桥取用(M5 断环:避免 chat → character 顶层依赖)。
+// owner 仍是 character / chat 自身,见 storeBridge.ts 纪律说明。
+import { currentCharacterIdValue, registerChatEventSink } from './storeBridge';
 
 const chatStream = createChatStreamService({
   streamChat: api.streamChat,
@@ -60,7 +62,7 @@ export const useChatStore = defineStore('app.chat', () => {
 
   /** 新建会话并切换过去(后端会注入角色开场白作为首条消息);greetingIndex=0 主开场,1..=备用开场 */
   async function newSession(greetingIndex = 0): Promise<void> {
-    const cid = useCharacterStore().currentCharacterId;
+    const cid = currentCharacterIdValue();
     if (!cid) return;
     const session = await api.createSession(cid, undefined, greetingIndex);
     sessions.value.unshift(session);
@@ -89,7 +91,7 @@ export const useChatStore = defineStore('app.chat', () => {
     currentSessionId.value = id;
     // 新会话恢复自动展开语义(上一会话的「不再自动弹」不跨越会话边界)
     useUiPrefsStore().resetAgentPanelAutoSuppress();
-    const cid = useCharacterStore().currentCharacterId;
+    const cid = currentCharacterIdValue();
     if (cid) writeLastSessionId(cid, id);
     await loadHistory(id);
   }
@@ -190,7 +192,7 @@ export const useChatStore = defineStore('app.chat', () => {
 
   // ===== 发送与流式生成 =====
   async function sendMessage(text: string): Promise<void> {
-    const cid = useCharacterStore().currentCharacterId;
+    const cid = currentCharacterIdValue();
     if (!cid || generating.value) return;
 
     // 无会话时先新建(后端注入开场白,保证角色上下文完整)
@@ -205,7 +207,7 @@ export const useChatStore = defineStore('app.chat', () => {
     text: string,
     opts: { resendMessageId?: number; regenerateAssistantId?: number } = {},
   ): Promise<void> {
-    const cid = useCharacterStore().currentCharacterId;
+    const cid = currentCharacterIdValue();
     if (!cid || generating.value) return;
     if (!currentSessionId.value) await newSession();
 
@@ -388,6 +390,16 @@ export const useChatStore = defineStore('app.chat', () => {
     }
   }
 
+  /** 设置 Agent 模式(fast/deep/agent/custom;进请求体 agent_mode,见 sendMessage) */
+  function setAgentMode(mode: api.AgentMode): void {
+    agentMode.value = mode;
+  }
+
+  /** 清空事件日志(开发工具面板「清空」按钮;采集口 onSseEvent 见下)。 */
+  function clearEventLog(): void {
+    eventLog.value = [];
+  }
+
   function onSseEvent(event: api.SseEvent): void {
     // 事件日志采集(阶段六 6c):全部 SSE 事件(含本地合成事件,如 stop/interrupted)
     // 流经本入口,在此一次性采集;cap 500 丢最旧,带当前会话上下文便于面板过滤。
@@ -397,8 +409,7 @@ export const useChatStore = defineStore('app.chat', () => {
       session_id: event.type === 'task' ? '' : (currentSessionId.value ?? ''),
       event,
     });
-    if (eventLog.value.length > 500) eventLog.value.splice(0, eventLog.value.length - 500);
-    // 事件语义处理在 sseReducer.ts(reduceSseEvent 纯函数);此处仅应用变更到响应式状态
+    if (eventLog.value.length > 500) eventLog.value.splice(0, eventLog.value.length - 500);    // 事件语义处理在 sseReducer.ts(reduceSseEvent 纯函数);此处仅应用变更到响应式状态
     const changes = reduceSseEvent(
       {
         agent: agent.value,
@@ -523,6 +534,10 @@ export const useChatStore = defineStore('app.chat', () => {
     return saved ? fileName : null;
   }
 
+  // 注册给回调桥(M5 断环):task store 的合成事件经此进事件日志与语义处理,
+  // 免去 task → chat 的顶层 import。行为与直接调用 onSseEvent 完全一致。
+  registerChatEventSink(onSseEvent);
+
   return {
     currentSessionId,
     sessions,
@@ -538,6 +553,8 @@ export const useChatStore = defineStore('app.chat', () => {
     mvuVariables,
     initVarEntries,
     eventLog,
+    clearEventLog,
+    setAgentMode,
     loadSessions,
     newSession,
     switchGreeting,

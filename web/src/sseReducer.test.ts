@@ -2,6 +2,18 @@ import { describe, expect, it } from 'vitest';
 import { idleAgent, reduceSseEvent, swipeCount, swipeIndex } from './sseReducer';
 import type { SseStateSlice } from './sseReducer';
 
+/** 全零 token 用量(finish 事件必带;测试只关心截断标记,数值无关) */
+function zeroUsage() {
+  return {
+    prompt_tokens: 0,
+    completion_tokens: 0,
+    total_tokens: 0,
+    context_tokens: 0,
+    prompt_cache_hit_tokens: 0,
+    prompt_cache_miss_tokens: 0,
+  };
+}
+
 function state(): SseStateSlice {
   return {
     agent: idleAgent(),
@@ -100,6 +112,57 @@ describe('reduceSseEvent', () => {
       reloadHistory: true,
     });
     expect(current.messages[0]).toMatchObject({ content: '最终正文', streaming: false });
+  });
+
+  it('finish_reason=length 时给消息打截断标记(可观测性问题①);stop 不打', () => {
+    // 截断:正文是半截,extra.truncated 置位供气泡展示「截断」提示
+    const truncatedState = state();
+    truncatedState.messages.push({ id: -1, role: 'assistant', content: '半截', extra: {}, streaming: true });
+    reduceSseEvent(truncatedState, {
+      type: 'finish',
+      content: '半截正文',
+      usage: zeroUsage(),
+      finish_reason: 'length',
+    });
+    expect(truncatedState.messages[0].extra.truncated).toBe(true);
+
+    // 正常收尾:不得误标截断
+    const normalState = state();
+    normalState.messages.push({ id: -1, role: 'assistant', content: '部分', extra: {}, streaming: true });
+    reduceSseEvent(normalState, {
+      type: 'finish',
+      content: '完整正文',
+      usage: zeroUsage(),
+      finish_reason: 'stop',
+    });
+    expect(normalState.messages[0].extra.truncated).toBeUndefined();
+
+    // 未下发 finish_reason(旧客户端形态):同样不标
+    const unknownState = state();
+    unknownState.messages.push({ id: -1, role: 'assistant', content: '部分', extra: {}, streaming: true });
+    reduceSseEvent(unknownState, { type: 'finish', content: '正文', usage: zeroUsage() });
+    expect(unknownState.messages[0].extra.truncated).toBeUndefined();
+  });
+
+  it('截断标记不覆盖既有 extra 字段(status_bar 等需保留)', () => {
+    const current = state();
+    current.messages.push({
+      id: -1,
+      role: 'assistant',
+      content: '半截',
+      extra: { status_bar: 'HP 10/10' },
+      streaming: true,
+    });
+    reduceSseEvent(current, {
+      type: 'finish',
+      content: '半截正文',
+      usage: zeroUsage(),
+      finish_reason: 'length',
+    });
+    expect(current.messages[0].extra).toMatchObject({
+      status_bar: 'HP 10/10',
+      truncated: true,
+    });
   });
 
   it('error 终态结束生成、进入 error 阶段并清理未落库临时草稿(含部分内容)', () => {

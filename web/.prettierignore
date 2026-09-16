@@ -1,0 +1,10 @@
+# 构建产物与依赖目录(与 .gitignore 对齐)
+dist
+node_modules
+coverage
+
+# 静态资源不格式化
+public
+
+# 由工具维护的生成物/锁文件
+package-lock.json

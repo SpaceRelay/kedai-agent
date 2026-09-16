@@ -283,3 +283,54 @@ describe('api/tasks streamTaskEvents(SSE 订阅)', () => {
     expect(closes2.length).toBe(0);
   });
 });
+
+// 形状闸门(批次 1):200 + 形状不对的载荷必须变成可捕获的 Error,而不是
+// 让 undefined 流进 store(报错点远离真正原因)。
+describe('api/tasks 形状闸门', () => {
+  beforeEach(() => {
+    resetApiTokenForTest();
+    vi.restoreAllMocks();
+  });
+
+  it('GET /tasks 返回 200 但缺 tasks 数组时透出服务端 error 原文', async () => {
+    vi.spyOn(globalThis, 'fetch')
+      .mockResolvedValueOnce(json({ token: 't' }))
+      .mockResolvedValueOnce(json({ error: '任务服务异常' }));
+    await expect(listTasks()).rejects.toThrow('任务服务异常');
+  });
+
+  it('GET /tasks 缺字段且无 error 原文时抛「任务列表响应格式异常」', async () => {
+    vi.spyOn(globalThis, 'fetch')
+      .mockResolvedValueOnce(json({ token: 't' }))
+      .mockResolvedValueOnce(json({ oops: true }));
+    await expect(listTasks()).rejects.toThrow('任务列表响应格式异常');
+  });
+
+  it('GET /tasks/:id 缺 subtasks 数组时抛错(不把形状错误带进 store)', async () => {
+    vi.spyOn(globalThis, 'fetch')
+      .mockResolvedValueOnce(json({ token: 't' }))
+      .mockResolvedValueOnce(json({ task: { id: 't1' } }));
+    await expect(getTask('t1')).rejects.toThrow('任务详情响应格式异常');
+  });
+
+  it('GET /tasks/usage-total 缺 usage_total 对象时抛错', async () => {
+    vi.spyOn(globalThis, 'fetch')
+      .mockResolvedValueOnce(json({ token: 't' }))
+      .mockResolvedValueOnce(json({ ok: true }));
+    await expect(getTaskUsageTotal()).rejects.toThrow('任务用量累计响应格式异常');
+  });
+
+  it('POST /tasks 缺 task 对象时抛错', async () => {
+    vi.spyOn(globalThis, 'fetch')
+      .mockResolvedValueOnce(json({ token: 't' }))
+      .mockResolvedValueOnce(json({ ok: true }));
+    await expect(createTask('目标')).rejects.toThrow('任务响应格式异常');
+  });
+
+  it('GET /tasks/:id/calls 缺 calls 数组时抛错', async () => {
+    vi.spyOn(globalThis, 'fetch')
+      .mockResolvedValueOnce(json({ token: 't' }))
+      .mockResolvedValueOnce(json({ ok: true }));
+    await expect(getTaskCalls('t1')).rejects.toThrow('任务调用记录响应格式异常');
+  });
+});

@@ -60,7 +60,7 @@ async function onDelete(id: string, name: string): Promise<void> {
 }
 
 // ===== 技能高级设置(工具白名单 / 子智能体 / 模型覆盖)=====
-// 后端 SkillRecord 早已支持这三个字段,前端此前无入口(见 docs/contract-drift-2026-09-09.md #9-#11)。
+// 后端 SkillRecord 早已支持这三个字段,前端此前无入口(见 docs/archive/contract-drift-2026-09-09.md #9-#11)。
 const editingId = ref<string | null>(null);
 /** 编辑草稿:allowedTools 以逗号分隔文本编辑,保存时转 JSON 数组字符串 */
 const draft = ref<{ allowedTools: string; runAsSubagent: boolean; model: string }>({

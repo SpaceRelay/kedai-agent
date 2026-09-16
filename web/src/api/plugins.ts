@@ -1,5 +1,6 @@
 // 插件(自定义工具)API
-import { BASE, authorizedFetch, request } from './client';
+import { request } from './client';
+import { uploadForm } from './stream';
 import type { PluginToolsStatus } from './types';
 
 /** 列出已注册工具插件 + 磁盘文件 */
@@ -9,14 +10,7 @@ export async function listPluginTools(): Promise<PluginToolsStatus> {
 
 /** 导入工具插件 JSON 文件(multipart) */
 export async function uploadPluginTool(file: File): Promise<{ ok: boolean; name: string; file: string }> {
-  const form = new FormData();
-  form.append('file', file);
-  const res = await authorizedFetch(`${BASE}/plugins/tools/upload`, { method: 'POST', body: form }, false);
-  if (!res.ok) {
-    const body = (await res.json().catch(() => ({}))) as { error?: string };
-    throw new Error(body.error ?? '导入失败');
-  }
-  return (await res.json()) as { ok: boolean; name: string; file: string };
+  return uploadForm<{ ok: boolean; name: string; file: string }>('/plugins/tools/upload', file);
 }
 
 /** 热重载全部工具插件 */

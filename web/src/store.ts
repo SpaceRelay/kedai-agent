@@ -58,6 +58,8 @@ export const useAppStore = defineStore('app', () => {
     sendMessage: chat.sendMessage,
     startStream: chat.startStream,
     onSseEvent: chat.onSseEvent,
+    clearEventLog: chat.clearEventLog,
+    setAgentMode: chat.setAgentMode,
     stop: chat.stop,
     removeMessage: chat.removeMessage,
     updateMessage: chat.updateMessage,
@@ -78,6 +80,7 @@ export const useAppStore = defineStore('app', () => {
     saveSettings: genSettings.saveSettings,
     queueSettingsSave: genSettings.queueSettingsSave,
     setAuthorizationMode: genSettings.setAuthorizationMode,
+    requestShizukuPermission: genSettings.requestShizukuPermission,
     loadPromptInject: genSettings.loadPromptInject,
     savePromptInjectConfig: genSettings.savePromptInjectConfig,
     loadAgentFlow: genSettings.loadAgentFlow,
@@ -106,6 +109,8 @@ export const useAppStore = defineStore('app', () => {
     stopTaskPolling: task.stopTaskPolling,
     // 界面偏好(渲染开关按角色记忆等动作)
     syncRenderHtmlToCurrent: uiPrefs.syncRenderHtmlToCurrent,
+    setRenderHtml: uiPrefs.setRenderHtml,
+    toggleRenderHtml: uiPrefs.toggleRenderHtml,
     removeRenderHtmlOverride: uiPrefs.removeRenderHtmlOverride,
     // Agent 面板开合(自动展开一次 + 用户主动收起后不再打扰)
     openAgentPanel: uiPrefs.openAgentPanel,

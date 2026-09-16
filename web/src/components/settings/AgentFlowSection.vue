@@ -221,7 +221,7 @@ onMounted(async () => {
               <label class="sv-inp-tag">温度</label>
               <input v-model.number="step.temperature" type="number" min="0" max="2" step="0.1" class="sv-input inject-num" placeholder="沿用全局" />
               <label class="sv-inp-tag">输出上限</label>
-              <input v-model.number="step.max_tokens" type="number" min="1" max="32768" class="sv-input inject-num" placeholder="沿用全局" />
+              <input v-model.number="step.max_tokens" type="number" min="1" max="131072" class="sv-input inject-num" placeholder="沿用全局" title="该步骤的输出上限(1~131072);留空沿用全局最大生成长度" />
             </div>
           </template>
         </div>

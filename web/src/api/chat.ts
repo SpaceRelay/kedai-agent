@@ -1,6 +1,7 @@
 // SSE 流式聊天(streamChat)
 import { BASE, apiErrorMessage, authorizedFetch, request } from './client';
 import { createSseFrameParser } from './sseParser';
+import { pumpSseFrames, readErrorParts } from './stream';
 import type { AgentMode, SseEvent, TokenUsage } from './types';
 
 export type SseHandler = (event: SseEvent) => void;
@@ -52,6 +53,8 @@ function emptyUsage(): TokenUsage {
 
 export interface SseParser {
   push(chunk: Uint8Array): void;
+  /** 喂入**已解出的 data 文本**(与 push 二选一):供共享读循环 stream.ts 复用同一解析器 */
+  pushData(data: string): void;
   finish(): boolean;
 }
 
@@ -65,7 +68,8 @@ export interface SseParser {
 export function createSseParser(onEvent: SseHandler): SseParser {
   let terminalReceived = false;
 
-  const frames = createSseFrameParser((data) => {
+  /** 单帧 data 文本 → 聊天事件(坏帧跳过,不阻断后续);终态在此登记 */
+  const handleData = (data: string): void => {
     try {
       const event = JSON.parse(data) as SseEvent;
       onEvent(event);
@@ -74,10 +78,13 @@ export function createSseParser(onEvent: SseHandler): SseParser {
     } catch {
       // 单个坏事件不应阻断后续事件。
     }
-  });
+  };
+
+  const frames = createSseFrameParser(handleData);
 
   return {
     push: (chunk) => frames.push(chunk),
+    pushData: handleData,
     finish: () => {
       frames.finish();
       return terminalReceived;
@@ -99,21 +106,17 @@ export function streamChat(
         signal: controller.signal,
       });
       if (!res.ok || !res.body) {
-        const body = (await res.json().catch(() => ({}))) as { error?: string; code?: string };
-        // 失败必须发 finish(空 content),否则 store 的 generating 永远不复位,UI 卡在生成中
-        // 提示口径与 request() 一致:按结构化 code 分类(见 client.ts apiErrorMessage)
-        const code = body.code ?? (res.status === 401 ? 'UNAUTHORIZED' : undefined);
-        onEvent({ type: 'step', step: '请求失败', detail: apiErrorMessage(res.status, code, body.error) });
+        // 失败必须发 finish(空 content),否则 store 的 generating 永远不复位,UI 卡在生成中。
+        // 错误口径与 request() 一致:按结构化 code 分类(见 client.ts apiErrorMessage),
+        // 错误体解析与 tasks 流共用 stream.ts 的单点实现。
+        const { status, code, detail } = await readErrorParts(res);
+        onEvent({ type: 'step', step: '请求失败', detail: apiErrorMessage(status, code, detail) });
         onEvent({ type: 'finish', usage: emptyUsage(), content: '' });
         return;
       }
-      const reader = res.body.getReader();
+      // 读循环与帧解析走共享底座(stream.ts),终态判定仍由本层的 createSseParser 负责
       const parser = createSseParser(onEvent);
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        parser.push(value);
-      }
+      await pumpSseFrames(res, (data) => parser.pushData(data));
       if (!parser.finish()) {
         onEvent({ type: 'step', step: '连接中断', detail: '流在收到终态事件前结束' });
         onEvent({ type: 'finish', usage: emptyUsage(), content: '' });

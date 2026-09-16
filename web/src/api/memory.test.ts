@@ -213,3 +213,51 @@ describe('deleteMemory', () => {
     await expect(deleteMemory(9999)).rejects.toThrow('记忆 9999 不存在');
   });
 });
+
+// 形状闸门(批次 1):200 + 形状不对的载荷必须变成可捕获的 Error
+describe('api/memory 形状闸门', () => {
+  beforeEach(() => {
+    resetApiTokenForTest();
+    vi.restoreAllMocks();
+  });
+
+  it('listMemories 缺 memories 数组时透出服务端 error 原文', async () => {
+    mockFetchSequence({ body: { error: '记忆服务异常' } });
+    await expect(listMemories('charA')).rejects.toThrow('记忆服务异常');
+  });
+
+  it('listMemories 缺字段且无原文时抛「记忆列表响应格式异常」', async () => {
+    mockFetchSequence({ body: { ok: true } });
+    await expect(listMemories('charA')).rejects.toThrow('记忆列表响应格式异常');
+  });
+
+  it('searchMemories 缺 memories 数组时抛错', async () => {
+    mockFetchSequence({ body: {} });
+    await expect(searchMemories('charA', 'q')).rejects.toThrow('记忆检索结果响应格式异常');
+  });
+
+  it('createMemory 缺 memory 对象时抛错', async () => {
+    mockFetchSequence({ body: { ok: true } });
+    await expect(createMemory('charA', '内容')).rejects.toThrow('记忆条目响应格式异常');
+  });
+
+  it('updateMemory 缺 memory 对象时抛错', async () => {
+    mockFetchSequence({ body: { ok: true } });
+    await expect(updateMemory(7, { pinned: true })).rejects.toThrow('记忆条目响应格式异常');
+  });
+
+  it('pruneMemories 计数字段(removed/deleted)全缺时抛错,不谎报「删除 0 条」', async () => {
+    mockFetchSequence({ body: { ok: true } });
+    await expect(pruneMemories('charA')).rejects.toThrow('记忆清理结果响应格式异常');
+  });
+
+  it('pruneMemories 保留 removed→deleted 兼容映射(0 是合法值)', async () => {
+    mockFetchSequence({ body: { ok: true, removed: 0 } });
+    await expect(pruneMemories('charA')).resolves.toEqual({ ok: true, deleted: 0 });
+  });
+
+  it('distillMemory 缺 inserted 数字时抛错', async () => {
+    mockFetchSequence({ body: { ok: true, character_id: 'charA' } });
+    await expect(distillMemory('s1')).rejects.toThrow('记忆蒸馏结果响应格式异常');
+  });
+});

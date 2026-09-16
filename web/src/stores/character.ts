@@ -1,6 +1,12 @@
 // 角色 store:角色列表 CRUD、当前角色选择、搜索过滤、开场白派生、角色卡脚本授权。
-// 从 store.ts 按领域拆分。跨 store 引用(切角色时重置 chat 会话状态 /
-// 同步 uiPrefs 的 HTML 渲染开关)均在动作运行时解析,setup 阶段不实例化其他 store。
+//
+// 代际: L2(中层·干 / Orchestration)——Pinia setup store,状态的唯一变更入口。
+// 跨 store 引用(切角色时重置 chat 会话状态 / 同步 uiPrefs 的 HTML 渲染开关)均在
+// action 运行时解析,setup 阶段不实例化其他 store(断环,见 storeBridge.ts)。
+//
+// 脚本授权双写(2026-09-14):本地 localStorage 台账(前端沙箱用)+ 后端台账
+// (`api.grantScriptAuthorization`,后端脚本执行门用)。哈希**取后端下发的
+// current_hash**,前端不自行计算,避免跨语言口径漂移导致永不匹配。
 import { defineStore } from 'pinia';
 import { computed, ref } from 'vue';
 import * as api from '../api';
@@ -19,6 +25,11 @@ import {
   writeLastCharacterId,
   writeLastSessionId,
 } from '../lastPosition';
+// 跨 store 依赖(M5 断环):当前角色 id 经回调桥(storeBridge.ts)暴露给 chat/uiPrefs,
+// 免去它们顶层 import 本 store;本 store 是这两条边的被依赖方。
+// chat / uiPrefs 已不再指向本 store,故本 store 对它们的引用(会话重置、渲染开关
+// 记忆/加载错误提示)不构成环,保持直接调用。
+import { registerCharacterIdProvider } from './storeBridge';
 import { useChatStore } from './chat';
 import { useUiPrefsStore } from './uiPrefs';
 
@@ -27,6 +38,9 @@ export const useCharacterStore = defineStore('app.character', () => {
   const characters = ref<api.CharacterRecord[]>([]);
   const currentCharacterId = ref<string | null>(null);
   const searchQuery = ref('');
+
+  // 注册给回调桥(M5 断环):chat/uiPrefs 读当前角色 id 经此取用本 store 实例。
+  registerCharacterIdProvider(() => currentCharacterId.value);
 
   const scriptAuthorizationStore = new LocalScriptAuthorizationStore(localStorage);
   /** 当前角色脚本内容哈希；角色或脚本变化时重算。 */
@@ -233,12 +247,29 @@ export const useCharacterStore = defineStore('app.character', () => {
     scriptAuthorizationStore.grant(id, hash);
     scriptAuthorizations.value = scriptAuthorizationStore.list();
     scriptAuthVersion.value += 1;
+    // **同步后端授权台账(2026-09-14,L12 后端授权门)**:后端角色卡脚本默认
+    // fail-closed,不推送后端授权则后端不会执行该卡脚本。哈希取**后端下发的
+    // current_hash**(前端不自行计算,避免跨语言哈希口径漂移导致永不匹配)。
+    // 失败仅告警不抛出:本地授权已生效(前端沙箱可用),后端门禁失败时应保持
+    // 「前端可用、后端不放行」的安全一侧,并让用户可见(console 提示)。
+    try {
+      const status = await api.getScriptAuthorization(id);
+      if (status.current_hash) {
+        await api.grantScriptAuthorization(id, status.current_hash);
+      }
+    } catch (e) {
+      console.warn('[脚本授权] 后端授权同步失败,后端将不执行该卡脚本:', e);
+    }
   }
 
   function revokeCharacterScripts(characterId: string): void {
     scriptAuthorizationStore.revoke(characterId);
     scriptAuthorizations.value = scriptAuthorizationStore.list();
     scriptAuthVersion.value += 1;
+    // 同步撤销后端授权(失败仅告警:本地已撤销,后端残留授权不应阻塞 UI)
+    void api.revokeScriptAuthorization(characterId).catch((e) => {
+      console.warn('[脚本授权] 后端撤销同步失败:', e);
+    });
   }
 
   function isCharacterScriptAuthorized(characterId: string, scriptHash: string): boolean {

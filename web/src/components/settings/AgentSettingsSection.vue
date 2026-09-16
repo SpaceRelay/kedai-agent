@@ -8,6 +8,7 @@ import { storeToRefs } from 'pinia';
 import { useAgentSettings } from '../../composables/useAgentSettings';
 import { useAgentPromptEditor } from '../../composables/useAgentPromptEditor';
 import AuthorizationSection from './AuthorizationSection.vue';
+import AndroidExecSection from './AndroidExecSection.vue';
 
 withDefaults(defineProps<{
   /** 是否显示(embedded 模式按 activeSection 切换;standalone 恒 true) */
@@ -147,6 +148,10 @@ watch(appMode, () => void loadPromptPreview());
       <div class="sv-separator">
         <div class="sv-field-label sub">授权管理</div>
         <AuthorizationSection :show="show" />
+      </div>
+
+      <div class="sv-separator">
+        <AndroidExecSection :show="show" />
       </div>
 
       <div class="sv-separator">

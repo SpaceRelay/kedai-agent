@@ -16,7 +16,7 @@
 
 import { onBeforeUnmount, onMounted } from 'vue';
 import type { Ref } from 'vue';
-import { authorizedFetch, BASE } from '../api/client';
+import { ApiError, apiErrorMessage, authorizedFetch, BASE } from '../api/client';
 import { getCharacter } from '../api/characters';
 import type { CharacterRecord } from '../api/types';
 import { applyResourceSync, loadResourceSnapshot, type ResourceSyncMessage } from '../resourceStore';
@@ -47,26 +47,52 @@ function escapeAttr(s: string): string {
   return s.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
+/**
+ * 资源页 RPC 诊断日志(环形保留 20 条,localStorage)。
+ * 卡片自检报「丢格式」时,用 `injected`(世界书注入条数)与 `chars`(产出长度)
+ * 区分故障:injected=0 → 角色 id 未送达或条目未命中;chars 偏小 → 被 max_tokens 截断。
+ * 仅记元信息,不落正文/密钥。
+ */
+function logTavernCall(entry: Record<string, unknown>): void {
+  try {
+    const log = JSON.parse(localStorage.getItem('kedai.tavern-call-log') ?? '[]') as unknown[];
+    log.push({ t: Date.now(), ...entry });
+    localStorage.setItem('kedai.tavern-call-log', JSON.stringify(log.slice(-20)));
+  } catch {
+    /* 忽略(隐私模式/配额满) */
+  }
+}
+
 export function useResourceFrames(opts: UseResourceFramesOptions) {
   /** 已注册的资源框架:contentWindow(跨 reload 稳定)→ 条目 */
   const resourceFrames = new Map<Window, ResourceEntry>();
   /** 作者页面 HTML 按 URL 缓存(同一作者页多条消息共享;失败不缓存,便于重试) */
-  const resourceHtmlCache = new Map<string, Promise<{ ok?: boolean; html?: string; base_url?: string; error?: string }>>();
+  const resourceHtmlCache = new Map<string, Promise<{ html: string; base_url?: string }>>();
 
-  function fetchResourceHtml(url: string): Promise<{ ok?: boolean; html?: string; base_url?: string; error?: string }> {
+  /**
+   * 取作者页 HTML。**成败按 HTTP 状态判定**(批次 1):后端错误体已统一为
+   * `{error, code}` + 真实状态码,不再用 200 + `{ok:false}` 上报失败——若仍按
+   * `body.ok` 分支,失败会被当成「html 缺失」而丢掉后端给的错误文案与 code 分类。
+   */
+  function fetchResourceHtml(url: string): Promise<{ html: string; base_url?: string }> {
     let p = resourceHtmlCache.get(url);
     if (!p) {
       p = (async () => {
         const res = await authorizedFetch(`${BASE}/resource/proxy?url=${encodeURIComponent(url)}`, undefined, false);
-        return (await res.json().catch(() => ({}))) as { ok?: boolean; html?: string; base_url?: string; error?: string };
+        const body = (await res.json().catch(() => ({}))) as { html?: unknown; base_url?: unknown; error?: unknown; code?: unknown };
+        if (!res.ok) {
+          const detail = typeof body.error === 'string' ? body.error : undefined;
+          const code = typeof body.code === 'string' ? body.code : undefined;
+          throw new ApiError(res.status, code, detail, apiErrorMessage(res.status, code, detail));
+        }
+        if (typeof body.html !== 'string') throw new Error('资源页响应缺少 html');
+        return { html: body.html, base_url: typeof body.base_url === 'string' ? body.base_url : undefined };
       })();
       resourceHtmlCache.set(url, p);
       const drop = (): void => {
         if (resourceHtmlCache.get(url) === p) resourceHtmlCache.delete(url);
       };
-      p.then((b) => {
-        if (!b?.ok) drop();
-      }, drop);
+      p.catch(drop);
     }
     return p;
   }
@@ -79,7 +105,6 @@ export function useResourceFrames(opts: UseResourceFramesOptions) {
     if (!win) return;
     try {
       const body = await fetchResourceHtml(url);
-      if (!body.ok || typeof body.html !== 'string') throw new Error(body.error ?? '未知错误');
       const html = body.base_url ? `<base href="${escapeAttr(body.base_url)}">\n${body.html}` : body.html;
       const snapshot = await loadResourceSnapshot(url);
       // 酒馆助手式资源页需要当前角色卡元数据推导资源包口令(TavernHelper shim)
@@ -197,14 +222,8 @@ export function useResourceFrames(opts: UseResourceFramesOptions) {
     entry: ResourceEntry,
     m: { callId?: string; method?: string; args?: unknown },
   ): Promise<void> {
-    // 调试痕迹:资源页 RPC 调用记录(诊断桥断点;环形保留 20 条)
-    try {
-      const log = JSON.parse(localStorage.getItem('kedai.tavern-call-log') ?? '[]') as unknown[];
-      log.push({ t: Date.now(), method: m.method, callId: m.callId });
-      localStorage.setItem('kedai.tavern-call-log', JSON.stringify(log.slice(-20)));
-    } catch {
-      /* 忽略 */
-    }
+    // 调试痕迹:资源页 RPC 调用记录(桥入口先记一条,便于确认调用是否到达宿主)
+    logTavernCall({ method: m.method, callId: m.callId, phase: 'received' });
     const win = entry.frame.contentWindow;
     if (!win || !m.callId) return;
     const reply = (ok: boolean, value?: unknown, error?: string): void => {
@@ -254,9 +273,35 @@ export function useResourceFrames(opts: UseResourceFramesOptions) {
         // 触发的输出格式规范)由后端注入,缺失会让模型自由发挥 → 游戏自检「丢格式」
         body: JSON.stringify({ messages, character_id: opts.currentCharacterId.value ?? undefined }),
       });
-      const data = (await res.json().catch(() => ({}))) as { ok?: boolean; text?: string; error?: string };
-      if (data.ok && typeof data.text === 'string') reply(true, data.text);
-      else reply(false, undefined, data.error ?? `HTTP ${res.status}`);
+      const data = (await res.json().catch(() => ({}))) as {
+        ok?: boolean;
+        text?: string;
+        error?: string;
+        /** 后端注入的世界书条目 comment 清单,空数组/缺失即「未注入」 */
+        injected?: string[];
+      };
+      if (data.ok && typeof data.text === 'string') {
+        // 注入条数与产出长度写进诊断日志(卡片报「丢格式」时用于区分
+        // 「世界书没注入」与「JSON 被 max_tokens 截断」两种故障)
+        logTavernCall({
+          method: m.method ?? 'generate',
+          callId: m.callId,
+          ok: true,
+          injected: data.injected?.length ?? 0,
+          chars: data.text.length,
+          characterId: opts.currentCharacterId.value ?? null,
+        });
+        reply(true, data.text);
+      } else {
+        logTavernCall({
+          method: m.method ?? 'generate',
+          callId: m.callId,
+          ok: false,
+          error: data.error ?? `HTTP ${res.status}`,
+          characterId: opts.currentCharacterId.value ?? null,
+        });
+        reply(false, undefined, data.error ?? `HTTP ${res.status}`);
+      }
     } catch (e) {
       reply(false, undefined, String((e as Error).message || '桥接失败'));
     }

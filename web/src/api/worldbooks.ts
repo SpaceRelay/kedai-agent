@@ -1,23 +1,22 @@
 // 世界书 API
-import { BASE, authorizedFetch, request } from './client';
+import { request } from './client';
+import { requireArrayField, requireObjectField } from './shape';
+import { uploadForm } from './stream';
 import type { WorldBookEntry, WorldBookRecord } from './types';
 
 export async function listWorldBooks(): Promise<WorldBookRecord[]> {
-  const data = await request<{ world_books: WorldBookRecord[] }>('/world-books');
-  return data.world_books;
+  const data = await request<unknown>('/world-books');
+  // 形状闸门:resources store 直接落 worldBooks 渲染列表,解出 undefined 会让面板空白
+  return requireArrayField<WorldBookRecord>(data, 'world_books', '世界书列表');
 }
 
 /** 上传独立世界书(JSON);characterId 可选绑定到角色 */
 export async function uploadWorldBook(file: File, characterId?: string): Promise<WorldBookRecord> {
-  const form = new FormData();
-  form.append('file', file);
-  if (characterId) form.append('character_id', characterId);
-  const res = await authorizedFetch(`${BASE}/world-books/upload`, { method: 'POST', body: form }, false);
-  if (!res.ok) {
-    const body = (await res.json().catch(() => ({}))) as { error?: string };
-    throw new Error(body.error ?? '上传失败');
-  }
-  return (await res.json()) as WorldBookRecord;
+  return uploadForm<WorldBookRecord>(
+    '/world-books/upload',
+    file,
+    characterId ? { character_id: characterId } : {},
+  );
 }
 
 /** 更新世界书:enabled / character_id(空串=转全局)/ name */
@@ -34,38 +33,38 @@ export async function deleteWorldBook(id: string): Promise<void> {
 
 /** 条目预览 */
 export async function getWorldBookEntries(id: string): Promise<WorldBookEntry[]> {
-  const data = await request<{ id: string; entries: WorldBookEntry[] }>(`/world-books/${id}/entries`);
-  return data.entries;
+  const data = await request<unknown>(`/world-books/${id}/entries`);
+  return requireArrayField<WorldBookEntry>(data, 'entries', '世界书条目');
 }
 
 /** 全量回写独立世界书条目(关键词/正则/常驻/激活/位置) */
 export async function saveWorldBookEntries(id: string, entries: WorldBookEntry[]): Promise<WorldBookEntry[]> {
-  const data = await request<{ ok: boolean; entries: WorldBookEntry[] }>(`/world-books/${id}/entries`, {
+  const data = await request<unknown>(`/world-books/${id}/entries`, {
     method: 'PUT',
     body: JSON.stringify({ entries }),
   });
-  return data.entries;
+  return requireArrayField<WorldBookEntry>(data, 'entries', '世界书条目');
 }
 
 /** 新增一条独立世界书条目(返回新条目,空内容需编辑后生效) */
 export async function addWorldBookEntry(id: string): Promise<WorldBookEntry> {
-  const data = await request<{ ok: boolean; entry: WorldBookEntry }>(`/world-books/${id}/entries`, { method: 'POST' });
-  return data.entry;
+  const data = await request<unknown>(`/world-books/${id}/entries`, { method: 'POST' });
+  return requireObjectField<WorldBookEntry>(data, 'entry', '世界书条目');
 }
 
 /** 当前角色卡内嵌世界书条目(character_book) */
 export async function getCharacterWorldEntries(characterId: string): Promise<WorldBookEntry[]> {
-  const data = await request<{ character_id: string; entries: WorldBookEntry[] }>(`/characters/${characterId}/world-entries`);
-  return data.entries;
+  const data = await request<unknown>(`/characters/${characterId}/world-entries`);
+  return requireArrayField<WorldBookEntry>(data, 'entries', '角色卡世界书条目');
 }
 
 /** 回写角色卡内嵌世界书条目 */
 export async function saveCharacterWorldEntries(characterId: string, entries: WorldBookEntry[]): Promise<WorldBookEntry[]> {
-  const data = await request<{ ok: boolean; entries: WorldBookEntry[] }>(`/characters/${characterId}/world-entries`, {
+  const data = await request<unknown>(`/characters/${characterId}/world-entries`, {
     method: 'PUT',
     body: JSON.stringify({ entries }),
   });
-  return data.entries;
+  return requireArrayField<WorldBookEntry>(data, 'entries', '角色卡世界书条目');
 }
 
 /** 自检:世界书「属性自动分配机制」是否可用(常驻→system、激发→user) */

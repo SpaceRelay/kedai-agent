@@ -2,28 +2,35 @@
 // 后端契约:GET /api/tasks → { tasks };POST /api/tasks → { ok, task };
 // GET /api/tasks/{id} → { task, subtasks };POST /api/tasks/{id}/run | /stop;
 // DELETE /api/tasks/{id} → 204;GET /api/tasks/events → SSE(KeepAlive 30s)。
-import { BASE, ApiError, apiErrorMessage, authorizedFetch, request } from './client';
-import { createSseFrameParser } from './sseParser';
+import { BASE, authorizedFetch, request } from './client';
+import { requireArrayField, requireObjectField } from './shape';
+import { pumpSseFrames, toApiError } from './stream';
 import type { TaskDetail, TaskEvent, TaskLlmCall, TaskRecord, TaskRunMode, TaskStep, TaskUsageTotal } from './types';
 
 /** 读取任务列表(最新在前) */
 export async function listTasks(): Promise<TaskRecord[]> {
-  const data = await request<{ tasks: TaskRecord[] }>('/tasks');
-  return data.tasks;
+  const data = await request<unknown>('/tasks');
+  // 形状闸门:任务板直接落列表渲染
+  return requireArrayField<TaskRecord>(data, 'tasks', '任务列表');
 }
 
 /** 新建任务;character_id 可选(执行者人设角色);task_mode 可选(批次 4 六模式,缺省 legacy) */
 export async function createTask(title: string, characterId?: string, taskMode?: TaskRunMode): Promise<TaskRecord> {
-  const data = await request<{ ok: boolean; task: TaskRecord }>('/tasks', {
+  const data = await request<unknown>('/tasks', {
     method: 'POST',
     body: JSON.stringify({ title, character_id: characterId ?? null, task_mode: taskMode ?? 'legacy' }),
   });
-  return data.task;
+  return requireObjectField<TaskRecord>(data, 'task', '任务');
 }
 
 /** 读取任务详情(含子任务) */
 export async function getTask(id: string): Promise<TaskDetail> {
-  return request<TaskDetail>(`/tasks/${id}`);
+  const data = await request<unknown>(`/tasks/${id}`);
+  // 形状闸门:task store 的 contentSignature(detail) 直接读 task/subtasks,
+  // 解出 undefined 会在下游以随机 TypeError 崩溃(报错点远离真正原因)
+  requireObjectField<TaskRecord>(data, 'task', '任务详情');
+  requireArrayField<TaskDetail['subtasks'][number]>(data, 'subtasks', '任务详情');
+  return data as TaskDetail;
 }
 
 /** 启动任务执行(后台) */
@@ -83,14 +90,15 @@ export async function deleteTask(id: string): Promise<void> {
 
 /** 全部任务 token 累计(侧栏任务模式「全局累计」) */
 export async function getTaskUsageTotal(): Promise<TaskUsageTotal> {
-  const data = await request<{ usage_total: TaskUsageTotal }>('/tasks/usage-total');
-  return data.usage_total;
+  const data = await request<unknown>('/tasks/usage-total');
+  // 形状闸门:侧栏直接读 usage_total.total_tokens 显示累计
+  return requireObjectField<TaskUsageTotal>(data, 'usage_total', '任务用量累计');
 }
 
 /** 任务 LLM 调用记录(批次 3 L3 调用追踪面板;按 created_at,id 升序) */
 export async function getTaskCalls(taskId: string): Promise<TaskLlmCall[]> {
-  const data = await request<{ calls: TaskLlmCall[] }>(`/tasks/${encodeURIComponent(taskId)}/calls`);
-  return data.calls;
+  const data = await request<unknown>(`/tasks/${encodeURIComponent(taskId)}/calls`);
+  return requireArrayField<TaskLlmCall>(data, 'calls', '任务调用记录');
 }
 
 /**
@@ -122,15 +130,12 @@ export function streamTaskEvents(
         signal: controller.signal,
       });
       if (!res.ok || !res.body) {
-        // 错误口径与 client.ts request() 一致:结构化 code 分类 + ApiError
-        const body = (await res.json().catch(() => ({}))) as { error?: string; code?: string };
-        const code = body.code ?? (res.status === 401 ? 'UNAUTHORIZED' : undefined);
-        throw new ApiError(res.status, code, body.error, apiErrorMessage(res.status, code, body.error));
+        // 错误口径与 client.ts request() 一致:结构化 code 分类 + ApiError(共享 stream.ts)
+        throw await toApiError(res);
       }
 
-      const reader = res.body.getReader();
-      /** 帧解析(共享层):data 文本 → task 事件(非 task 类型/坏帧忽略) */
-      const frames = createSseFrameParser((data) => {
+      // 帧解析与读循环走共享底座;非 task 类型/坏帧跳过,不阻断后续事件
+      await pumpSseFrames(res, (data) => {
         try {
           const ev = JSON.parse(data) as TaskEvent;
           if (ev && ev.type === 'task' && typeof ev.task_id === 'string') onEvent(ev);
@@ -138,13 +143,6 @@ export function streamTaskEvents(
           // 单个坏事件不阻断后续事件
         }
       });
-
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        frames.push(value);
-      }
-      frames.finish();
       // 流自然结束(对端关闭):非主动关闭,通知调用方重连
       if (!closed) {
         closed = true;

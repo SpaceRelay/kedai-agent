@@ -350,6 +350,7 @@ function detailWithSubtasks(task: TaskRecord): TaskDetail {
         error: '',
         created_at: '2026-08-29T00:00:00.000Z',
         updated_at: '2026-08-29T00:00:00.000Z',
+        finished_at: '2026-08-29T00:00:00.000Z',
       },
     ],
     usage_total: { prompt_tokens: 0, completion_tokens: 0, reasoning_tokens: 0 },

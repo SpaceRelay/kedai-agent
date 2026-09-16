@@ -301,6 +301,63 @@ describe('任务事件 SSE 订阅(WP5)', () => {
     await vi.advanceTimersByTimeAsync(30000);
     expect(h.subscribeCalls, '退出 task 模式后不得重连').toBe(1);
   });
+
+  it('断线可观测:每次断线输出一条 [kedai] warn,内含下次退避毫秒数与兜底轮询状态', async () => {
+    vi.useFakeTimers();
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const store = useTaskStore();
+    store.appMode = 'task';
+    store.startTaskEvents();
+    await vi.advanceTimersByTimeAsync(0);
+
+    // 连续失败三次:退避 1s → 2s → 4s(warn 里记录的正是 setTimeout 实际使用的值)
+    h.autoFailSubscribe = true;
+    h.emitClose!(new Error('network down'));
+    await vi.advanceTimersByTimeAsync(1000); // t=1s:1s 退避后重连 → 被拒
+    await vi.advanceTimersByTimeAsync(2000); // t=3s:2s 退避后重连 → 被拒
+
+    const msgs = warnSpy.mock.calls
+      .map((c) => String(c[0]))
+      .filter((m) => m.startsWith('[kedai]'));
+    expect(msgs, '每次断线一条 warn').toHaveLength(3);
+    expect(msgs[0]).toContain('1000ms');
+    expect(msgs[1], '退避翻倍(策略未改,仅观测)').toContain('2000ms');
+    expect(msgs[2]).toContain('4000ms');
+    expect(
+      msgs.every((m) => m.includes('兜底轮询')),
+      'warn 应说明兜底轮询已接管',
+    ).toBe(true);
+  });
+
+  it('恢复可观测:settle 窗口内未再断时输出 [kedai] info;首次连接不刷该行', async () => {
+    vi.useFakeTimers();
+    const infoSpy = vi.spyOn(console, 'info').mockImplementation(() => {});
+    const store = useTaskStore();
+    store.appMode = 'task';
+
+    // 首次连接成功也走 settle,但 reconnectDelay 仍为起步值 → 不报「恢复」(避免噪声)
+    store.startTaskEvents();
+    await vi.advanceTimersByTimeAsync(1600);
+    expect(
+      infoSpy.mock.calls.filter((c) => String(c[0]).includes('[kedai]')),
+      '首次连接不产生恢复信号',
+    ).toHaveLength(0);
+
+    // 断线后重连并在 settle 内保持稳定 → 报一次恢复
+    h.emitClose!(new Error('network down'));
+    await vi.advanceTimersByTimeAsync(1000); // t=2.6s:1s 退避后重连(不再失败)
+    expect(
+      infoSpy.mock.calls.filter((c) => String(c[0]).includes('[kedai]')),
+      'settle 未到,不应提前报恢复',
+    ).toHaveLength(0);
+
+    await vi.advanceTimersByTimeAsync(1500); // t=4.1s:settle(1500ms)触发
+    const infos = infoSpy.mock.calls
+      .map((c) => String(c[0]))
+      .filter((m) => m.startsWith('[kedai]'));
+    expect(infos).toHaveLength(1);
+    expect(infos[0]).toContain('已恢复');
+  });
 });
 
 describe('llm_call 事件与调用追踪(批次 3 L3)', () => {

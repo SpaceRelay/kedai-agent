@@ -1,5 +1,6 @@
 // 角色卡 API
-import { BASE, authorizedFetch, request } from './client';
+import { request } from './client';
+import { uploadForm } from './stream';
 import type { CharacterRecord } from './types';
 
 export async function listCharacters(): Promise<CharacterRecord[]> {
@@ -12,14 +13,7 @@ export async function getCharacter(id: string): Promise<CharacterRecord> {
 }
 
 export async function uploadCharacter(file: File): Promise<CharacterRecord> {
-  const form = new FormData();
-  form.append('file', file);
-  const res = await authorizedFetch(`${BASE}/characters/upload`, { method: 'POST', body: form }, false);
-  if (!res.ok) {
-    const body = (await res.json().catch(() => ({}))) as { error?: string };
-    throw new Error(body.error ?? '上传失败');
-  }
-  return (await res.json()) as CharacterRecord;
+  return uploadForm<CharacterRecord>('/characters/upload', file);
 }
 
 export async function updateCharacter(

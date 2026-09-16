@@ -57,6 +57,33 @@ export interface CacheDiagnostics {
   watermark: CacheWatermark;
 }
 
+/**
+ * 校验响应形状:后端正常时必带 totals/entries/watermark 三个对象。
+ *
+ * 存在的理由(实测教训):后端曾在**失败时也返回 200** 并携带 `{"error": ...}`。
+ * 由于 `request()` 只按 HTTP 状态判成败,该载荷会被当作 `CacheDiagnostics` 返回,
+ * 调用方随即在 `data.totals.hit_rate` 上抛 TypeError(可选链只保护了 `data` 本身,
+ * 挡不住「形状不对的真值对象」)。后端已改为失败返回 5xx,这里再加一道形状闸门,
+ * 使「载荷不对」表现为可捕获的 Error 而不是下游的随机崩溃。
+ */
+function assertDiagnostics(value: unknown): CacheDiagnostics {
+  const v = value as Partial<CacheDiagnostics> | null | undefined;
+  const ok =
+    !!v &&
+    typeof v === 'object' &&
+    typeof v.totals === 'object' &&
+    v.totals !== null &&
+    Array.isArray(v.entries) &&
+    typeof v.watermark === 'object' &&
+    v.watermark !== null;
+  if (!ok) {
+    // 兼容旧版后端:带着 error 文案的 200 响应,把原文透出便于定位
+    const err = (v as { error?: unknown } | null)?.error;
+    throw new Error(typeof err === 'string' && err.trim() ? err : '缓存统计响应格式异常');
+  }
+  return v as CacheDiagnostics;
+}
+
 /** GET /api/diagnostics/cache:读取近 N 轮缓存命中率、费用估算与上下文水位 */
 export async function getCacheDiagnostics(
   opts: { sessionId?: string; window?: number } = {},
@@ -64,5 +91,6 @@ export async function getCacheDiagnostics(
   const query = new URLSearchParams();
   if (opts.sessionId) query.set('session_id', opts.sessionId);
   if (opts.window !== undefined) query.set('window', String(opts.window));
-  return request(`/diagnostics/cache${query.size ? `?${query}` : ''}`);
+  const raw = await request<unknown>(`/diagnostics/cache${query.size ? `?${query}` : ''}`);
+  return assertDiagnostics(raw);
 }

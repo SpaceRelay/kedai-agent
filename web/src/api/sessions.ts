@@ -1,5 +1,10 @@
 // 会话 / 消息 API(含 history / clear / export / import)
 import { request } from './client';
+import {
+  requireArrayField,
+  requireNullableObjectField,
+  requireStringMapField,
+} from './shape';
 import type {
   ChatMessage,
   MessageRecord,
@@ -10,14 +15,15 @@ import type {
 } from './types';
 
 export async function listSessions(characterId: string): Promise<SessionInfo[]> {
-  const data = await request<{ sessions: SessionInfo[] }>(`/chat/sessions?character_id=${encodeURIComponent(characterId)}`);
-  return data.sessions;
+  const data = await request<unknown>(`/chat/sessions?character_id=${encodeURIComponent(characterId)}`);
+  // 形状闸门:调用方直接落列表渲染/计算长度
+  return requireArrayField<SessionInfo>(data, 'sessions', '会话列表');
 }
 
 /** 全部会话(联表角色名 + 消息数)——聊天记录面板 */
 export async function listAllSessions(): Promise<SessionWithCharacter[]> {
-  const data = await request<{ sessions: SessionWithCharacter[] }>('/chat/sessions');
-  return data.sessions;
+  const data = await request<unknown>('/chat/sessions');
+  return requireArrayField<SessionWithCharacter>(data, 'sessions', '会话列表');
 }
 
 /** 新建会话;greetingIndex 指定开场序号(0=主开场,1..=备用开场;缺省 0) */
@@ -45,8 +51,9 @@ export async function deleteSession(id: string): Promise<void> {
 }
 
 export async function fetchHistory(sessionId: string): Promise<ChatMessage[]> {
-  const data = await request<{ messages: ChatMessage[] }>(`/chat/history?session_id=${encodeURIComponent(sessionId)}`);
-  return data.messages;
+  const data = await request<unknown>(`/chat/history?session_id=${encodeURIComponent(sessionId)}`);
+  // 形状闸门:历史消息直接驱动聊天渲染,undefined 会让窗口空白且无从提示
+  return requireArrayField<ChatMessage>(data, 'messages', '聊天历史');
 }
 
 /** 角色扮演 Agent 记录(只读):agent_sessions.state/plan/step_index + tool_calls。
@@ -67,10 +74,11 @@ export interface AgentTrace {
 
 /** GET /api/chat/sessions/{id}/agent/trace:切会话/重启后恢复右侧 Agent 面板记录 */
 export async function fetchAgentTrace(sessionId: string): Promise<AgentTrace | null> {
-  const data = await request<{ trace: AgentTrace | null }>(
+  const data = await request<unknown>(
     `/chat/sessions/${encodeURIComponent(sessionId)}/agent/trace`,
   );
-  return data.trace;
+  // 形状闸门:trace 可为 null(无记录是合法状态),但字段缺失属形状异常
+  return requireNullableObjectField<AgentTrace>(data, 'trace', 'Agent 记录');
 }
 
 export async function updateMessage(sessionId: string, id: number, content: string): Promise<ChatMessage> {
@@ -135,10 +143,11 @@ export async function saveAssistantVars(
 
 /** 获取角色 [InitVar] 初始变量条目 */
 export async function fetchInitVars(characterId: string): Promise<Record<string, string>> {
-  const data = await request<{ entries: Record<string, string> }>(
+  const data = await request<unknown>(
     `/chat/init-vars?character_id=${encodeURIComponent(characterId)}`,
   );
-  return data.entries ?? {};
+  // 形状闸门:变量树会被逐键渲染/做模板替换,非对象会让替换逻辑静默失效
+  return requireStringMapField(data, 'entries', '初始变量');
 }
 
 export async function clearMessages(sessionId: string): Promise<void> {

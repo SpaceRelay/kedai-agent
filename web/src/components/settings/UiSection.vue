@@ -29,7 +29,7 @@ const { scriptAuthorizations } = storeToRefs(store);
           <b>Agent 面板</b>
           <span>生成时自动展开,展示步骤、推理链与工具调用</span>
         </div>
-        <button class="sv-btn ghost" @click="store.agentPanelOpen = !store.agentPanelOpen">
+        <button class="sv-btn ghost" @click="store.toggleAgentPanel()">
           {{ store.agentPanelOpen ? '展开中' : '已折叠' }}
         </button>
       </div>
@@ -38,7 +38,7 @@ const { scriptAuthorizations } = storeToRefs(store);
           <b>安全 HTML 渲染</b>
           <span>应用角色卡正则替换并清理 script/style 属性、事件处理器、javascript URL 与外部资源；不代表允许 JavaScript。开关按角色卡记忆,未设置的角色卡回退全局默认</span>
         </div>
-        <button type="button" class="sv-btn ghost" :aria-pressed="store.renderHtml" @click="store.renderHtml = !store.renderHtml">
+        <button type="button" class="sv-btn ghost" :aria-pressed="store.renderHtml" @click="store.toggleRenderHtml()">
           {{ store.renderHtml ? '已开启' : '已关闭' }}
         </button>
       </div>

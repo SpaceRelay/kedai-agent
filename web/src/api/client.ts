@@ -98,21 +98,30 @@ export function apiErrorMessage(status: number, code?: string, detail?: string):
   }
 }
 
-export async function request<T>(path: string, init: RequestInit = {}, isRetry = false): Promise<T> {
-  let res = await authorizedFetch(`${BASE}${path}`, init);
-  if (res.status === 401 && !isRetry) {
-    // 服务端重启后 bearer token 轮换:丢弃缓存 token 重新引导,原样重试一次;
-    // 重新引导失败(后端未就绪)或重试仍 401 才按 token 失效报错。
-    forgetApiToken();
-    let refreshed = false;
-    try {
-      await apiToken();
-      refreshed = true;
-    } catch {
-      /* 重新引导失败:按原响应的 401 处理 */
-    }
-    if (refreshed) res = await authorizedFetch(`${BASE}${path}`, init);
+/**
+ * 单次 401 重引导重试:首次响应为 401 时丢弃缓存 token、重新 bootstrap,原样重试一次。
+ *
+ * 服务端重启后 bearer token 轮换,这是恢复路径。**重试安全性**:401 由鉴权中间件在
+ * handler 之前返回,**首请求未被执行**,故非幂等的 POST/上传重试也不会产生重复写入。
+ * 重新引导失败(后端未就绪)或重试仍 401 时,**原样返回**最后一次响应,由调用方按
+ * 401 报错——不在这里抛异常,以便调用方统一走各自的错误出口。
+ */
+export async function retryOnUnauthorized(doFetch: () => Promise<Response>): Promise<Response> {
+  const res = await doFetch();
+  if (res.status !== 401) return res;
+  forgetApiToken();
+  let refreshed = false;
+  try {
+    await apiToken();
+    refreshed = true;
+  } catch {
+    /* 重新引导失败:按原响应的 401 处理 */
   }
+  return refreshed ? doFetch() : res;
+}
+
+export async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
+  const res = await retryOnUnauthorized(() => authorizedFetch(`${BASE}${path}`, init));
   if (!res.ok) {
     let body: ApiErrorBody = {};
     try {

@@ -356,7 +356,16 @@ export async function executeSandboxedCharacterScript(
       }
     };
     const onMessage = (event: MessageEvent): void => {
-      // WebView2 会把跨源 iframe 的 source 包装成不同对象,身份由高熵 nonce + 固定 channel 校验。
+      // 身份校验:高熵 nonce + 固定 channel。
+      //
+      // 为何不校验 event.source / event.origin(M5 评估结论,勿重复尝试):
+      // - origin:沙箱为不透明源(无 allow-same-origin),其 origin 恒为 "null",无判别力
+      //   (见 render.ts 注释);
+      // - source:WebView2 会把跨源 iframe 的 source 包装成**另一个对象**,与
+      //   iframe.contentWindow 不相等。若按「不等即拒」处理,会把正常的 ready/done
+      //   全部拒掉——scriptRunner.test.ts「接受 WebView2 source wrapper」正是锁定此契约。
+      // 故 source 判别在目标平台不可用,nonce 是唯一可靠身份凭据(128 位随机、
+      // 仅存在于执行闭包并经 URL fragment 交给沙箱,不落 DOM/存储)。
       const message = event.data as SandboxRequest;
       if (!message || message.channel !== CHANNEL || message.nonce !== nonce) return;
       try {

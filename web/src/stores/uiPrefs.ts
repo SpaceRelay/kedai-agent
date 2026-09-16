@@ -1,14 +1,24 @@
 // 界面偏好 store:各弹窗/面板开关、启动动画、安全 HTML 渲染开关(按角色卡记忆 + 全局默认)。
-// 从 store.ts 按领域拆分。跨 store 引用(currentCharacterId / queueSettingsSave)均在
-// 回调/动作运行时解析,setup 阶段不实例化其他 store,避免初始化环。
+// 从 store.ts 按领域拆分。跨 store 依赖(M5 断环后)均为叶子模块:
+//   - currentCharacterId 读回调桥(storeBridge.ts,owner 为 character store);
+//   - 保存全局 render_html 走回调桥(storeBridge.ts,由 genSettings 注册队列保存);
+//   - 反向注册两个 sink(renderHtml 默认值通知 / task 用的界面偏好能力)。
+// 本 store 不顶层 import 任何其他 store,成为依赖图的汇点。
 import { defineStore } from 'pinia';
 import { ref, watch } from 'vue';
 import { LocalRenderHtmlPreferenceStore } from '../renderHtmlPreference';
-import { useCharacterStore } from './character';
-import { useGenSettingsStore } from './genSettings';
+import {
+  currentCharacterIdValue,
+  queueSettingsSave,
+  registerRenderHtmlDefaultSink,
+  registerUiPrefsSink,
+} from './storeBridge';
 
 export const useUiPrefsStore = defineStore('app.uiPrefs', () => {
   // ===== 弹窗/面板开关 =====
+  // 弹窗开关(settingsOpen…chatRecordsOpen)与 web/src/modals.ts 的 MODALS 注册表一一对应:
+  // 逐个声明的目的是保住 store.xxxOpen 的布尔类型与模板绑定;一致性由
+  // web/src/modals.test.ts 元测试锁定(解析契约:弹窗开关均为 ref(false) 的具名声明)。
   const settingsOpen = ref(false);
   /** 提示词顺序管理面板开关 */
   const promptsOpen = ref(false);
@@ -42,12 +52,25 @@ export const useUiPrefsStore = defineStore('app.uiPrefs', () => {
   const repoIndexOpen = ref(false);
   /** 聊天记录面板开关 */
   const chatRecordsOpen = ref(false);
+  /**
+   * 退出确认弹窗开关。打开时机:桌面壳下发 kedai://close-requested(用户点了窗口关闭),
+   * 或 Android 返回键已无弹窗/抽屉可退。确认后发 kedai://exit-app 退出,
+   * 取消则发 kedai://close-cancelled 让壳复位二次关闭兜底标记。
+   */
+  const exitConfirmOpen = ref(false);
   /** 启动动画是否完成 */
   const splashDone = ref(false);
   /** 弹窗懒加载失败提示(defineAsyncComponent onError 写入;flag 为重试所需的面板开关键) */
   const modalLoadError = ref<{ name: string; flag: string } | null>(null);
   /** 启动/切换时的数据加载失败提示(角色/会话/历史加载 catch 写入;下次加载成功时清除) */
   const dataLoadError = ref<string | null>(null);
+  /**
+   * 全局未捕获异常提示(计划批次 5.1;写入方为 main.ts 注册的 globalErrorHandlers)。
+   * 与 dataLoadError 分开的原因:后者的横幅挂着一个「重试 = 重载角色列表」按钮,
+   * 而未捕获异常没有对应的重试动作——混用会让用户点到一个与错误无关的重试。
+   * 仅内存态:下次异常覆盖、用户关闭即清除,不持久化。
+   */
+  const globalError = ref<string | null>(null);
   /**
    * 上传角色卡请求计数器(跨组件通信,取代 document.querySelector 戳 Sidebar 内部 DOM):
    * 发起方(如 SettingsHub 快速操作)自增;Sidebar watch 本计数器触发自身隐藏 file input 的 click。
@@ -114,7 +137,7 @@ export const useUiPrefsStore = defineStore('app.uiPrefs', () => {
    * 程序性赋值走 restoring 闩锁,不触发持久化写入(避免为默认值凭空生成记忆)。
    */
   function syncRenderHtmlToCurrent(): void {
-    const cid = useCharacterStore().currentCharacterId;
+    const cid = currentCharacterIdValue();
     const v = cid && cid in renderHtmlOverrides.value
       ? renderHtmlOverrides.value[cid]
       : defaultRenderHtml.value;
@@ -124,7 +147,21 @@ export const useUiPrefsStore = defineStore('app.uiPrefs', () => {
       renderHtmlSaveTimer = null;
     }
     restoringRenderHtml = true;
+    renderHtml.value = v;  }
+
+  /**
+   * 程序性设置 HTML 渲染开关(引导条一键开启 / 顶栏与设置面板切换共用)。
+   * 与 syncRenderHtmlToCurrent 的区别:后者是「按当前角色卡回读持久化值」,
+   * 本函数是「用户显式改值」——赋值后由下方 watch 节流持久化(有卡写卡记忆,
+   * 无卡写全局默认)。统一入口避免组件直接赋值绕过持久化闩锁与失败回滚。
+   */
+  function setRenderHtml(v: boolean): void {
     renderHtml.value = v;
+  }
+
+  /** 切换 HTML 渲染开关(等价于 setRenderHtml(!renderHtml)) */
+  function toggleRenderHtml(): void {
+    renderHtml.value = !renderHtml.value;
   }
 
   /** 删除角色卡时清理其 HTML 渲染开关记忆(随卡删除,不留孤儿数据) */
@@ -149,7 +186,7 @@ export const useUiPrefsStore = defineStore('app.uiPrefs', () => {
     }
     if (renderHtmlSaveTimer) clearTimeout(renderHtmlSaveTimer);
     renderHtmlSaveTimer = setTimeout(() => {
-      const cid = useCharacterStore().currentCharacterId;
+      const cid = currentCharacterIdValue();
       if (cid) {
         // 按角色卡记忆:仅写 localStorage,不改全局默认
         const next = { ...renderHtmlOverrides.value, [cid]: v };
@@ -157,7 +194,7 @@ export const useUiPrefsStore = defineStore('app.uiPrefs', () => {
         renderHtmlPreferenceStore.write(next);
         confirmedRenderHtml = v;
       } else {
-        void useGenSettingsStore().queueSettingsSave({ render_html: v })
+        void queueSettingsSave({ render_html: v })
           .then(() => { confirmedRenderHtml = v; })
           .catch((error) => {
             console.error('HTML 渲染设置保存失败', error);
@@ -166,6 +203,22 @@ export const useUiPrefsStore = defineStore('app.uiPrefs', () => {
           });
       }
     }, 300);
+  });
+
+  // 注册给回调桥(M5 断环):genSettings 读到新的全局 render_html 默认值后通知这里。
+  // 顺序与原实现一致:先写 defaultRenderHtml,再由 syncRenderHtmlToCurrent 按
+  // 角色卡记忆重算生效值(有卡记忆优先,无卡才跟随全局默认)。
+  registerRenderHtmlDefaultSink((v) => {
+    defaultRenderHtml.value = v;
+    syncRenderHtmlToCurrent();
+  });
+
+  // 注册给回调桥(M5 断环):task store 需要的三个界面操作,经桥调用免去
+  // task → uiPrefs 的顶层 import。
+  registerUiPrefsSink({
+    collapseAgentPanel,
+    autoOpenAgentPanel,
+    isCallTraceOpen: () => callTraceOpen.value,
   });
 
   // ===== Agent 面板开合动作 =====
@@ -221,9 +274,11 @@ export const useUiPrefsStore = defineStore('app.uiPrefs', () => {
     memoryOpen,
     repoIndexOpen,
     chatRecordsOpen,
+    exitConfirmOpen,
     splashDone,
     modalLoadError,
     dataLoadError,
+    globalError,
     characterUploadRequested,
     callTraceOpen,
     taskResultSummaryOpen,
@@ -231,6 +286,8 @@ export const useUiPrefsStore = defineStore('app.uiPrefs', () => {
     defaultRenderHtml,
     renderHtmlOverrides,
     syncRenderHtmlToCurrent,
+    setRenderHtml,
+    toggleRenderHtml,
     removeRenderHtmlOverride,
   };
 });

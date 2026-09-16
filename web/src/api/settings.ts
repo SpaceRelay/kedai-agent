@@ -1,5 +1,13 @@
 // 设置 / 连接 / 模型 / Token 与提示词注入 API
-import { BASE, authorizedFetch, request } from './client';
+import { request } from './client';
+import { uploadForm } from './stream';
+import {
+  requireArrayField,
+  requireNumberField,
+  requireObject,
+  requireObjectField,
+  requireStringField,
+} from './shape';
 import type {
   ConnectorInfo,
   PromptInjectConfig,
@@ -24,12 +32,14 @@ export async function testEmbedding(): Promise<{
 }
 
 export async function settingsInfo(): Promise<ConnectorInfo> {
-  return request('/settings/info');
+  const data = await request<unknown>('/settings/info');
+  // 形状闸门:调用方解构 connector/model/models 回填设置页,空对象会让连接器名恒为空
+  return requireObject<ConnectorInfo>(data, '连接器信息');
 }
 
 export async function getModel(): Promise<string> {
-  const data = await request<{ model: string }>('/settings/model');
-  return data.model;
+  const data = await request<unknown>('/settings/model');
+  return requireStringField(data, 'model', '模型信息');
 }
 
 export async function switchModel(model: string): Promise<{ model: string; changed: boolean }> {
@@ -37,8 +47,8 @@ export async function switchModel(model: string): Promise<{ model: string; chang
 }
 
 export async function listModels(): Promise<string[]> {
-  const data = await request<{ models: string[] }>('/settings/models');
-  return data.models;
+  const data = await request<unknown>('/settings/models');
+  return requireArrayField<string>(data, 'models', '模型列表');
 }
 
 /** GET /api/settings:读取运行期设置(API Key 脱敏);mode 指定读取哪个模式的合并值 */
@@ -49,11 +59,14 @@ export async function getSettings(mode?: 'roleplay' | 'task'): Promise<RuntimeSe
 
 /** POST /api/settings/refresh-models:向已保存的 API 请求可用模型列表 */
 export async function refreshModels(): Promise<{ models: string[]; message: string | null }> {
-  const data = await request<{ ok: boolean; models: string[]; message?: string | null }>(
-    '/settings/refresh-models',
-    { method: 'POST', body: '{}' },
-  );
-  return { models: data.models, message: data.message ?? null };
+  const data = await request<unknown>('/settings/refresh-models', {
+    method: 'POST',
+    body: '{}',
+  });
+  // 形状闸门:models 直接决定下拉框内容,解出 undefined 会让模型列表永久为空
+  const models = requireArrayField<string>(data, 'models', '模型列表');
+  const message = (data as { message?: unknown }).message;
+  return { models, message: typeof message === 'string' ? message : null };
 }
 
 /** PUT /api/settings:保存运行期设置(部分字段;Base URL/Key 变更立即重建连接器);mode 指定写入哪个模式 */
@@ -86,49 +99,44 @@ export async function getPromptPreview(sessionId?: string, characterId?: string,
 
 /** GET /api/prompt-inject:读取注入配置 */
 export async function getPromptInject(): Promise<PromptInjectConfig> {
-  const data = await request<{ ok: boolean; config: PromptInjectConfig }>('/prompt-inject');
-  return data.config;
+  const data = await request<unknown>('/prompt-inject');
+  // 形状闸门:PromptManager 直接渲染 config.mode/floors,空对象会让面板白屏
+  return requireObjectField<PromptInjectConfig>(data, 'config', '提示词注入配置');
 }
 
 /** PUT /api/prompt-inject:全量保存注入配置 */
 export async function savePromptInject(config: PromptInjectConfig): Promise<PromptInjectConfig> {
-  const data = await request<{ ok: boolean; config: PromptInjectConfig }>('/prompt-inject', {
+  const data = await request<unknown>('/prompt-inject', {
     method: 'PUT',
     body: JSON.stringify({ config }),
   });
-  return data.config;
+  return requireObjectField<PromptInjectConfig>(data, 'config', '提示词注入配置');
 }
 
 /** POST /api/prompt-inject/import:导入酒馆(SillyTavern)预设 JSON,替换现有楼层 */
 export async function importPromptPreset(file: File): Promise<PromptPresetImportResult> {
-  const form = new FormData();
-  form.append('file', file);
-  const res = await authorizedFetch(`${BASE}/prompt-inject/import`, { method: 'POST', body: form }, false);
-  if (!res.ok) {
-    const body = (await res.json().catch(() => ({}))) as { error?: string };
-    throw new Error(body.error ?? '导入失败');
-  }
-  return (await res.json()) as PromptPresetImportResult;
+  return uploadForm<PromptPresetImportResult>('/prompt-inject/import', file);
 }
 
 // ===== Token 计数 =====
 
 export async function countTokens(messages: Array<{ role: string; content: string }>, model?: string): Promise<number> {
-  const data = await request<{ total: number }>('/token/count', {
+  const data = await request<unknown>('/token/count', {
     method: 'POST',
     body: JSON.stringify({ messages, model }),
   });
-  return data.total;
+  // 形状闸门:token 计数直接参与上下文水位计算,undefined 会污染后续算术
+  return requireNumberField(data, 'total', 'Token 计数');
 }
 
 /** GET /api/token/session-total:当前会话累计 token */
 export async function getSessionTotalTokens(sessionId: string): Promise<number> {
-  const data = await request<{ total_tokens: number }>(`/token/session-total?session_id=${encodeURIComponent(sessionId)}`);
-  return data.total_tokens;
+  const data = await request<unknown>(`/token/session-total?session_id=${encodeURIComponent(sessionId)}`);
+  return requireNumberField(data, 'total_tokens', '会话 Token 累计');
 }
 
 /** GET /api/token/global-total:全局累计 token */
 export async function getGlobalTotalTokens(): Promise<number> {
-  const data = await request<{ total_tokens: number }>('/token/global-total');
-  return data.total_tokens;
+  const data = await request<unknown>('/token/global-total');
+  return requireNumberField(data, 'total_tokens', '全局 Token 累计');
 }

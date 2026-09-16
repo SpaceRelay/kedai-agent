@@ -55,9 +55,20 @@ const { tempLabel, topPLabel, ctxLabel, saveParams, paramsMsg, saveParamsNow } =
       <div>
         <div class="sv-range-label">最大生成长度</div>
         <div class="sv-range-row">
-          <input v-model.number="maxTokens" type="range" min="128" max="10000" step="1" class="sv-range" />
-          <output>{{ maxTokens }}</output>
+          <!-- 上限与后端 `default_max_tokens` 校验区间(1..=131072)一致。
+               超大区间下拖动精度有限,故同排保留数字输入用于精确录入。 -->
+          <input v-model.number="maxTokens" type="range" min="128" max="131072" step="1" class="sv-range" />
+          <input
+            v-model.number="maxTokens"
+            type="number"
+            min="1"
+            max="131072"
+            step="1"
+            class="sv-input inject-num"
+            title="单次生成的最大输出 token 数(含推理模型的 reasoning 消耗)"
+          />
         </div>
+        <div class="sv-range-hints"><span>128 · 省钱</span><span>131072 · 上限</span></div>
       </div>
       <div>
         <div class="sv-range-label">

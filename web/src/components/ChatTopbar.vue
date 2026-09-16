@@ -52,7 +52,7 @@ function dismissRenderHint(): void {
 }
 /** 一键开启 HTML 渲染;JS 授权由引导条上的独立按钮触发(高危操作不合并进一次点击) */
 function enableRenderFromHint(): void {
-  store.renderHtml = true;
+  store.setRenderHtml(true);
   dismissRenderHint();
 }
 
@@ -146,7 +146,7 @@ const hitRate = computed<number | null>(() => computeHitRate(store.lastUsage));
         class="sv-render-toggle-v2"
         :aria-pressed="renderHtml"
         :title="renderHtml ? '安全 HTML 渲染已开启(仅此角色卡记忆)' : '安全 HTML 渲染已关闭(仅此角色卡记忆)'"
-        @click="store.renderHtml = !store.renderHtml"
+        @click="store.toggleRenderHtml()"
       >
         <span class="toggle-track" :class="{ on: renderHtml }">
           <span class="toggle-thumb" />

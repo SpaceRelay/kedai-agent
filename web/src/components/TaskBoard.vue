@@ -9,6 +9,7 @@ import { storeToRefs } from 'pinia';
 import { renderMarkdown } from '../markdown';
 import { splitTaskResult } from '../taskResult';
 import { taskStatusClass as statusClass, taskStatusLabel as statusLabel } from '../taskStatus';
+import { MODE_LABELS, messageKindLabel } from '../api/labels';
 import type { TaskRecord, TaskRunMode, TaskStep } from '../api';
 
 const store = useAppStore();
@@ -28,15 +29,8 @@ const taskTotalTokens = computed(() => {
 
 // ===== 批次 4:六模式呈现 =====
 
-/** 模式 → 中文标签(与 Sidebar 选择器文案一致) */
-const MODE_LABELS: Record<TaskRunMode, string> = {
-  legacy: '三段式',
-  solo: '单 Agent',
-  multi: '多 Agent',
-  plan: '先规划后批准',
-  team: '团队协作',
-  custom: '自定义流程',
-};
+// 模式中文文案统一取自 api/labels.ts(唯一源;穷尽校验见该文件)。
+// 原此处手写 MODE_LABELS 与 TaskModeSelect.vue 内联 option 是两份,已收敛。
 
 /** 当前任务执行模式(旧服务端不带 task_mode 时按 legacy 处理) */
 const taskMode = computed<TaskRunMode>(() => currentTask.value?.task.task_mode ?? 'legacy');
@@ -119,17 +113,8 @@ const followupDisabledHint = computed(() => {
   return '任务执行中:完成或停止后可追加指令';
 });
 
-/** 消息种类小标签(followup=追加 / plan_chat=规划对话 / goal=目标 /
- *  result=首轮成果;normal 旧行不显示标签) */
-const MESSAGE_KIND_LABELS: Record<string, string> = {
-  goal: '目标',
-  result: '成果',
-  followup: '追加',
-  plan_chat: '规划对话',
-};
-function messageKindLabel(kind: string): string {
-  return MESSAGE_KIND_LABELS[kind] ?? '';
-}
+/** 消息种类小标签(文案源见 api/labels.ts;未登记种类返回空串、不显示) */
+// 原此处手写 MESSAGE_KIND_LABELS,已收敛到 api/labels.ts 的 messageKindLabel()
 
 /** 助手发言的署名:优先任务绑定角色的名字,无绑定(如纯任务)回退「任务 Agent」 */
 const taskMessageAuthor = computed(() => {

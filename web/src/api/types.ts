@@ -84,7 +84,9 @@ export interface ChatMessage {
 
 /** 任务事件分类(WP4 后端推送):创建 / 状态变化 / 计划 / 子任务 / token 累计 / 删除 / LLM 调用落库
  *  批次 4 六模式追加:agent_status(主/子 agent 状态迁移)/ approval_required(plan 模式计划待批准)
- *  批次 R4 流式输出追加:delta(LLM 正文攒批增量,暂态不落库;权威数据以 llm_call 落库行为准) */
+ *  批次 R4 流式输出追加:delta(LLM 正文攒批增量,暂态不落库;权威数据以 llm_call 落库行为准)
+ *  真源为 Rust `models/types.rs` 的 `TaskEventKind`(serde snake_case);改一侧须同步另一侧,
+ *  并更新 `tools/check-contract.mjs` 的映射表。 */
 export type TaskEventKind = 'created' | 'status' | 'plan' | 'subtask' | 'usage' | 'deleted' | 'llm_call' | 'agent_status' | 'approval_required' | 'delta';
 
 /**
@@ -120,7 +122,7 @@ export type SseEvent =
   | { type: 'vars'; stat_data: Record<string, unknown> }
   | { type: 'interrupted' }
   | { type: 'error'; code: string; message: string; retryable: boolean }
-  | { type: 'finish'; usage: TokenUsage; content: string }
+  | { type: 'finish'; usage: TokenUsage; content: string; finish_reason?: string }
   | TaskEvent;
 
 export type ToolRisk = 'safe' | 'sensitive' | 'dangerous';
@@ -351,7 +353,7 @@ export interface RuntimeSettings {
   bypass_blacklist: string[];
   /** 授权等待超时(秒;30..=1800,默认 300) */
   tool_authorization_timeout_secs: number;
-  /** 任务模式工具策略:all=全量、deny_dangerous=拒绝危险工具(默认)、allowlist=白名单 */
+  /** 任务模式工具策略:all=全量、deny_dangerous=拒绝危险工具但保留 bash(默认)、allowlist=白名单 */
   task_tool_policy: 'all' | 'deny_dangerous' | 'allowlist';
   /** 任务模式工具白名单(task_tool_policy=allowlist 时生效) */
   task_tool_allowlist: string[];
@@ -407,6 +409,14 @@ export interface RuntimeSettings {
   mcp_enabled: boolean;
   /** MCP 服务器列表(stdio 托管子进程;默认空) */
   mcp_servers: McpServerConfig[];
+  /** 命令执行总开关(阶段 E;默认 false = 关闭,须用户显式开启) */
+  exec_enabled: boolean;
+  /** Android 执行层:允许 ROOT 档(su 提权;默认 false) */
+  exec_allow_root: boolean;
+  /** Android 执行层:允许 Shizuku 档(ADB shell 权限,无需 root;默认 false) */
+  exec_allow_shizuku: boolean;
+  /** Android 执行层:允许沙箱档(应用自身 UID;默认 false) */
+  exec_allow_sandbox: boolean;
   /** 执行者人设完整开关(R3a;默认 false = 精简:仅 description+personality;true = 完整:再加 scenario+mes_example)。仅任务模式生效 */
   task_persona_full: boolean;
   /** 任务模式是否继承提示词注入(2026-09-10 实跑修复;默认 false = 隔离,不注入 prompt_floors.json)。仅任务模式生效 */
@@ -501,6 +511,14 @@ export interface RuntimeSettingsPatch {
   undo_enabled?: boolean;
   mcp_enabled?: boolean;
   mcp_servers?: McpServerConfig[];
+  /** 命令执行总开关(阶段 E;缺省保持不变) */
+  exec_enabled?: boolean;
+  /** Android 允许 ROOT 档(缺省保持不变) */
+  exec_allow_root?: boolean;
+  /** Android 允许 Shizuku 档(缺省保持不变) */
+  exec_allow_shizuku?: boolean;
+  /** Android 允许沙箱档(缺省保持不变) */
+  exec_allow_sandbox?: boolean;
   /** 执行者人设完整开关(R3a;仅任务模式生效) */
   task_persona_full?: boolean;
   /** 任务模式是否继承提示词注入(2026-09-10 实跑修复;默认 false = 隔离) */
@@ -769,6 +787,9 @@ export interface TaskRecord {
  * 任务子任务状态(与 server-rs task_service 实际写入值对齐):
  * running=执行中(create_subtask 插入即 running) / done=完成 / error=失败 / ended=已停止(取消)
  * pending=待执行:当前无写入点,但 cancel 逻辑对其做防御性判断,保留在值域内
+ *
+ * 批次 4 起终态口径收窄:done/error 是终态,再被 agentend 召回**不再改写**为 ended
+ * (只补 finished_at),故 ended 只表示「真正中途中断」。
  */
 export type TaskSubtaskStatus = 'pending' | 'running' | 'done' | 'error' | 'ended';
 
@@ -783,6 +804,8 @@ export interface TaskSubtask {
   error: string;
   created_at: string;
   updated_at: string;
+  /** 首次进入终态(done/error/ended)的时刻;pending/running 期间为空串 */
+  finished_at: string;
 }
 
 /** 任务 token 累计(规划/步骤/汇总各次 LLM 调用落库聚合) */
