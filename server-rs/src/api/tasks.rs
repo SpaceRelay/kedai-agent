@@ -1,11 +1,12 @@
 // 任务模式路由:/api/tasks(列表/新建/详情/执行/批准/停止/删除/事件 SSE 流)
 use crate::api::app_state::AppState;
-use crate::api::{db_err, err_with_code, ErrorCode, WithStatus};
+use crate::api::json_body::JsonBody;
+use crate::api::{db_err, err_with_code, not_found, validation, ErrorCode, WithStatus};
 use crate::models::types::{TaskFollowupMode, TaskRunMode, TaskStatus, TaskStep};
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::sse::Event;
-use axum::response::{IntoResponse, Response, Sse};
+use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::Deserialize;
 use serde_json::json;
@@ -57,7 +58,7 @@ pub async fn list(State(state): State<Arc<AppState>>) -> Response {
 
 pub async fn create(
     State(state): State<Arc<AppState>>,
-    Json(body): Json<CreateTaskBody>,
+    JsonBody(body): JsonBody<CreateTaskBody>,
 ) -> Response {
     // 任务模式严格解析:未知值 400「未知任务模式」(from_str_lossy 仅用于 DB 读侧容错)
     let mode = match body.task_mode.as_deref() {
@@ -65,11 +66,9 @@ pub async fn create(
         Some(s) => match TaskRunMode::from_str_strict(s) {
             Some(m) => m,
             None => {
-                return Json(json!({
-                    "error": format!("未知任务模式:{s}(可选:legacy/solo/multi/plan/team/custom)"),
-                }))
-                .into_response()
-                .with_status(StatusCode::BAD_REQUEST);
+                return validation(format!(
+                    "未知任务模式:{s}(可选:legacy/solo/multi/plan/team/custom)"
+                ));
             }
         },
     };
@@ -82,9 +81,7 @@ pub async fn create(
         Ok(Ok(task)) => Json(json!({ "ok": true, "task": task }))
             .into_response()
             .with_status(StatusCode::CREATED),
-        Ok(Err(e)) => Json(json!({ "error": e }))
-            .into_response()
-            .with_status(StatusCode::BAD_REQUEST),
+        Ok(Err(e)) => validation(e),
     }
 }
 
@@ -111,15 +108,13 @@ pub async fn get(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> 
             "messages": messages,
         }))
         .into_response(),
-        Ok(None) => Json(json!({ "error": "任务不存在" }))
-            .into_response()
-            .with_status(StatusCode::NOT_FOUND),
+        Ok(None) => not_found("任务不存在"),
     }
 }
 
 /// GET /api/tasks/events:任务事件 SSE 流(WP4 任务模式实时化,取代前端轮询)。
 /// 订阅 TaskService 的 broadcast 通道并逐条转发为 data 帧(与 /api/chat/send 同款
-/// KeepAlive 30s + CACHE_CONTROL no-cache);接收滞后(Lagged)记 debug 后跳过积压
+/// KeepAlive 30s + CACHE_CONTROL no-cache);接收滞后(Lagged)记 warn 后跳过积压
 /// 继续,通道关闭(Closed)结束流。
 pub async fn events(State(state): State<Arc<AppState>>) -> Response {
     let mut rx = state.tasks.subscribe();
@@ -131,23 +126,18 @@ pub async fn events(State(state): State<Arc<AppState>>) -> Response {
                     yield Ok::<Event, Infallible>(Event::default().data(json_str));
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                    tracing::debug!(skipped = skipped, "任务事件 SSE 接收滞后,跳过积压事件");
+                    // 滞后意味着前端已丢失事件(面板会短暂与后端不一致),属真实可观测
+                    // 异常而非调试噪声,故记 warn;前端依 5s 兜底轮询/重连补拉恢复一致。
+                    tracing::warn!(skipped = skipped, "任务事件 SSE 接收滞后,跳过积压事件");
                     continue;
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             }
         }
     };
-    let mut response = Sse::new(stream)
-        .keep_alive(
-            axum::response::sse::KeepAlive::new().interval(std::time::Duration::from_secs(30)),
-        )
-        .into_response();
-    response.headers_mut().insert(
-        axum::http::header::CACHE_CONTROL,
-        axum::http::HeaderValue::from_static("no-cache, no-transform"),
-    );
-    response
+    // 装配单点在 api::util::sse_response(KeepAlive 30s + no-transform),
+    // 与 /api/chat/send 共用——两处必须一致,见该函数注释。
+    super::sse_response(stream)
 }
 
 /// GET /api/tasks/{id}/calls:任务 LLM 调用追踪全量列表(批次 3「调用情况」面板;
@@ -177,9 +167,7 @@ pub async fn run(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> 
     match state.db_call(move || svc.run(&id)).await {
         Err(e) => db_err(&e),
         Ok(Ok(())) => Json(json!({ "ok": true })).into_response(),
-        Ok(Err(e)) => Json(json!({ "error": e }))
-            .into_response()
-            .with_status(StatusCode::BAD_REQUEST),
+        Ok(Err(e)) => validation(e),
     }
 }
 
@@ -189,15 +177,13 @@ pub async fn run(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> 
 pub async fn approve(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
-    Json(body): Json<ApproveTaskBody>,
+    JsonBody(body): JsonBody<ApproveTaskBody>,
 ) -> Response {
     let svc = state.tasks.clone();
     match state.db_call(move || svc.approve(&id, body.plan)).await {
         Err(e) => db_err(&e),
         Ok(Ok(())) => Json(json!({ "ok": true })).into_response(),
-        Ok(Err(e)) => Json(json!({ "error": e }))
-            .into_response()
-            .with_status(StatusCode::BAD_REQUEST),
+        Ok(Err(e)) => validation(e),
     }
 }
 
@@ -212,7 +198,7 @@ pub async fn approve(
 pub async fn followup(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
-    Json(body): Json<FollowupTaskBody>,
+    JsonBody(body): JsonBody<FollowupTaskBody>,
 ) -> Response {
     let content = body.content.trim().to_string();
     if content.is_empty() {
@@ -259,7 +245,10 @@ pub async fn followup(
         );
     }
     let svc = state.tasks.clone();
-    match state.db_call(move || svc.followup(&id, &content, mode)).await {
+    match state
+        .db_call(move || svc.followup(&id, &content, mode))
+        .await
+    {
         Err(e) => db_err(&e),
         Ok(Ok(())) => Json(json!({ "ok": true })).into_response(),
         // 复核失败(竞态:预检通过后状态被 stop/重跑改变)按 409 语义返回
@@ -276,7 +265,7 @@ pub async fn followup(
 pub async fn plan_chat(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
-    Json(body): Json<PlanChatBody>,
+    JsonBody(body): JsonBody<PlanChatBody>,
 ) -> Response {
     let message = body.message.trim().to_string();
     if message.is_empty() {
@@ -322,9 +311,7 @@ pub async fn stop(State(state): State<Arc<AppState>>, Path(id): Path<String>) ->
     match state.db_call(move || svc.stop(&id)).await {
         Err(e) => db_err(&e),
         Ok(true) => Json(json!({ "ok": true })).into_response(),
-        Ok(false) => Json(json!({ "error": "任务不存在" }))
-            .into_response()
-            .with_status(StatusCode::NOT_FOUND),
+        Ok(false) => not_found("任务不存在"),
     }
 }
 
@@ -333,8 +320,6 @@ pub async fn delete(State(state): State<Arc<AppState>>, Path(id): Path<String>) 
     match state.db_call(move || svc.delete(&id)).await {
         Err(e) => db_err(&e),
         Ok(true) => StatusCode::NO_CONTENT.into_response(),
-        Ok(false) => Json(json!({ "error": "任务不存在" }))
-            .into_response()
-            .with_status(StatusCode::NOT_FOUND),
+        Ok(false) => not_found("任务不存在"),
     }
 }

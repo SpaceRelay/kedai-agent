@@ -224,6 +224,8 @@ fn lex_one(src: &str, start: usize) -> Result<(Tok, usize), String> {
                 }
             }
             let text = &src[i..j];
+            // 有意丢弃 ParseFloatError:其唯一信息就是「这段文本不是数字」,
+            // 而 text 原值已带进消息
             let n: f64 = text.parse().map_err(|_| format!("数字格式错误: {text}"))?;
             Ok((Tok::Num(n), j))
         }

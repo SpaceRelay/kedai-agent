@@ -77,13 +77,11 @@ fn replace_file(temp_path: &Path, path: &Path) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
+    use crate::utils::test_support::TempDataDir;
 
-    /// 隔离临时目录(uuid 命名,避免并行测试互相干扰)
-    fn temp_dir(tag: &str) -> PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("kedai-fs-atomic-{tag}-{}", uuid::Uuid::new_v4()));
-        dir
+    /// 隔离临时目录(uuid 唯一 + 作用域结束自动清理)
+    fn temp_dir(tag: &str) -> TempDataDir {
+        TempDataDir::new(&format!("fs-atomic-{tag}"))
     }
 
     /// 目录下不应残留任何原子写临时文件(.{name}.*.tmp)

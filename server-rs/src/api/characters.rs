@@ -1,7 +1,8 @@
 // 角色卡路由:/api/characters(列表/上传/详情/更新/删除)
 // services 同步 DB 调用均经 state.db_call 挪进阻塞线程池(DB 并发改造)
 use crate::api::app_state::AppState;
-use crate::api::{db_err, WithStatus};
+use crate::api::json_body::JsonBody;
+use crate::api::{db_err, err_status, WithStatus};
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -47,13 +48,13 @@ pub async fn upload(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
     let Some(boundary) = parse_boundary(content_type) else {
-        return err_json("缺少文件字段(file)", StatusCode::BAD_REQUEST);
+        return err_status("缺少文件字段(file)", StatusCode::BAD_REQUEST);
     };
     let Some((file_name, file_bytes)) = parse_multipart_file(&body, &boundary) else {
-        return err_json("缺少文件字段(file)", StatusCode::BAD_REQUEST);
+        return err_status("缺少文件字段(file)", StatusCode::BAD_REQUEST);
     };
     if file_bytes.len() > MAX_UPLOAD {
-        return err_json("文件超过 30MB 上限", StatusCode::BAD_REQUEST);
+        return err_status("文件超过 30MB 上限", StatusCode::BAD_REQUEST);
     }
     let svc = state.characters.clone();
     let upload_result = state
@@ -66,7 +67,7 @@ pub async fn upload(
             state.invalidate_contracts_for_character(&c.id);
             Json(c).into_response().with_status(StatusCode::CREATED)
         }
-        Ok(Err(e)) => err_json(e, StatusCode::BAD_REQUEST),
+        Ok(Err(e)) => err_status(e, StatusCode::BAD_REQUEST),
     }
 }
 
@@ -172,14 +173,14 @@ pub async fn get(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> 
             }
             Json(c).into_response()
         }
-        Ok(None) => err_json("角色卡不存在", StatusCode::NOT_FOUND),
+        Ok(None) => err_status("角色卡不存在", StatusCode::NOT_FOUND),
     }
 }
 
 pub async fn update(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
-    Json(body): Json<UpdateBody>,
+    JsonBody(body): JsonBody<UpdateBody>,
 ) -> Response {
     let svc = state.characters.clone();
     let updated = state
@@ -199,7 +200,7 @@ pub async fn update(
             state.invalidate_contracts_for_character(&c.id);
             Json(c).into_response()
         }
-        Ok(None) => err_json("角色卡不存在", StatusCode::NOT_FOUND),
+        Ok(None) => err_status("角色卡不存在", StatusCode::NOT_FOUND),
     }
 }
 
@@ -212,11 +213,6 @@ pub async fn delete(State(state): State<Arc<AppState>>, Path(id): Path<String>) 
             state.invalidate_contracts_for_character(&id);
             StatusCode::NO_CONTENT.into_response()
         }
-        Ok(false) => err_json("角色卡不存在", StatusCode::NOT_FOUND),
+        Ok(false) => err_status("角色卡不存在", StatusCode::NOT_FOUND),
     }
-}
-
-/// 本模块统一错误响应:按状态码自动附带结构化错误码(见 api/errors.rs)。
-fn err_json(msg: impl AsRef<str>, status: StatusCode) -> Response {
-    crate::api::err_with_code(crate::api::code_for_status(status), msg, status)
 }

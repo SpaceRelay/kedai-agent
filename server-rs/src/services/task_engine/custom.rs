@@ -1,5 +1,5 @@
 // custom 模式:复用 AgentFlowService 当前启用流程(AgentFlowConfig 步骤序列,
-// L2 既有资产)配轻量 step 执行器(批次 4.3b,docs/任务引擎六模式.md 第一节)。
+// L2 既有资产)配轻量 step 执行器(批次 4.3b,docs/功能.md 第一节)。
 // 语义:逐 step 顺序执行,上一步输出作为下一步输入;只吃 steps+goal,
 // 不依赖角色卡/聊天历史(角色类占位符渲染为空,{{char}} 等宏原文不泄漏)。
 // 工具:step.tools=None 走 generate_text 纯生成;Some([]) = 按 task_tool_policy 编译的
@@ -8,7 +8,7 @@
 // 反思步骤(action=reflect)按契约不携带用户 system_prompt,统一用内置
 // CUSTOM_REFLECT_PROMPT;首版不做 reflect 回退循环(判定结论作为文本流向下一步)。
 use super::context::TaskRunContext;
-use super::executor::{ModeExecutor, TaskOutcome};
+use super::executor::ModeExecutor;
 use super::sink;
 use crate::agents::engine::executor::run_tool_loop;
 use crate::agents::engine::{AbortFlag, AgentEngine};
@@ -17,42 +17,25 @@ use crate::models::types::{
     GenerationParams, LlmMessage, PlanStep, TaskStatus, TaskStep, TaskStepStatus, TokenUsage,
     ToolChoice, ToolContext,
 };
-use crate::services::agent_flow_service::AgentFlowConfig;
 use crate::services::prompt_kit::untrusted_boundary;
-use crate::services::task_service::prompt::{
+use crate::services::task_core::prompt_consts::{
     CUSTOM_REFLECT_PROMPT, EXECUTOR_PROMPT, TASK_INTERNAL_PLAN_PROMPT,
 };
-use crate::services::task_service::{TaskGenOutput, TaskService};
+use crate::services::task_core::{TaskBackend, TaskGenOutput, TaskTerminal};
 use futures::future::BoxFuture;
 use std::sync::Arc;
 use std::time::Instant;
 use uuid::Uuid;
 
-/// custom 执行器:任务服务(流程库/落库/追踪)+ 聊天引擎(带工具步骤的工具循环)。
+/// custom 执行器:任务后端(流程库/落库/追踪)+ 聊天引擎(带工具步骤的工具循环)。
 pub(crate) struct CustomExecutor {
-    svc: Arc<TaskService>,
+    svc: Arc<dyn TaskBackend>,
     engine: Arc<AgentEngine>,
 }
 
 impl CustomExecutor {
-    pub(crate) fn new(svc: Arc<TaskService>, engine: Arc<AgentEngine>) -> Self {
+    pub(crate) fn new(svc: Arc<dyn TaskBackend>, engine: Arc<AgentEngine>) -> Self {
         CustomExecutor { svc, engine }
-    }
-
-    /// 读取当前启用流程配置(克隆后立即释放锁,禁持引用跨 .await)。
-    fn current_flow(&self) -> Result<AgentFlowConfig, String> {
-        let flow = self.svc.agent_flow();
-        let guard = flow.lock().unwrap_or_else(|e| e.into_inner());
-        let cfg = guard
-            .get()
-            .cloned()
-            .ok_or("请先在设置中启用一个 Agent 流程")?;
-        if !cfg.enabled {
-            return Err("当前 Agent 流程未启用,请在设置中开启后再运行 custom 模式".into());
-        }
-        // 执行前按启动时注册工具集校验(与保存时同一 validate_flow)
-        guard.validate(&cfg)?;
-        Ok(cfg)
     }
 
     /// 组装步骤 system:内置基础指令(direct 生成=执行者 / direct 非生成=内部规划 /
@@ -180,36 +163,16 @@ impl CustomExecutor {
         let model = self.engine.model();
         match result {
             Ok(res) if !res.interrupted => {
-                // 截断自愈留痕落库(问题①,与 solo.rs run_agent_loop 同口径):
-                // 被截断的那次调用补落一行 status=error,再落最终行
-                for heal in &res.self_heals {
-                    let heal_out = TaskGenOutput {
-                        text: String::new(),
-                        finish_reason: heal.finish_reason.clone(),
-                        prompt_tokens: heal.prompt_tokens,
-                        completion_tokens: heal.completion_tokens,
-                        reasoning_tokens: 0,
-                        reasoning_chars: 0,
-                        tool_calls: Vec::new(),
-                    };
-                    self.svc.record_llm_call(
-                        &ctx.task_id,
-                        "step",
-                        Some(step_index),
-                        &model,
-                        messages,
-                        &format!(
-                            "(截断自愈){},输出上限翻倍至 {} 重发",
-                            heal.note, heal.retried_max_tokens
-                        ),
-                        Some(&heal_out),
-                        std::time::Duration::ZERO,
-                        "error",
-                    );
-                    // 补落被截断那次调用的 usage(2026-09-10 实测修复,口径同 solo.rs)
-                    self.svc
-                        .record_usage(&ctx.task_id, "step", Some(step_index), &heal_out);
-                }
+                // 截断自愈留痕落库(问题①):与 solo.rs run_agent_loop 共用单一实现
+                // (TaskService::record_self_heals:补落被截断行 + 补 usage)。
+                self.svc.record_self_heals(
+                    &ctx.task_id,
+                    "step",
+                    Some(step_index),
+                    &model,
+                    messages,
+                    &super::executor::to_self_heals(&res.self_heals),
+                );
                 let text = res.content.trim().to_string();
                 let status = if text.is_empty() { "empty" } else { "ok" };
                 let out = TaskGenOutput {
@@ -250,24 +213,27 @@ impl CustomExecutor {
                 Err("任务已停止".into())
             }
             Err(e) => {
+                // 步骤执行器对外契约是字符串错误(步骤 result/追踪列),分类在此落回文案;
+                // 分类只服务聊天路径的 SSE 错误终态。
+                let msg = e.message().to_string();
                 self.svc.record_llm_call(
                     &ctx.task_id,
                     "step",
                     Some(step_index),
                     &model,
                     messages,
-                    &e,
+                    &msg,
                     None,
                     elapsed,
                     "error",
                 );
-                Err(e)
+                Err(msg)
             }
         }
     }
 
-    async fn run_inner(&self, ctx: TaskRunContext) -> Result<TaskOutcome, String> {
-        let cfg = self.current_flow()?;
+    async fn run_inner(&self, ctx: TaskRunContext) -> Result<(TaskTerminal, TokenUsage), String> {
+        let cfg = self.svc.current_flow()?;
         let steps: Vec<PlanStep> = cfg.steps.iter().filter(|s| s.enabled).cloned().collect();
         if steps.is_empty() {
             return Err("当前 Agent 流程没有启用的步骤".into());
@@ -339,20 +305,14 @@ impl CustomExecutor {
                         (text, out)
                     })
                 }
-                // 工具步骤:run_tool_loop(白名单自动放行),调用追踪在步骤函数内落
+                // 工具步骤:run_tool_loop(白名单自动放行),调用追踪在步骤函数内落。
+                // usage → TaskGenOutput 统一走 usage_as_output(批次 B.4 单一出处);
+                // 该 out 仅作 record_usage 入参(text 不消费)
                 Some(list) => self
                     .run_step_with_tools(&ctx, i, step, &mut messages, list)
                     .await
                     .map(|(text, usage)| {
-                        let out = TaskGenOutput {
-                            text: text.clone(),
-                            finish_reason: None,
-                            prompt_tokens: usage.prompt_tokens,
-                            completion_tokens: usage.completion_tokens,
-                            reasoning_tokens: 0,
-                            reasoning_chars: 0,
-                            tool_calls: Vec::new(),
-                        };
+                        let out = super::executor::usage_as_output(&usage);
                         (text, out)
                     }),
             };
@@ -403,21 +363,26 @@ impl CustomExecutor {
         }
         // 含 error 步骤但成果已产出 → partial(对齐 legacy WP3 语义)
         let status = if any_error {
-            Some(TaskStatus::Partial)
+            TaskStatus::Partial
         } else {
-            None
+            TaskStatus::Done
         };
-        Ok(TaskOutcome {
-            text: draft,
-            usage: total,
-            status,
-            error: None,
-        })
+        Ok((
+            TaskTerminal::Complete {
+                result: draft,
+                status,
+                error: None,
+            },
+            total,
+        ))
     }
 }
 
 impl ModeExecutor for CustomExecutor {
-    fn run<'a>(&'a self, ctx: TaskRunContext) -> BoxFuture<'a, Result<TaskOutcome, String>> {
+    fn run<'a>(
+        &'a self,
+        ctx: TaskRunContext,
+    ) -> BoxFuture<'a, Result<(TaskTerminal, TokenUsage), String>> {
         Box::pin(async move { self.run_inner(ctx).await })
     }
 }

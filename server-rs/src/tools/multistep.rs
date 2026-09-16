@@ -143,6 +143,7 @@ mod tests {
     use super::*;
     use crate::services::character_service::CharacterService;
     use crate::services::world_book_service::WorldBookService;
+    use crate::utils::test_support::TempDataDir;
 
     /// 测试依赖:会话服务 + 契约注册表 + 自持角色服务(建种子角色用)。
     struct Fixture {
@@ -150,22 +151,39 @@ mod tests {
         registry: Arc<ContractRegistry>,
         characters: Arc<CharacterService>,
         kaleido: Arc<KaleidoStateService>,
+        /// 临时目录守卫必须**最后一个字段**:结构体字段按声明顺序析构,
+        /// 居末才活到持 DB 句柄的服务之后(见 test_support 模块头)
+        _dir: TempDataDir,
     }
 
     fn fixture() -> Fixture {
-        let dir = std::env::temp_dir().join(format!("kedai-multistep-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = TempDataDir::new("multistep");
         let db = Arc::new(crate::models::db::Db::open(&dir.join("t.db"), &dir).unwrap());
         let sessions = Arc::new(SessionService::new(db.clone()));
-        let characters = Arc::new(CharacterService::new(db.clone(), dir));
+        let characters = Arc::new(CharacterService::new(db.clone(), dir.path().to_path_buf()));
         let world_books = Arc::new(WorldBookService::new(db.clone()));
         let kaleido = Arc::new(KaleidoStateService::new(db.clone()));
-        let registry = Arc::new(ContractRegistry::new(characters.clone(), world_books));
+        // 批次 B.6:注册表改注入取数据闭包(生产注入见 api/app_state.rs)
+        let registry = Arc::new(ContractRegistry::new(
+            {
+                let characters = characters.clone();
+                move |id: &str| {
+                    characters
+                        .get(id)
+                        .and_then(|c: crate::models::types::CharacterRecord| c.data_raw)
+                }
+            },
+            {
+                let world_books = world_books.clone();
+                move |id: &str| world_books.collect_entries_for_character(id)
+            },
+        ));
         Fixture {
             sessions,
             registry,
             characters,
             kaleido,
+            _dir: dir,
         }
     }
 

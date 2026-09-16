@@ -82,6 +82,9 @@ pub(crate) fn render_template_with_ctx(
     ctx: &mut RenderCtx<'_>,
     locals: &[(&str, JsValue)],
 ) -> (String, Vec<String>) {
+    // 渲染资源预算(迭代步数 + 墙钟):角色卡不可信,模板可含死循环。
+    // 守卫在本函数退出(含 panic 展开)时恢复预算,嵌套渲染共享同一预算。
+    let _render_budget = exec::RenderGuard::new();
     // <#escape-ejs> 块预处理:块内 `<%`/`%>` 替换为唯一占位符,避免被编译阶段
     // 当作 EJS 标签执行(原样输出、不执行);渲染完成后按序还原。占位符含控制字符,
     // lexer 字符串解析会原样保留,不会被当作标签。
@@ -769,5 +772,81 @@ mod tests {
         // 无 escape 块:行为与之前完全一致
         assert_eq!(render("1+2=<%= 1 + 2 %>", &mut v), "1+2=3");
         assert_eq!(render("纯文本", &mut v), "纯文本");
+    }
+
+    // ============ 渲染资源预算(防不可信卡死循环/爆栈) ============
+
+    /// while(true){} 必须在预算耗尽后中止(不挂死):
+    /// 返回 Err 且**在 2 秒墙钟预算内返回**(测试整体给 10 秒余量)。
+    #[test]
+    fn while_true_is_aborted_by_budget() {
+        let mut v = AssistantVars::new();
+        let t0 = std::time::Instant::now();
+        let (out, errs) = render_template("<% while (true) { } %>END", &mut v, &[]);
+        let elapsed = t0.elapsed();
+        assert!(
+            elapsed.as_secs() < 10,
+            "while(true) 未在预算内中止,耗时 {elapsed:?}"
+        );
+        assert!(
+            errs.iter().any(|e| e.contains("预算")),
+            "应报预算超限错误,实际: {errs:?}"
+        );
+        // 死循环中的输出不产出,但后续文本仍渲染(单语句失败不影响整体)
+        assert!(out.ends_with("END"), "out: {out:?}");
+    }
+
+    /// for(;;){} 同样被预算中止
+    #[test]
+    fn for_forever_is_aborted_by_budget() {
+        let mut v = AssistantVars::new();
+        let (out, errs) = render_template("<% for (;;) { } %>END", &mut v, &[]);
+        assert!(
+            errs.iter().any(|e| e.contains("预算")),
+            "应报预算超限错误,实际: {errs:?}"
+        );
+        assert!(out.ends_with("END"), "out: {out:?}");
+    }
+
+    /// 深一元链 `!!!!…x` 1 万层:parse_unary 守卫必须拦住(只守二元链会漏此处)
+    #[test]
+    fn deep_unary_chain_is_rejected() {
+        let mut v = AssistantVars::new();
+        let tpl = format!("<%= {}true %>", "!".repeat(10_000));
+        let t0 = std::time::Instant::now();
+        let (_out, errs) = render_template(&tpl, &mut v, &[]);
+        assert!(
+            t0.elapsed().as_secs() < 10,
+            "深一元链未及时返回,疑似爆栈/挂死"
+        );
+        assert!(
+            errs.iter().any(|e| e.contains("嵌套过深")),
+            "应报嵌套过深错误,实际: {errs:?}"
+        );
+    }
+
+    /// 2000 层括号(原子链):parse_primary 守卫拦住,不崩溃
+    #[test]
+    fn deep_paren_nesting_is_rejected() {
+        let mut v = AssistantVars::new();
+        let tpl = format!("<%= {}1{} %>", "(".repeat(2_000), ")".repeat(2_000));
+        let t0 = std::time::Instant::now();
+        let (_out, errs) = render_template(&tpl, &mut v, &[]);
+        assert!(t0.elapsed().as_secs() < 10, "深嵌套未及时返回");
+        assert!(
+            errs.iter().any(|e| e.contains("嵌套过深")),
+            "应报嵌套过深错误,实际: {errs:?}"
+        );
+    }
+
+    /// 正常量级循环必须照常通过(防预算误杀;同时验证每次渲染预算独立重置)
+    #[test]
+    fn normal_loop_still_works_and_budget_resets() {
+        let mut v = AssistantVars::new();
+        let tpl = "<% var s = 0; for (var i = 0; i < 1000; i++) { s = s + i; } %><%= s %>";
+        assert_eq!(render(tpl, &mut v), "499500");
+        // 连续多次渲染:预算在每次入口重置(RAII 守卫恢复),第二次仍可跑满 1000 次
+        assert_eq!(render(tpl, &mut v), "499500");
+        assert_eq!(render(tpl, &mut v), "499500");
     }
 }

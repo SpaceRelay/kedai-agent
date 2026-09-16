@@ -1812,6 +1812,12 @@ async fn task_multi_mode_subtasks_visible_from_memory_overlay() {
     );
     assert!(sub["created_at"].as_str().is_some(), "缺 created_at: {sub}");
     assert!(sub["updated_at"].as_str().is_some(), "缺 updated_at: {sub}");
+    // 批次 4:终态时刻一并透出,调用方据 finished_at 判「何时完成」,
+    // 不必再用 ended 兼表「完成后召回」与「中途中断」
+    assert!(
+        sub["finished_at"].as_str().is_some_and(|s| !s.is_empty()),
+        "done 子任务应带非空 finished_at: {sub}"
+    );
 }
 
 /// 问题⑤(回归):legacy 模式 subtasks 仍来自 task_subtasks 表(DB 路径),行为不变。
@@ -2986,10 +2992,6 @@ fn assert_usage_matches_calls(detail: &Value, calls: &Value) {
 /// 2026-09-10 六模式实跑修复(F5):followup replace 模式整体替换结果。
 /// 背景:append 语义下「压缩到 200 字」这类指令无法表达——新产出以追加段附加,
 /// 原文仍在(实测 result 反而变长)。replace 模式用新产出整体替换 result(段标
-
-/// 2026-09-10 六模式实跑修复(F5):followup replace 模式整体替换结果。
-/// 背景:append 语义下「压缩到 200 字」这类指令无法表达——新产出以追加段附加,
-/// 原文仍在(实测 result 反而变长)。replace 模式用新产出整体替换 result(段标
 /// 「修订 N」),旧内容不保留;messages 仍按 user/assistant 各一行落库。
 /// 用两个独立任务分别验证 replace 与默认 append,避免 title 内的回复钩子
 /// 在多轮之间互相污染(mock [[reply:]] 按最后一条 user 消息中首个命中)。
@@ -3123,4 +3125,71 @@ async fn task_multi_mode_subagent_truncation_marks_error() {
             .contains("半截成果在前"),
         "被截断的正文必须保留在 result: {sub}"
     );
+}
+
+/// 多线程 runtime 上的任务端到端 + 并发读不被落库阻塞(2026-09-16 性能批次 P-6)。
+///
+/// 覆盖缺口:本文件其余用例都是 `#[tokio::test]`(current_thread),而**生产是
+/// multi-thread**——两者在 `utils::blocking::park_worker` 里走**不同分支**
+/// (current_thread 直接执行,multi-thread 才 `block_in_place` 让出调度核心)。
+/// 只在 current_thread 下测,等于没测到生产的落库路径,故这里显式用 multi_thread。
+///
+/// 断言两件事:
+///   ① 任务仍能正常跑到 done(证明让出/归还调度核心没有破坏落库与事件链路);
+///   ② 任务执行期间并发读持续成功(证明落库不再把 worker 卡死——这是 P-6 的目的)。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn task_run_on_multi_thread_runtime_keeps_reads_alive() {
+    let app = test_app();
+
+    let title =
+        r#"[[reply:[{"name":"步骤一","goal":"写第一段"},{"name":"步骤二","goal":"写第二段"}] ]]"#;
+    let id = create_task(app, title).await;
+
+    let (status, json) = send_json(app, "POST", &format!("/api/tasks/{id}/run"), json!({})).await;
+    assert_eq!(status, StatusCode::OK, "run 应 200: {json}");
+
+    // ② 执行期间持续并发读:任何一次失败都说明 worker 被落库阻塞/饿死
+    let mut reads = 0usize;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        // 并发发起 4 个读请求,验证读不被落库阻塞
+        let mut handles = Vec::new();
+        for _ in 0..4 {
+            let app = app.clone();
+            let id = id.clone();
+            handles.push(tokio::spawn(async move {
+                let (st, _) = send_json(&app, "GET", &format!("/api/tasks/{id}"), json!({})).await;
+                st
+            }));
+        }
+        for h in handles {
+            assert_eq!(
+                h.await.unwrap(),
+                StatusCode::OK,
+                "任务执行期间并发读详情必须成功(worker 不应被落库阻塞)"
+            );
+            reads += 1;
+        }
+
+        let (st, detail) = send_json(app, "GET", &format!("/api/tasks/{id}"), json!({})).await;
+        assert_eq!(st, StatusCode::OK);
+        let ts = detail["task"]["status"].as_str().unwrap_or("");
+        if ts == "done" || ts == "partial" || ts == "error" || ts == "ended" {
+            // ① 终态正确
+            assert_eq!(ts, "done", "multi-thread 下任务应正常完成: {detail}");
+            assert!(
+                !detail["task"]["result"].as_str().unwrap_or("").is_empty(),
+                "结果非空: {detail}"
+            );
+            let plan = detail["task"]["plan"].as_array().unwrap();
+            assert_eq!(plan.len(), 2);
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "任务未在 20s 内到终态(疑似落库阻塞或死锁)"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(reads > 4, "应观察到多轮并发读,实际 {reads} 次");
 }

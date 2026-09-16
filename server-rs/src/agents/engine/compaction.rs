@@ -507,9 +507,9 @@ mod tests {
     fn second_compaction_keeps_old_row_and_appends() {
         use crate::models::db::Db;
         use crate::services::session_service::SessionService;
+        use crate::utils::test_support::TempDataDir;
         use std::sync::Arc;
-        let dir = std::env::temp_dir().join(format!("kedai-compaction-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = TempDataDir::new("compaction");
         let db = Arc::new(Db::open(&dir.join("kedai.db"), &dir).unwrap());
         let svc = SessionService::new(db);
         {
@@ -552,7 +552,6 @@ mod tests {
             .unwrap();
         assert_eq!(old_row, first, "旧摘要行必须原样保留");
         drop(conn);
-        std::fs::remove_dir_all(dir).ok();
     }
 
     // ===== snip 零成本裁剪档(缓存感知管线) =====

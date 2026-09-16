@@ -1,7 +1,8 @@
 // 生成参数:模式隔离类型(Roleplay/Task 提示词、ModeSettings 覆盖层)、serde 默认值函数、
 // from_config 默认构建与 for_mode 按模式覆盖合并。
 use crate::config::AppConfig;
-use crate::tools::permissions::AuthorizationMode;
+// 授权档位词汇已下沉 L1(2026-09-14):L2 直连 models,不经 tools 转发。
+use crate::models::tool_policy::AuthorizationMode;
 use serde::{Deserialize, Serialize};
 
 use super::connection::DEFAULT_SEARCH_ENDPOINT;
@@ -27,23 +28,12 @@ pub struct RoleplayPromptConfig(pub String);
 #[serde(transparent)]
 pub struct TaskPromptConfig(pub String);
 
-/// MCP 服务器配置(批次 6.2,L3 隔离):stdio 托管子进程。
-/// v1 仅在启动时装配(改设置后重启生效,无热重连)。
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
-pub struct McpServerConfig {
-    /// 服务器名(工具名前缀来源,装配时 sanitize 为 [a-z0-9_])
-    #[serde(default)]
-    pub name: String,
-    /// 可执行命令(如 npx / node / 某个 exe)
-    #[serde(default)]
-    pub command: String,
-    /// 命令行参数
-    #[serde(default)]
-    pub args: Vec<String>,
-    /// 该服务器是否启用(默认 true;false = 保留配置但启动时不装配)
-    #[serde(default = "default_mcp_server_enabled")]
-    pub enabled: bool,
-}
+/// MCP 服务器配置**已下沉到 L1**（`crate::models::tool_policy::McpServerConfig`，2026-09-14）。
+///
+/// 理由：`mcp/`（L3）需要读取该配置来 spawn 子进程。若类型留在 `settings_service`（L2），
+/// `mcp/` 就构成 `L3→L2` 越代依赖（规则 J 检出的 `mcp→services`）。
+/// 它是被 L2 设置层与 L3 客户端共享的**配置词汇**，放 L1 最合适。此处仅重导出。
+pub use crate::models::tool_policy::McpServerConfig;
 
 /// 按模式的设置覆盖项:所有字段 `Option`,`Some` 表示覆盖共享默认,`None` 表示沿用共享值。
 /// 仅覆盖生成参数与 Agent 配置;连接信息(openai_base_url/openai_api_key/model)始终共享。
@@ -194,6 +184,7 @@ pub(super) fn default_bypass_blacklist() -> Vec<String> {
 /// 旧配置迁移:旧版只有 bypass_mode 布尔值,映射到三档模式。
 /// - bypass_mode=true  → Bypass(旧行为:除黑名单外全放行)
 /// - bypass_mode=false → Strict(旧行为:非安全工具都需授权,Strict 最贴近)
+///
 /// 仅当配置中确实出现旧字段时调用,避免把「新装默认 loose」误改。
 pub(super) fn migrate_authorization_mode(legacy_bypass_mode: bool) -> AuthorizationMode {
     if legacy_bypass_mode {
@@ -268,10 +259,9 @@ pub(super) fn default_subagent_result_max_chars() -> u32 {
     2000
 }
 
-/// MCP 服务器条目默认启用(批次 6.2;显式 enabled:false 才跳过装配)
-fn default_mcp_server_enabled() -> bool {
-    true
-}
+// MCP 服务器条目默认启用的辅助函数已随 `McpServerConfig` 下沉到 L1
+// （`models/tool_policy.rs` 的私有 `default_mcp_server_enabled`，2026-09-14）。
+// 此处不再保留副本——否则 serde 默认值会与 L1 定义分叉。
 
 /// 任务模式缺省 Agent 系统提示词(任务向,与 task_service 执行者指令互补)。
 /// 仅 task 覆盖层未显式设置(None)时使用;显式清空(Some(""))表示不注入。
@@ -284,6 +274,7 @@ fn default_mcp_server_enabled() -> bool {
 /// 约束(有测试锁,改文本时勿破坏):
 /// - 必须保留「任务执行智能体」字样(server-rs/tests/tasks.rs 断言缺省已注入默认词);
 /// - 不得出现 `{{char}}` 等角色扮演宏(settings_service 断言:task 默认词不得继承人设词)。
+///
 /// 可用占位符:`{{user}}`(用户)、`{{lastUserMessage}}`(本轮任务目标,经 render_agent_prompt)。
 pub fn default_task_agent_prompt() -> String {
     "你是高效的任务执行智能体,直接、准确地完成用户给出的目标。\n\
@@ -428,6 +419,11 @@ impl RuntimeSettings {
             subagent_result_max_chars: default_subagent_result_max_chars(),
             mcp_enabled: false,
             mcp_servers: Vec::new(),
+            // 命令执行(阶段 E):全部默认关闭,须用户显式开启(合规:root 能力不进 Play)
+            exec_enabled: false,
+            exec_allow_root: false,
+            exec_allow_shizuku: false,
+            exec_allow_sandbox: false,
             task_persona_full: false,
             // 默认隔离:任务模式不继承 prompt_floors.json 注入(2026-09-10 实测修复)
             task_prompt_inject_enabled: false,

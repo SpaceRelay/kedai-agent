@@ -381,6 +381,7 @@ pub fn validate_flow(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::utils::test_support::TempDataDir;
 
     fn tools() -> BTreeSet<String> {
         ["read", "search", "update_variables", "calculator"]
@@ -532,31 +533,25 @@ mod tests {
 
     #[test]
     fn load_corrupted_file_falls_back_to_default() {
-        let dir = std::env::temp_dir().join(format!("kedai-flow-test-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&dir);
+        let dir = TempDataDir::new("flow-test");
         std::fs::write(dir.join("agent_flows.json"), "{not json").unwrap();
         let lib = AgentFlowLibrary::load(&dir);
         assert!(lib.flows.is_empty());
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn load_missing_file_creates_builtin() {
-        let dir = std::env::temp_dir().join(format!("kedai-flow-missing-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&dir);
-        let _ = std::fs::remove_file(dir.join("agent_flows.json"));
+        let dir = TempDataDir::new("flow-missing");
         let lib = AgentFlowLibrary::load(&dir);
         assert_eq!(lib.flows.len(), 1);
         assert_eq!(lib.flows[0].id, "builtin-coordination");
         assert_eq!(lib.current_flow_id.as_deref(), Some("builtin-coordination"));
         assert!(validate_flow(&lib.flows[0], &tools()).is_ok());
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn load_legacy_single_flow_migrates() {
-        let dir = std::env::temp_dir().join(format!("kedai-flow-legacy-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&dir);
+        let dir = TempDataDir::new("flow-legacy");
         std::fs::write(
             dir.join("agent_flows.json"),
             r#"{"enabled":true,"steps":[{"id":"s1","name":"生成","enabled":true,"goal":"生成正文","action":"direct","generates":true}]}"#,
@@ -570,14 +565,13 @@ mod tests {
             lib.current_flow_id.as_deref(),
             Some(lib.flows[0].id.as_str())
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn service_set_select_remove_roundtrip() {
-        let dir = std::env::temp_dir().join(format!("kedai-flow-svc-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&dir);
-        let mut svc = AgentFlowService::new(dir.clone(), tools().into_iter().collect());
+        let dir = TempDataDir::new("flow-svc");
+        let mut svc =
+            AgentFlowService::new(dir.path().to_path_buf(), tools().into_iter().collect());
         // 内置默认流程已在首次加载时注入
         assert_eq!(svc.get_library().flows.len(), 1);
 
@@ -605,8 +599,7 @@ mod tests {
         );
 
         // 重新加载(持久化验证)
-        let svc2 = AgentFlowService::new(dir.clone(), tools().into_iter().collect());
+        let svc2 = AgentFlowService::new(dir.path().to_path_buf(), tools().into_iter().collect());
         assert_eq!(svc2.get_library().flows.len(), 1);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

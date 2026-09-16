@@ -1,12 +1,11 @@
 // 契约 DSL 模块(万花筒机制移植进 Kedai Rust 后端 · 方案 B 的 M1 前置)。
 //
-// 这是变量系统的「唯一事实源」:契约(Contract)声明字段/更新策略/护栏/不变量,
-// 后续 dueFields 调度、observe 观察层、置信度门控、changelog、缓存分层全部读同一份契约。
-// 任何结构变化必须 contractVersion+1 并触发调和,不得静默修改(文档 §7.1-D1)。
+// 代际: L1(老层·稳 / Anchored Core)——兼容契约层。
+// 判据: 契约是变量系统的**唯一事实源**(字段/更新策略/护栏/不变量),结构变化即
+//       影响既有会话数据;仅依赖同层 parsing,不依赖上层。
+// 纪律: contractVersion+1 并触发调和,不得静默修改结构;禁止依赖 services/agents/api/tools。
+// 详见 docs/契约-架构与数据.md §2.2。
 //
-// P0 范围:冻结 MVPContract 结构(serde 类型 + 版本号)+ parse_contract 校验入口。
-// 可选能力(achievements/ejs/runBoundary/derived/sideEffects/middleware/extends/mixins)
-// 以 Option + serde(default) 预留,后续里程碑「点亮」时不改结构(向后兼容,§7 后向兼容原则)。
 pub mod changelog;
 pub mod due_fields;
 pub mod extract;

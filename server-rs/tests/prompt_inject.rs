@@ -14,9 +14,11 @@ fn test_app() -> &'static axum::Router {
     // 测试进程级:运行时主提示词目录指向空目录,避免真实项目根 AGENTS_RUNTIME.md 混入断言。
     static INIT: std::sync::Once = std::sync::Once::new();
     INIT.call_once(|| {
-        let dir = std::env::temp_dir().join("kedai-test-runtime-prompt-empty");
-        std::fs::create_dir_all(&dir).unwrap();
-        std::env::set_var("KEDAI_RUNTIME_PROMPT_DIR", &dir);
+        // uuid 唯一名(避免多测试二进制并发共用同名目录);守卫随本闭包析构即回收。
+        // 目录是否存在不影响语义:with_dir 关闭内置默认回退,读不到文件即视为「无提示词」,
+        // 与「指向一个空目录」等价(全仓无测试写该文件)。
+        let dir = kedai_server::utils::test_support::TempDataDir::new("test-runtime-prompt-empty");
+        std::env::set_var("KEDAI_RUNTIME_PROMPT_DIR", dir.path());
     });
     APP.get_or_init(|| build_test_app().expect("构建测试应用失败"))
 }

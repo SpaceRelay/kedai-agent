@@ -1,7 +1,7 @@
 // 世界书路由:/api/world-books(列表/上传/详情/更新/删除/条目编辑/自检)+ 角色卡内嵌条目
 use crate::api::app_state::AppState;
 use crate::api::characters::{parse_boundary, parse_multipart};
-use crate::api::WithStatus;
+use crate::api::{err_status, not_found, validation, WithStatus};
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -46,20 +46,14 @@ pub async fn upload(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
     let Some(boundary) = parse_boundary(content_type) else {
-        return Json(json!({ "error": "缺少文件字段(file)" }))
-            .into_response()
-            .with_status(StatusCode::BAD_REQUEST);
+        return validation("缺少文件字段(file)");
     };
     let parts = parse_multipart(&body, &boundary);
     let Some(file) = parts.iter().find(|p| p.filename.is_some()) else {
-        return Json(json!({ "error": "缺少文件字段(file)" }))
-            .into_response()
-            .with_status(StatusCode::BAD_REQUEST);
+        return validation("缺少文件字段(file)");
     };
     if file.content.len() > MAX_UPLOAD {
-        return Json(json!({ "error": "文件超过 30MB 上限" }))
-            .into_response()
-            .with_status(StatusCode::BAD_REQUEST);
+        return validation("文件超过 30MB 上限");
     }
     let character_id = parts
         .iter()
@@ -78,9 +72,7 @@ pub async fn upload(
             state.clear_all_contracts();
             Json(b).into_response().with_status(StatusCode::CREATED)
         }
-        Err(e) => Json(json!({ "error": e }))
-            .into_response()
-            .with_status(StatusCode::BAD_REQUEST),
+        Err(e) => validation(e),
     }
 }
 
@@ -118,9 +110,7 @@ pub async fn update(
             state.clear_all_contracts();
             Json(b).into_response()
         }
-        None => Json(json!({ "error": "世界书不存在" }))
-            .into_response()
-            .with_status(StatusCode::NOT_FOUND),
+        None => not_found("世界书不存在"),
     }
 }
 
@@ -129,18 +119,14 @@ pub async fn delete(State(state): State<Arc<AppState>>, Path(id): Path<String>) 
         state.clear_all_contracts();
         StatusCode::NO_CONTENT.into_response()
     } else {
-        Json(json!({ "error": "世界书不存在" }))
-            .into_response()
-            .with_status(StatusCode::NOT_FOUND)
+        not_found("世界书不存在")
     }
 }
 
 pub async fn entries(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
     match state.world_books.entries(&id) {
         Some(entries) => Json(json!({ "id": id, "entries": entries })).into_response(),
-        None => Json(json!({ "error": "世界书不存在" }))
-            .into_response()
-            .with_status(StatusCode::NOT_FOUND),
+        None => not_found("世界书不存在"),
     }
 }
 
@@ -157,19 +143,11 @@ pub async fn save_entries(
 ) -> Response {
     let rec = match state.world_books.get(&id) {
         Some(r) => r,
-        None => {
-            return Json(json!({ "error": "世界书不存在" }))
-                .into_response()
-                .with_status(StatusCode::NOT_FOUND)
-        }
+        None => return not_found("世界书不存在"),
     };
     let mut raw = match rec.data_raw {
         Some(r) => r,
-        None => {
-            return Json(json!({ "error": "世界书缺少原始数据" }))
-                .into_response()
-                .with_status(StatusCode::BAD_REQUEST)
-        }
+        None => return validation("世界书缺少原始数据"),
     };
     if raw.get("entries").is_none() {
         raw.as_object_mut()
@@ -184,9 +162,9 @@ pub async fn save_entries(
             state.clear_all_contracts();
             Json(json!({ "ok": true, "id": id, "entries": body.entries })).into_response()
         }
-        None => Json(json!({ "error": "保存失败" }))
-            .into_response()
-            .with_status(StatusCode::INTERNAL_SERVER_ERROR),
+        // "保存失败"是给用户的固定文案(非内部错误原文),故走 err_status 保留原文,
+        // 只补 code;若改成 internal() 会把文案降级为通用提示,反而丢信息。
+        None => err_status("保存失败", StatusCode::INTERNAL_SERVER_ERROR),
     }
 }
 
@@ -197,9 +175,7 @@ pub async fn add_entry(State(state): State<Arc<AppState>>, Path(id): Path<String
             state.clear_all_contracts();
             Json(json!({ "ok": true, "entry": view })).into_response()
         }
-        None => Json(json!({ "error": "世界书不存在或保存失败" }))
-            .into_response()
-            .with_status(StatusCode::NOT_FOUND),
+        None => not_found("世界书不存在或保存失败"),
     }
 }
 
@@ -226,8 +202,6 @@ pub async fn save_character_entries(
             state.invalidate_contracts_for_character(&id);
             Json(json!({ "ok": true, "character_id": id, "entries": body.entries })).into_response()
         }
-        None => Json(json!({ "error": "角色卡无内嵌世界书,或保存失败" }))
-            .into_response()
-            .with_status(StatusCode::BAD_REQUEST),
+        None => validation("角色卡无内嵌世界书,或保存失败"),
     }
 }

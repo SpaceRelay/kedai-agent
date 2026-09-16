@@ -1,5 +1,5 @@
 // 会话与消息服务(与 Node 版 session.service.ts 对齐)
-use super::log_query_failure;
+use super::{log_query_failure, log_read_pool_failure};
 use crate::models::db::{now_iso, Db};
 use crate::models::types::{MessageRecord, SessionRecord, SessionWithCharacter, StMessage};
 use rusqlite::{params, OptionalExtension};
@@ -46,6 +46,31 @@ fn row_to_session_with_char(row: &rusqlite::Row) -> rusqlite::Result<SessionWith
     })
 }
 
+/// 删消息前清理其 message 作用域变量(2026-09-13 批次 3.1):
+/// `scope_variables` 的 message 行(scope='message',scope_id=消息 id 的**文本**)没有
+/// FK 级联,消息行删除后即成孤儿;单条删除/截断/清空三条路径都必须**先于删 messages**
+/// 调用(删后子查询已取不到消息 id)。只清 message 作用域,不涉及 undo_snapshots /
+/// kaleido_changelog(那属于会话删除,见 cleanup_dependent_rows_before_delete)。
+/// `filter` 是 messages 表的会话内筛选片段(仅本文件内字面量,无注入面);`ps` 与调用方
+/// 删消息的 SQL 参数一致。失败记日志且不阻断消息删除(残留仅占存储,读写均按 id 过滤)。
+fn cleanup_message_scope_variables<P: rusqlite::Params>(
+    conn: &rusqlite::Connection,
+    filter: &str,
+    ps: P,
+) {
+    let sql = format!(
+        "DELETE FROM scope_variables WHERE scope = 'message' AND scope_id IN (
+           SELECT CAST(id AS TEXT) FROM messages WHERE {filter}
+         )"
+    );
+    if let Err(e) = conn.execute(&sql, ps) {
+        tracing::warn!(
+            error = e.to_string(),
+            "消息作用域变量清理失败(不阻断消息删除)"
+        );
+    }
+}
+
 impl SessionService {
     pub fn new(db: Arc<Db>) -> Self {
         SessionService { db }
@@ -71,7 +96,10 @@ impl SessionService {
     }
 
     pub fn list_by_character(&self, character_id: &str) -> Vec<SessionRecord> {
-        let conn = self.db.read().expect("获取只读连接失败");
+        let conn = match self.db.read() {
+            Ok(c) => c,
+            Err(e) => return log_read_pool_failure("会话消息列表", e),
+        };
         // prepare/参数绑定失败属 schema 级异常:记 warn 回退空列表,不在阻塞线程 panic
         // (与 filter_map 丢弃坏行的既有 best-effort 语义一致)
         let mut stmt = match conn
@@ -89,7 +117,10 @@ impl SessionService {
 
     /// 全部会话(联表角色名),按 updated_at DESC —— 聊天记录面板
     pub fn list_all(&self) -> Vec<SessionWithCharacter> {
-        let conn = self.db.read().expect("获取只读连接失败");
+        let conn = match self.db.read() {
+            Ok(c) => c,
+            Err(e) => return log_read_pool_failure("会话消息列表", e),
+        };
         let mut stmt = match conn.prepare(
             "SELECT s.id, s.character_id, s.title, s.created_at, s.updated_at, c.chara_name \
                  FROM sessions s LEFT JOIN characters c ON c.id = s.character_id \
@@ -105,17 +136,22 @@ impl SessionService {
         }
     }
 
-    /// 会话消息数量(聊天记录面板显示)
+    /// 会话消息数量(聊天记录面板显示)。
+    /// 取连接或查询失败时记 warn 回退 0(计数类查询的安全默认值),不 panic 请求线程。
     pub fn message_count(&self, session_id: &str) -> i64 {
-        self.db
-            .read()
-            .expect("获取只读连接失败")
-            .query_row(
-                "SELECT COUNT(*) FROM messages WHERE session_id = ?1",
-                params![session_id],
-                |row| row.get(0),
-            )
-            .unwrap_or(0)
+        let conn = match self.db.read() {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(op = "会话消息数量", error = e, "获取只读连接失败,回退 0");
+                return 0;
+            }
+        };
+        conn.query_row(
+            "SELECT COUNT(*) FROM messages WHERE session_id = ?1",
+            params![session_id],
+            |row| row.get(0),
+        )
+        .unwrap_or(0)
     }
 
     pub fn get(&self, id: &str) -> Option<SessionRecord> {
@@ -185,7 +221,10 @@ impl SessionService {
     }
 
     pub fn get_messages(&self, session_id: &str) -> Vec<MessageRecord> {
-        let conn = self.db.read().expect("获取只读连接失败");
+        let conn = match self.db.read() {
+            Ok(c) => c,
+            Err(e) => return log_read_pool_failure("会话消息列表", e),
+        };
         let mut stmt = match conn
             .prepare_cached("SELECT id, session_id, role, content, extra, created_at FROM messages WHERE session_id = ?1 ORDER BY id ASC")
         {
@@ -219,7 +258,62 @@ impl SessionService {
             params![session_id, upto_message_id, summary, model, now_iso()],
         )
         .map_err(|e| format!("保存压缩摘要失败: {e}"))?;
+        // 保留策略(2026-09-13 批次 2):此前每次压缩新增一行且全仓无 GC,长期会话行数
+        // 线性增长。保留最近 20 条(回溯用),更旧的删除;失败仅告警不影响本次保存。
+        if let Err(e) = conn.execute(
+            "DELETE FROM session_compactions
+             WHERE session_id = ?1 AND upto_message_id NOT IN (
+               SELECT upto_message_id FROM session_compactions
+               WHERE session_id = ?1 ORDER BY upto_message_id DESC LIMIT 20
+             )",
+            params![session_id],
+        ) {
+            tracing::warn!(
+                session_id,
+                error = e.to_string(),
+                "压缩摘要保留策略清理失败"
+            );
+        }
         Ok(())
+    }
+
+    /// 会话删除前清理无 FK 级联的从属表(2026-09-13 批次 2,防孤儿行无限累积):
+    /// - `scope_variables` 的 message 作用域行(随消息存亡;**必须在删会话之前**调用,
+    ///   删除会话会连带删 messages,届时子查询已取不到 message id);
+    /// - `undo_snapshots`(写工具快照,payload 可能很大,此前只在 restore 时清理);
+    /// - `kaleido_changelog`(契约逐 op 变更日志,会话删除时原本不清理)。
+    ///
+    /// 返回首个错误的描述;调用方记日志不阻断删除(残留仅占存储,读写均按 session_id 过滤)。
+    pub fn cleanup_dependent_rows_before_delete(&self, session_id: &str) -> Result<(), String> {
+        let conn = self.db.write();
+        let mut first_err: Option<String> = None;
+        let mut run = |sql: &str, label: &str| {
+            if let Err(e) = conn.execute(sql, params![session_id]) {
+                let msg = format!("{label}: {e}");
+                tracing::warn!(session_id, error = e.to_string(), "会话从属数据清理失败");
+                if first_err.is_none() {
+                    first_err = Some(msg);
+                }
+            }
+        };
+        run(
+            "DELETE FROM scope_variables WHERE scope = 'message' AND scope_id IN (
+               SELECT CAST(id AS TEXT) FROM messages WHERE session_id = ?1
+             )",
+            "message 作用域变量",
+        );
+        run(
+            "DELETE FROM undo_snapshots WHERE session_id = ?1",
+            "回退快照",
+        );
+        run(
+            "DELETE FROM kaleido_changelog WHERE session_id = ?1",
+            "契约变更日志",
+        );
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
     }
 
     /// 读取该会话最新一条压缩摘要(按 upto_message_id 最大),返回 (upto_message_id, summary)。
@@ -462,6 +556,12 @@ impl SessionService {
 
     pub fn delete_message(&self, session_id: &str, id: i64) -> bool {
         let conn = self.db.write();
+        // 先清 message 作用域变量再删消息(批次 3.1;顺序不可换:删后子查询取不到 id)
+        cleanup_message_scope_variables(
+            &conn,
+            "session_id = ?1 AND id = ?2",
+            params![session_id, id],
+        );
         conn.execute(
             "DELETE FROM messages WHERE session_id = ?1 AND id = ?2",
             params![session_id, id],
@@ -474,6 +574,12 @@ impl SessionService {
     /// 用于「编辑用户消息后重发」:保留被编辑消息、丢弃其后的所有上下文。
     pub fn truncate_messages_after(&self, session_id: &str, anchor_id: i64) -> usize {
         let conn = self.db.write();
+        // 被截断消息的 message 作用域变量一并清理(批次 3.1;anchor 本身保留)
+        cleanup_message_scope_variables(
+            &conn,
+            "session_id = ?1 AND id > ?2",
+            params![session_id, anchor_id],
+        );
         conn.execute(
             "DELETE FROM messages WHERE session_id = ?1 AND id > ?2",
             params![session_id, anchor_id],
@@ -483,6 +589,9 @@ impl SessionService {
 
     pub fn clear_messages(&self, session_id: &str) {
         let conn = self.db.write();
+        // 清空前先清该会话全部 message 作用域变量(批次 3.1;import_chat 复用本函数,
+        // 导入后消息 id 重分配,旧变量按旧 id 存续只会成为永久孤儿)
+        cleanup_message_scope_variables(&conn, "session_id = ?1", params![session_id]);
         let _ = conn.execute(
             "DELETE FROM messages WHERE session_id = ?1",
             params![session_id],
@@ -656,10 +765,11 @@ impl SessionService {
 mod tests {
     use super::*;
     use crate::models::db::Db;
+    use crate::utils::test_support::TempDataDir;
 
-    fn service() -> (SessionService, std::path::PathBuf) {
-        let dir = std::env::temp_dir().join(format!("kedai-session-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
+    /// 返回 (守卫, 服务):解构绑定按**逆序**析构,守卫在前才活到最后(见 test_support 模块头)
+    fn service() -> (TempDataDir, SessionService) {
+        let dir = TempDataDir::new("session");
         let db = Arc::new(Db::open(&dir.join("kedai.db"), &dir).unwrap());
         let svc = SessionService::new(db);
         // llm_requests/session_compactions 均外键引用 sessions,测试需先建 character + session
@@ -678,12 +788,12 @@ mod tests {
             )
             .unwrap();
         }
-        (svc, dir)
+        (dir, svc)
     }
 
     #[test]
     fn save_llm_request_persists_payload() {
-        let (svc, dir) = service();
+        let (_dir, svc) = service();
         svc.save_llm_request("s1", "run1", 0, r#"{"role":"system"}"#, "m")
             .unwrap();
 
@@ -699,12 +809,11 @@ mod tests {
         assert_eq!(payload, r#"{"role":"system"}"#);
         assert_eq!(model, "m");
         drop(conn);
-        std::fs::remove_dir_all(dir).ok();
     }
 
     #[test]
     fn prune_llm_requests_keeps_only_recent() {
-        let (svc, dir) = service();
+        let (_dir, svc) = service();
         // 插入 seq 0..4 共 5 条
         for seq in 0..5 {
             svc.save_llm_request("s1", "run1", seq, "x", "m").unwrap();
@@ -739,13 +848,12 @@ mod tests {
         assert_eq!(max_seq, 4);
         assert_eq!(min_seq, 3);
         drop(conn);
-        std::fs::remove_dir_all(dir).ok();
     }
 
     /// 缓存 usage 落库:已有请求快照行(seq 匹配)时 UPDATE 缓存列,payload 不被覆盖
     #[test]
     fn save_llm_cache_usage_updates_existing_row() {
-        let (svc, dir) = service();
+        let (_dir, svc) = service();
         svc.save_llm_request("s1", "run1", 0, r#"{"role":"system"}"#, "m")
             .unwrap();
         svc.save_llm_cache_usage("s1", "run1", 0, "m", 1000, 200, 700, 300)
@@ -775,14 +883,13 @@ mod tests {
             "缓存列更新不应覆盖 payload"
         );
         drop(conn);
-        std::fs::remove_dir_all(dir).ok();
     }
 
     /// 缓存 usage 落库:快照开关关闭(无既有行)时插入轻量行(payload 为空串),
     /// 保证缓存观测数据不依赖 llm_request_log 调试开关
     #[test]
     fn save_llm_cache_usage_inserts_light_row_when_missing() {
-        let (svc, dir) = service();
+        let (_dir, svc) = service();
         svc.save_llm_cache_usage("s1", "run2", 3, "m", 500, 80, 0, 500)
             .unwrap();
 
@@ -799,6 +906,135 @@ mod tests {
         assert_eq!((hit, miss), (0, 500));
         assert_eq!(payload, "", "无快照开关时应插入轻量行(payload 空)");
         drop(conn);
-        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// 再建一个会话(FK 指向同一 character),供「跨会话不受影响」断言
+    fn add_second_session(svc: &SessionService) {
+        let conn = svc.db.write();
+        conn.execute(
+            "INSERT INTO sessions (id, character_id, title, created_at, updated_at)
+             VALUES ('s2', 'c1', 't2', '', '')",
+            [],
+        )
+        .unwrap();
+    }
+
+    /// 3.1 单条删除:仅该消息的 message 作用域变量被清,同会话其它消息与其它作用域保留
+    #[test]
+    fn delete_message_cleans_its_message_scope_variables() {
+        let (_dir, svc) = service();
+        let m1 = svc
+            .add_message("s1", "assistant", "一", serde_json::json!({}))
+            .unwrap();
+        let m2 = svc
+            .add_message("s1", "user", "二", serde_json::json!({}))
+            .unwrap();
+        svc.save_scope_variables(
+            "message",
+            &m1.id.to_string(),
+            &serde_json::json!({ "好感度": 1 }),
+        );
+        svc.save_scope_variables(
+            "message",
+            &m2.id.to_string(),
+            &serde_json::json!({ "好感度": 2 }),
+        );
+        // 同名数据的 chat 作用域:不得被顺手清掉(只清 message)
+        svc.save_scope_variables("chat", "s1", &serde_json::json!({ "好感度": 3 }));
+
+        assert!(svc.delete_message("s1", m1.id), "删除应命中一行");
+        assert!(
+            svc.load_scope_variables("message", &m1.id.to_string())
+                .is_none(),
+            "被删消息的 message 变量应清理(否则成孤儿)"
+        );
+        assert_eq!(
+            svc.load_scope_variables("message", &m2.id.to_string()),
+            Some(serde_json::json!({ "好感度": 2 })),
+            "同会话其它消息的变量保留"
+        );
+        assert_eq!(
+            svc.load_scope_variables("chat", "s1"),
+            Some(serde_json::json!({ "好感度": 3 })),
+            "chat 作用域不受影响"
+        );
+    }
+
+    /// 3.1 截断:anchor 之后的消息变量被清,anchor 自身保留
+    #[test]
+    fn truncate_messages_after_cleans_later_message_scope_variables() {
+        let (_dir, svc) = service();
+        let m1 = svc
+            .add_message("s1", "assistant", "一", serde_json::json!({}))
+            .unwrap();
+        let m2 = svc
+            .add_message("s1", "user", "二", serde_json::json!({}))
+            .unwrap();
+        let m3 = svc
+            .add_message("s1", "assistant", "三", serde_json::json!({}))
+            .unwrap();
+        for id in [m1.id, m2.id, m3.id] {
+            svc.save_scope_variables(
+                "message",
+                &id.to_string(),
+                &serde_json::json!({ "轮次": id }),
+            );
+        }
+
+        assert_eq!(
+            svc.truncate_messages_after("s1", m1.id),
+            2,
+            "应删 anchor 之后两条"
+        );
+        assert!(
+            svc.load_scope_variables("message", &m1.id.to_string())
+                .is_some(),
+            "anchor 自身的变量保留"
+        );
+        assert!(
+            svc.load_scope_variables("message", &m2.id.to_string())
+                .is_none(),
+            "anchor 之后的消息变量应清理"
+        );
+        assert!(
+            svc.load_scope_variables("message", &m3.id.to_string())
+                .is_none(),
+            "anchor 之后的消息变量应清理(最末条)"
+        );
+    }
+
+    /// 3.1 清空:该会话 message 变量清空,其它会话的 message 变量保留
+    #[test]
+    fn clear_messages_cleans_only_that_session_scope_variables() {
+        let (_dir, svc) = service();
+        add_second_session(&svc);
+        let m1 = svc
+            .add_message("s1", "assistant", "甲", serde_json::json!({}))
+            .unwrap();
+        let m2 = svc
+            .add_message("s2", "assistant", "乙", serde_json::json!({}))
+            .unwrap();
+        svc.save_scope_variables(
+            "message",
+            &m1.id.to_string(),
+            &serde_json::json!({ "v": 1 }),
+        );
+        svc.save_scope_variables(
+            "message",
+            &m2.id.to_string(),
+            &serde_json::json!({ "v": 2 }),
+        );
+
+        svc.clear_messages("s1");
+        assert!(
+            svc.load_scope_variables("message", &m1.id.to_string())
+                .is_none(),
+            "被清空会话的 message 变量应清理"
+        );
+        assert_eq!(
+            svc.load_scope_variables("message", &m2.id.to_string()),
+            Some(serde_json::json!({ "v": 2 })),
+            "其它会话的 message 变量不受影响"
+        );
     }
 }

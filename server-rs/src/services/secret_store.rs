@@ -87,7 +87,9 @@ pub fn unprotect(stored: &str) -> String {
         #[cfg(not(any(windows, target_os = "android")))]
         {
             let _ = b64;
-            eprintln!("[secret_store] 当前平台无安全凭据存储,无法解密 enc:v1 值;请在设置页重填 API Key");
+            eprintln!(
+                "[secret_store] 当前平台无安全凭据存储,无法解密 enc:v1 值;请在设置页重填 API Key"
+            );
             return String::new();
         }
     }

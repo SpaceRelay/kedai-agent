@@ -1,59 +1,23 @@
 // Agent 工具最终裁决:按授权模式(严格/宽松/放行)、操作类型与会话/角色授权决定是否允许执行。
 use crate::models::types::ToolContext;
 use crate::tools::action_class::{PathZone, ToolAction, ToolOp};
+use crate::tools::command_risk::CommandRisk;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::PathBuf;
 use std::sync::Mutex;
 use tokio::sync::oneshot;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ToolRisk {
-    Safe,
-    Sensitive,
-    Dangerous,
-}
-
-/// 授权模式(三档;settings 以 snake_case 字符串落盘,旧配置缺省经迁移映射)。
-/// - Strict:读/写/删文件都需授权;其他工具走原风险裁决。
-/// - Loose:读/写文件放行,删文件需授权;其他工具走原风险裁决。
-/// - Bypass:除「系统路径(C 盘)写/删」外一律放行。
-/// 三档下「写/删系统路径」始终需授权,这是模式的硬底线。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum AuthorizationMode {
-    Strict,
-    Loose,
-    Bypass,
-}
-
-impl Default for AuthorizationMode {
-    /// 新装默认宽松(可用性优先:读写放行、仅删除需授权)
-    fn default() -> Self {
-        AuthorizationMode::Loose
-    }
-}
-
-impl AuthorizationMode {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            AuthorizationMode::Strict => "strict",
-            AuthorizationMode::Loose => "loose",
-            AuthorizationMode::Bypass => "bypass",
-        }
-    }
-
-    /// 解析模式字符串;非法值返回 None(调用方决定是 400 还是回退)
-    pub fn parse(s: &str) -> Option<Self> {
-        match s {
-            "strict" => Some(AuthorizationMode::Strict),
-            "loose" => Some(AuthorizationMode::Loose),
-            "bypass" => Some(AuthorizationMode::Bypass),
-            _ => None,
-        }
-    }
-}
+/// 工具风险等级与授权模式**已下沉到 L1**（`crate::models::tool_policy`，2026-09-14），
+/// 此处仅重导出以保持 `tools/` 内部既有 `use` 路径可用。
+///
+/// **下沉理由**：`services/`（L2）需要读授权档位与风险等级，若词汇留在 `tools/`（L3），
+/// 就形成 L2→L3 的越代依赖。详见 `models/tool_policy.rs` 头部与
+/// `docs/契约-架构与数据.md` §2.2。
+///
+/// **L2 代码请直接 `use crate::models::tool_policy::{...}`**，不要经本模块转发——
+/// 转发仍会构成跨代依赖边（规则 J 会如实检出）。本重导出只服务 `tools/` 内部。
+pub use crate::models::tool_policy::{AuthorizationMode, ToolRisk};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct PermissionDecision {
@@ -140,6 +104,7 @@ impl ToolPermissionManager {
             zone: PathZone::Opaque,
             target: None,
             reason: String::new(),
+            exec_risk: None,
         };
         self.decide_with_policy(
             tool,
@@ -158,6 +123,7 @@ impl ToolPermissionManager {
     /// `custom_authorized`:调用方传入的白名单命中(聊天 custom 步骤 / 任务策略闸门)。
     /// `mode`:三档授权模式;`action` 为本次调用的操作/区域分类;`always_required` 表示
     /// 该工具位于「始终需授权」清单(settings.bypass_blacklist,重定义后对三档都生效)。
+    #[allow(clippy::too_many_arguments)] // 裁决输入维度天然多(工具/上下文/三档/清单),拆分反而降低可读性
     pub fn decide_with_policy(
         &self,
         tool: &str,
@@ -169,6 +135,27 @@ impl ToolPermissionManager {
         always_required: bool,
     ) -> PermissionDecision {
         let risk = self.risk_for(tool);
+        // ★★ 命令执行高危硬门(必须在任何自动放行之前判定)★★
+        // 为什么优先级最高:bash 是**单一工具名**,工具级授权(白名单/会话授权/角色授权)
+        // 无法区分「同一工具这次跑的是 ls 还是 rm -rf」。若让工具级授权先放行,用户一旦
+        // 授权过 bash,高危命令就会静默执行(2026-09-13 冒烟实测复现过该缺口)。
+        // 故 Destructive/Admin 命令一律返回未授权,强制走引擎的授权等待:
+        //   - 聊天模式:弹确认卡(展示命令原文 + 风险级),逐条由用户决定;
+        //   - 任务模式:no_ui_authorization=true → 直接拒绝(无 UI 通道,不能假装问过);
+        //   - 「放行」模式与「始终需授权」清单在此都不适用(硬门在它们之前)。
+        if action.is_exec_op() {
+            let cmd_risk = action.exec_risk.unwrap_or(CommandRisk::Admin);
+            if cmd_risk.requires_explicit_confirm() {
+                return PermissionDecision {
+                    allowed: false,
+                    risk,
+                    reason: format!(
+                        "高危命令({})需逐条确认,不受任何授权豁免;任务模式不支持高危命令",
+                        cmd_risk.label()
+                    ),
+                };
+            }
+        }
         if !registered {
             return PermissionDecision {
                 allowed: false,
@@ -203,6 +190,22 @@ impl ToolPermissionManager {
                 reason: "该工具位于「始终需授权」清单,需手动授权".into(),
             };
         }
+        // 非高危命令执行(只读/写入类):按三档常规处理
+        // (高危已在函数开头硬门拦截,能到这里说明是 safe/sensitive 命令)
+        if action.is_exec_op() {
+            let cmd_risk = action.exec_risk.unwrap_or(CommandRisk::Admin);
+            if mode == AuthorizationMode::Bypass {
+                return PermissionDecision::allowed(
+                    risk,
+                    format!("放行模式:{}命令已放行", cmd_risk.label()),
+                );
+            }
+            return PermissionDecision {
+                allowed: false,
+                risk,
+                reason: format!("{}命令需授权", cmd_risk.label()),
+            };
+        }
         // 三档文件规则(仅对文件操作或外部工具的系统路径调用生效)
         if let Some(decision) = self.file_rule(mode, action, risk) {
             return decision;
@@ -235,6 +238,12 @@ impl ToolPermissionManager {
         risk: ToolRisk,
     ) -> Option<PermissionDecision> {
         let op = action.op;
+        // 命令执行不适用文件矩阵:已由 decide_with_policy 的 Exec 分支处理。
+        // 此处显式返回 None 而非落入下方 match,是为了让「Exec 不走文件规则」这一
+        // 契约在类型层面可见(而非依赖 zone 恰好是 Opaque 的偶然性)。
+        if action.is_exec_op() {
+            return None;
+        }
         if !action.is_file_op() {
             // 外部工具(插件/MCP)参数中出现系统路径,但无法判定读写:按最严处理,
             // 三档一律要求授权(宁可多拦,不可静默写删系统文件)。
@@ -250,7 +259,10 @@ impl ToolPermissionManager {
                     if mode == AuthorizationMode::Strict {
                         Some(self.needs_auth(mode, action, risk))
                     } else {
-                        Some(PermissionDecision::allowed(risk, "读取系统路径已放行".into()))
+                        Some(PermissionDecision::allowed(
+                            risk,
+                            "读取系统路径已放行".into(),
+                        ))
                     }
                 }
                 // 写/删系统路径:三档硬底线,一律需授权
@@ -260,19 +272,22 @@ impl ToolPermissionManager {
             PathZone::Sandbox | PathZone::Opaque => match op {
                 ToolOp::ReadFile | ToolOp::WriteFile => match mode {
                     AuthorizationMode::Strict => Some(self.needs_auth(mode, action, risk)),
-                    AuthorizationMode::Loose | AuthorizationMode::Bypass => {
-                        Some(PermissionDecision::allowed(risk, "该操作在当前授权模式下已放行".into()))
-                    }
+                    AuthorizationMode::Loose | AuthorizationMode::Bypass => Some(
+                        PermissionDecision::allowed(risk, "该操作在当前授权模式下已放行".into()),
+                    ),
                 },
                 ToolOp::DeleteFile => match mode {
                     AuthorizationMode::Strict | AuthorizationMode::Loose => {
                         Some(self.needs_auth(mode, action, risk))
                     }
-                    AuthorizationMode::Bypass => {
-                        Some(PermissionDecision::allowed(risk, "放行模式已放行删除".into()))
-                    }
+                    AuthorizationMode::Bypass => Some(PermissionDecision::allowed(
+                        risk,
+                        "放行模式已放行删除".into(),
+                    )),
                 },
                 ToolOp::Other => None,
+                // Exec 已在上方提前返回;此 arm 仅为 match 穷尽性
+                ToolOp::Exec => None,
             },
         }
     }
@@ -417,6 +432,8 @@ impl ToolPermissionManager {
         }
         // 上方 get 已确认键存在且持锁期间无并发移除,remove 必然为 Some
         let item = pending.remove(&key).expect("键已确认存在,移除必然成功");
+        // 有意丢弃 SendError:接收端已 drop 即原因本身(用户离开/会话结束),
+        // 文案已等价表达,且此处决策值无需回传给调用方
         item.sender
             .send(decision)
             .map_err(|_| "待授权调用已断开".to_string())
@@ -464,9 +481,10 @@ fn default_risk(tool: &str) -> ToolRisk {
         // agentend 是子智能体编排收尾(结束任务),不改数据,归敏感级;
         // 若归危险级,任务模式默认策略(拒绝危险工具)会打断子智能体流程。
         "search" | "sleep" | "agentgo" | "agentend" => ToolRisk::Sensitive,
-        "memory_write" | "update_variables" | "write" | "replace" | "create" => {
-            ToolRisk::Dangerous
-        }
+        "memory_write" | "update_variables" | "write" | "replace" | "create" => ToolRisk::Dangerous,
+        // 命令执行恒危险级:与文件写工具同级,但额外走「命令级风险强制确认」
+        // (tools/command_risk.rs)。显式登记而非依赖下面的通配兜底,便于后续审查。
+        "bash" => ToolRisk::Dangerous,
         // 未知工具(包括用户插件)按危险处理,避免新增工具绕过裁决。
         _ => ToolRisk::Dangerous,
     }
@@ -476,6 +494,7 @@ fn default_risk(tool: &str) -> ToolRisk {
 mod tests {
     use super::*;
     use crate::models::types::ToolContext;
+    use crate::utils::test_support::TempDataDir;
 
     fn context() -> ToolContext {
         ToolContext {
@@ -487,29 +506,31 @@ mod tests {
 
     #[test]
     fn failed_authorize_does_not_change_memory() {
-        let root =
-            std::env::temp_dir().join(format!("kedai-permission-fail-{}", uuid::Uuid::new_v4()));
-        std::fs::write(&root, "not a directory").unwrap();
-        let manager = ToolPermissionManager::load(root.join("permissions.json"));
+        let root = TempDataDir::new("permission-fail");
+        // 父路径故意做成一个「文件」而非目录:permissions.json 无法在其下创建,
+        // 借此模拟落盘失败。放在 root 内一层是为了让 TempDataDir 仍能整体清理
+        //(直接把 root 本身变成文件会让守卫的 remove_dir_all 静默失败、留下残留)。
+        let blocked = root.join("blocked");
+        std::fs::write(&blocked, "not a directory").unwrap();
+        let manager = ToolPermissionManager::load(blocked.join("permissions.json"));
         assert!(manager.authorize("search", "session", "s").is_err());
         assert!(!manager.decide("search", &context()).allowed);
-        let _ = std::fs::remove_file(root);
     }
 
     #[test]
     fn failed_revoke_keeps_existing_memory_grant() {
-        let root =
-            std::env::temp_dir().join(format!("kedai-permission-revoke-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&root).unwrap();
-        let path = root.join("permissions.json");
+        let root = TempDataDir::new("permission-revoke");
+        let dir = root.join("cfg");
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("permissions.json");
         let manager = ToolPermissionManager::load(path.clone());
         manager.authorize("search", "session", "s").unwrap();
         std::fs::remove_file(&path).unwrap();
-        std::fs::remove_dir(&root).unwrap();
-        std::fs::write(&root, "block directory").unwrap();
+        // 把承载目录换成文件(同上一用例的机制),使 revoke 的落盘必然失败
+        std::fs::remove_dir(&dir).unwrap();
+        std::fs::write(&dir, "block directory").unwrap();
         assert!(manager.revoke("search", "session", "s").is_err());
         assert!(manager.decide("search", &context()).allowed);
-        let _ = std::fs::remove_file(root);
     }
 
     // ==================== 三档授权模式矩阵 ====================
@@ -520,6 +541,7 @@ mod tests {
             zone,
             target: Some(target.into()),
             reason: format!("测试 {target}"),
+            exec_risk: None,
         }
     }
 
@@ -529,6 +551,7 @@ mod tests {
             zone: PathZone::Opaque,
             target: None,
             reason: String::new(),
+            exec_risk: None,
         }
     }
 
@@ -626,6 +649,7 @@ mod tests {
             zone: PathZone::SystemPath,
             target: Some("C:\\x".into()),
             reason: "外部工具参数含系统路径 C:\\x".into(),
+            exec_risk: None,
         };
         for mode in [
             AuthorizationMode::Strict,
@@ -645,9 +669,19 @@ mod tests {
         let safe = decide_with(&m, "read", AuthorizationMode::Strict, &other_action());
         assert!(safe.allowed, "安全工具在严格模式下仍自动执行");
         // Dangerous 工具在严格/宽松下等待授权,放行模式下放行
-        let strict = decide_with(&m, "memory_write", AuthorizationMode::Strict, &other_action());
+        let strict = decide_with(
+            &m,
+            "memory_write",
+            AuthorizationMode::Strict,
+            &other_action(),
+        );
         assert!(!strict.allowed);
-        let bypass = decide_with(&m, "memory_write", AuthorizationMode::Bypass, &other_action());
+        let bypass = decide_with(
+            &m,
+            "memory_write",
+            AuthorizationMode::Bypass,
+            &other_action(),
+        );
         assert!(bypass.allowed);
     }
 
@@ -682,9 +716,7 @@ mod tests {
     /// 场景:历史配置或手改的 tool_permissions.json 里存在 role_grants[""]。
     #[test]
     fn anonymous_session_does_not_match_role_grants() {
-        let root =
-            std::env::temp_dir().join(format!("kedai-permission-anon-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&root).unwrap();
+        let root = TempDataDir::new("permission-anon");
         let path = root.join("permissions.json");
         std::fs::write(
             &path,
@@ -699,7 +731,6 @@ mod tests {
         };
         let d = m.decide("memory_write", &anon);
         assert!(!d.allowed, "空角色不应命中 role_grants[\"\"]");
-        let _ = std::fs::remove_dir_all(root);
     }
 
     /// authorize 拒绝空 scope_id(旧实现会写入 role_grants[""],造成跨匿名会话串权)
@@ -744,5 +775,171 @@ mod tests {
             agent_depth: 0,
         };
         assert!(!m.decide("search", &dead).allowed);
+    }
+
+    // ==================== 命令执行(Exec)授权矩阵 ====================
+
+    /// 构造一个命令执行类 ToolAction(风险级由 classify 内部判定)。
+    fn exec_action(cmd: &str) -> ToolAction {
+        crate::tools::action_class::classify(
+            "bash",
+            &format!(r#"{{"command":"{cmd}"}}"#),
+            crate::tools::action_class::ToolOrigin::Builtin,
+        )
+    }
+
+    /// **核心安全契约**:破坏性/提权命令在**任何**授权模式下都不被放行
+    /// (含 Bypass)——否则放行模式等于「静默执行任意命令」。
+    #[test]
+    fn destructive_and_admin_commands_never_auto_allowed() {
+        let m = ToolPermissionManager::in_memory();
+        for cmd in [
+            "rm -rf /tmp/x",
+            "sudo reboot",
+            "dd if=/dev/zero of=/dev/sda",
+            "pm list packages",
+        ] {
+            let a = exec_action(cmd);
+            assert!(a.is_exec_op(), "{cmd} 应归类为 Exec");
+            for mode in [
+                AuthorizationMode::Strict,
+                AuthorizationMode::Loose,
+                AuthorizationMode::Bypass,
+            ] {
+                let d = decide_with(&m, "bash", mode, &a);
+                assert!(
+                    !d.allowed,
+                    "{cmd} 在 {mode:?} 下不应自动放行(高危命令硬门);理由:{}",
+                    d.reason
+                );
+                assert!(
+                    d.reason.contains("逐条确认"),
+                    "理由应说明需确认:{}",
+                    d.reason
+                );
+            }
+        }
+    }
+
+    /// 只读命令:严格/宽松下需授权,放行模式下放行(非高危,不制造确认疲劳)。
+    #[test]
+    fn safe_command_follows_three_mode_matrix() {
+        let m = ToolPermissionManager::in_memory();
+        let a = exec_action("ls -la");
+        assert!(!decide_with(&m, "bash", AuthorizationMode::Strict, &a).allowed);
+        assert!(!decide_with(&m, "bash", AuthorizationMode::Loose, &a).allowed);
+        assert!(decide_with(&m, "bash", AuthorizationMode::Bypass, &a).allowed);
+    }
+
+    /// 写入类命令(非高危):放行模式放行,严格模式需授权。
+    #[test]
+    fn sensitive_command_not_treated_as_destructive() {
+        let m = ToolPermissionManager::in_memory();
+        let a = exec_action("mkdir -p build");
+        assert!(!decide_with(&m, "bash", AuthorizationMode::Strict, &a).allowed);
+        assert!(decide_with(&m, "bash", AuthorizationMode::Bypass, &a).allowed);
+    }
+
+    /// bash 的风险级恒为 Dangerous(显式登记,不依赖通配兜底)。
+    #[test]
+    fn bash_registered_as_dangerous() {
+        let m = ToolPermissionManager::in_memory();
+        assert_eq!(m.risk_for("bash"), ToolRisk::Dangerous);
+    }
+
+    /// ★ 回归测试(2026-09-13 冒烟实测发现的缺口):
+    /// **工具级显式授权不得豁免命令级高危硬门**。
+    /// 背景:bash 是单一工具名,用户授权 bash 后,同一工具既能跑 ls 也能跑 rm -rf;
+    /// 修复前 explicitly_allowed 在 exec 硬门之前判定,导致授权 bash 后 rm -rf 直接执行。
+    #[test]
+    fn explicit_tool_grant_does_not_bypass_destructive_command_gate() {
+        let m = ToolPermissionManager::in_memory();
+        // 授予会话级 bash 授权(模拟用户点过「本次授权」)
+        m.authorize("bash", "session", "s").unwrap();
+        let a = exec_action("rm -rf /important");
+        for mode in [
+            AuthorizationMode::Strict,
+            AuthorizationMode::Loose,
+            AuthorizationMode::Bypass,
+        ] {
+            let d = decide_with(&m, "bash", mode, &a);
+            assert!(
+                !d.allowed,
+                "会话已授权 bash,但高危命令仍必须逐条确认(而非直接执行);模式 {mode:?}"
+            );
+        }
+        // 提权命令同理
+        let a2 = exec_action("sudo rm -rf /");
+        assert!(!decide_with(&m, "bash", AuthorizationMode::Bypass, &a2).allowed);
+    }
+
+    /// ★ 任务模式白名单(custom_authorized=true,即 ToolGate 名单内工具)不得豁免
+    /// 命令级高危硬门:无人值守任务没有 UI 确认通道,rm -rf/sudo 必须直接拒绝;
+    /// 普通命令仍经白名单放行(证明硬化断言非恒真)。
+    #[test]
+    fn task_whitelist_does_not_bypass_destructive_command_gate() {
+        let m = ToolPermissionManager::in_memory();
+        let ctx = ToolContext {
+            session_id: "task:s1".into(),
+            character_id: String::new(),
+            agent_depth: 0,
+        };
+        for cmd in ["rm -rf /important", "sudo reboot"] {
+            let a = exec_action(cmd);
+            let d = m.decide_with_policy(
+                "bash",
+                &ctx,
+                true,
+                true,
+                AuthorizationMode::Loose,
+                &a,
+                false,
+            );
+            assert!(
+                !d.allowed,
+                "任务白名单不得放行高危命令 {cmd};理由:{}",
+                d.reason
+            );
+        }
+        let a = exec_action("ls -la");
+        let d = m.decide_with_policy(
+            "bash",
+            &ctx,
+            true,
+            true,
+            AuthorizationMode::Loose,
+            &a,
+            false,
+        );
+        assert!(d.allowed, "普通命令应经任务白名单放行:{}", d.reason);
+    }
+
+    /// 非高危命令仍受工具级授权放行(授权 bash 后 ls 不再重复问)。
+    #[test]
+    fn explicit_tool_grant_still_applies_to_safe_commands() {
+        let m = ToolPermissionManager::in_memory();
+        m.authorize("bash", "session", "s").unwrap();
+        let a = exec_action("ls -la");
+        assert!(
+            decide_with(&m, "bash", AuthorizationMode::Strict, &a).allowed,
+            "只读命令在已授权后应放行,避免每次都弹确认"
+        );
+    }
+
+    /// 「始终需授权」清单对 bash 同样生效(用户可再加一道锁)。
+    #[test]
+    fn bash_respects_always_required_list() {
+        let m = ToolPermissionManager::in_memory();
+        let a = exec_action("ls");
+        let d = m.decide_with_policy(
+            "bash",
+            &context(),
+            true,
+            false,
+            AuthorizationMode::Bypass,
+            &a,
+            true,
+        );
+        assert!(!d.allowed, "在始终需授权清单中即使放行模式也不得放行");
     }
 }

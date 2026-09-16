@@ -195,6 +195,75 @@ pub fn ensure_task_llm_calls_finish_reason_column(conn: &Connection) -> Result<(
     Ok(())
 }
 
+/// 列补全的共用实现(2026-09-16 批次 4):两张子任务表要补同一个 `finished_at`,
+/// 逐个手抄一遍 PRAGMA 探测会把「表不存在直接跳过」这条易错的边界抄漏。
+///
+/// 语义与既有 ensure_* 列迁移一致:
+/// - 表不存在(极旧快照/手工建库/测试手工建库)时**零列返回**,交建表批负责,不得 ALTER 报错;
+/// - 列已存在即跳过(幂等,重复执行不产生重复列);
+/// - 列追加在表尾,与新版 CREATE_TABLES 建出的 schema normalize 后一致
+///   (跨库合并的 schema 一致性比对依赖此点)。
+fn add_column_if_missing(
+    conn: &Connection,
+    table: &str,
+    column: &str,
+    column_type: &str,
+) -> Result<(), String> {
+    let mut existing: Vec<String> = Vec::new();
+    {
+        let mut stmt = conn
+            .prepare(&format!("PRAGMA table_info({table})"))
+            .map_err(|e| format!("读取 {table} 列失败: {e}"))?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .map_err(|e| format!("遍历 {table} 列失败: {e}"))?;
+        for name in rows.flatten() {
+            existing.push(name.to_lowercase());
+        }
+    }
+    if existing.is_empty() {
+        return Ok(());
+    }
+    if existing.iter().any(|c| c == column) {
+        return Ok(());
+    }
+    conn.execute(
+        &format!("ALTER TABLE {table} ADD COLUMN {column} {column_type}"),
+        [],
+    )
+    .map_err(|e| format!("为 {table} 补 {column} 列失败: {e}"))?;
+    Ok(())
+}
+
+/// 幂等 schema 升级(批次 4 子任务终态语义):为 agent_subtasks 补 `finished_at` 列。
+///
+/// 用途:让「已完成再被 agentend 召回」与「中途被召回」可分——前者保持 `done` 且
+/// `finished_at` 非空,只有后者才落 `ended`。旧行经 DEFAULT '' 零迁移成本
+/// (`''` = 未知/该列引入前完成,不等于「未完成」,不反推语义)。
+/// 启动时(Db::open)与跨库合并前(merge_databases 两侧)各执行一次。
+pub fn ensure_agent_subtasks_finished_at_column(conn: &Connection) -> Result<(), String> {
+    add_column_if_missing(
+        conn,
+        "agent_subtasks",
+        "finished_at",
+        "TEXT NOT NULL DEFAULT ''",
+    )
+}
+
+/// 幂等 schema 升级(批次 4):为 task_subtasks 补 `finished_at` 列。
+///
+/// task_subtasks 是 legacy 路径下 agent_subtasks 的等价表,契约映射
+/// (tools/check-contract.mjs 的「任务子任务」组)与迁移期 schema 指纹比对都要求
+/// 两表同形状——只补一张会让跨库合并报「基线缺少列」。
+pub fn ensure_task_subtasks_finished_at_column(conn: &Connection) -> Result<(), String> {
+    add_column_if_missing(
+        conn,
+        "task_subtasks",
+        "finished_at",
+        "TEXT NOT NULL DEFAULT ''",
+    )
+}
+
 /// 契约变更历史表(阶段 C):append-only 审计 + 回滚源。合并前对两侧各补一次 DDL,
 /// 与 SCOPE_VARIABLES_DDL 同理,避免旧库与新库合并时因「基线缺少源表」停止(§4.3)。
 /// 索引不参与 schema 一致性比对(schema_map 仅读 type='table'),无需在此重复。
@@ -374,5 +443,56 @@ pub fn ensure_task_messages_table(conn: &Connection) -> Result<(), String> {
     }
     conn.execute_batch(TASK_MESSAGES_DDL)
         .map_err(|e| format!("创建 task_messages 表失败: {e}"))?;
+    Ok(())
+}
+
+/// 命令执行审计表(bash 工具与 Android 执行层):每次尝试执行(含被拒绝的)
+/// 落一行,供设置面板审计查看与事后追溯。
+/// 为什么必须落库:root/ADB 级命令不可逆,「谁在何时以什么等级跑了什么」
+/// 是唯一的回溯依据(见 docs/契约-协议与配置.md 与 docs/计划.md 合规要求)。
+pub(super) const EXEC_AUDIT_DDL: &str = r#"
+CREATE TABLE IF NOT EXISTS exec_audit (
+  id             INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts             TEXT NOT NULL,
+  source         TEXT NOT NULL DEFAULT 'chat',
+  task_id        TEXT,
+  session_id     TEXT,
+  command        TEXT NOT NULL,
+  shell          TEXT NOT NULL DEFAULT '',
+  tier           TEXT NOT NULL DEFAULT 'sandbox',
+  risk           TEXT NOT NULL DEFAULT 'sensitive',
+  decision       TEXT NOT NULL DEFAULT 'allowed',
+  exit_code      INTEGER,
+  stdout_summary TEXT NOT NULL DEFAULT '',
+  stderr_summary TEXT NOT NULL DEFAULT ''
+)"#;
+/// 审计按时间倒序查询的辅助索引。
+pub(super) const EXEC_AUDIT_INDEX_DDL: &str =
+    "CREATE INDEX IF NOT EXISTS idx_exec_audit_ts ON exec_audit(ts DESC)";
+
+/// 幂等补建命令执行审计表(旧库无此表时创建)。
+/// DDL 全用 IF NOT EXISTS,启动与跨库合并前各执行一次均安全(同 task_messages 模式)。
+pub fn ensure_exec_audit_table(conn: &Connection) -> Result<(), String> {
+    conn.execute_batch(EXEC_AUDIT_DDL)
+        .map_err(|e| format!("创建 exec_audit 表失败: {e}"))?;
+    conn.execute_batch(EXEC_AUDIT_INDEX_DDL)
+        .map_err(|e| format!("创建 exec_audit 索引失败: {e}"))?;
+    Ok(())
+}
+
+/// 性能索引补建(2026-09-13 批次 3):旧库补 `sessions.character_id` 与 `tasks` 过滤列索引。
+/// 此前这些列表查询走全表扫描 + 排序(外键列 SQLite 不自动建索引)。
+/// 与 `schema.rs` 的同名 `CREATE INDEX IF NOT EXISTS` 保持一致——新增/改动索引时
+/// **两处都要改**(迁移元测试 `tests/schema_migration_meta.rs` 会逐表比对索引集合把关)。
+const PERF_INDEX_DDL: &str = "
+CREATE INDEX IF NOT EXISTS idx_sessions_character ON sessions(character_id, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_tasks_character ON tasks(character_id);
+CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
+";
+
+/// 幂等 schema 升级(批次 3):旧库补建会话/任务列表查询索引。
+pub fn ensure_perf_indexes(conn: &Connection) -> Result<(), String> {
+    conn.execute_batch(PERF_INDEX_DDL)
+        .map_err(|e| format!("创建性能索引失败: {e}"))?;
     Ok(())
 }

@@ -4,7 +4,6 @@
 use crate::models::types::{ToolContext, ToolDefinition};
 use crate::tools::action_class::ToolOrigin;
 use crate::tools::permissions::{PermissionDecision, ToolPermissionManager};
-use futures::future::BoxFuture;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -15,9 +14,11 @@ const DEFAULT_TOOL_TIMEOUT: Duration = Duration::from_secs(30);
 /// 工具结果最大字节数(超出截断,避免超长输出撑爆上下文与前端渲染)
 const MAX_TOOL_OUTPUT_BYTES: usize = 64 * 1024;
 
-/// 工具执行器类型别名(register_multistep_tools 等外部构造闭包时需要显式标注)
-pub type ToolExecutor =
-    Arc<dyn Fn(Value, ToolContext) -> BoxFuture<'static, Result<String, String>> + Send + Sync>;
+/// 工具执行器类型别名**已下沉到 L1**（`crate::models::types::ToolExecutor`，2026-09-14）。
+///
+/// 理由：`plugins/`（L3）与 `mcp/`（L3）都需要**构造**执行器，若类型留在本模块（L2），
+/// 两者都会构成 `L3→L2` 越代依赖。此处仅重导出，服务 `tools/` 内部既有 `use`。
+pub use crate::models::types::ToolExecutor;
 
 #[derive(Clone)]
 pub struct RegisteredTool {
@@ -41,6 +42,12 @@ pub struct ToolRegistry {
     /// 上注册表先构造,故后注;与 ToolDeps.engine/tasks 的 OnceLock 后注同范式)。
     /// 未注入(单元测试 ToolRegistry::new())时写工具不产快照,行为与旧版一致。
     undo: std::sync::OnceLock<Arc<crate::services::undo_service::UndoService>>,
+    /// 工具定义快照缓存(2026-09-14 性能):`list_definitions` 此前每次调用都在锁内
+    /// 全量 clone 每个工具定义再排序。该函数在请求热路径上(agent 模式每请求一次、
+    /// custom 模式每 step 一次、任务策略每次 compile 一次),工具多时是无谓的重复开销。
+    /// 改为「按需构建 + 写路径失效」:注册/注销时置 None,下次读取重建一次。
+    /// 失效点只有 register_external 与 unregister 两处,覆盖插件加载与 MCP 动态注册。
+    definitions_cache: Mutex<Option<Arc<Vec<ToolDefinition>>>>,
 }
 
 impl ToolRegistry {
@@ -54,6 +61,7 @@ impl ToolRegistry {
             permissions,
             tool_timeout: DEFAULT_TOOL_TIMEOUT,
             undo: std::sync::OnceLock::new(),
+            definitions_cache: Mutex::new(None),
         }
     }
 
@@ -108,6 +116,17 @@ impl ToolRegistry {
                 origin,
             },
         );
+        drop(g);
+        self.invalidate_definitions_cache();
+    }
+
+    /// 失效工具定义快照(2026-09-14)。**所有写路径必须调用**——漏调会导致
+    /// 新注册的工具(插件/MCP)不下发给模型。当前写路径只有 register_external 与 unregister。
+    fn invalidate_definitions_cache(&self) {
+        *self
+            .definitions_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
     }
 
     /// 工具来源;未注册返回 None。裁决时用于区分沙箱内外的路径可信度。
@@ -123,12 +142,34 @@ impl ToolRegistry {
     pub fn is_builtin(&self, name: &str) -> bool {
         self.origin_of(name) == Some(ToolOrigin::Builtin)
     }
+}
 
+/// 实现 L1 的 [`crate::models::types::ToolRegistrar`] 窄接口：让 L3（`mcp/`）能经
+/// `&dyn ToolRegistrar` 注册工具，而**不必** `use crate::tools::...`（否则构成 L3→L2
+/// 越代依赖）。方法体直接委托到本结构体的同名固有方法，行为零变化。
+impl crate::models::types::ToolRegistrar for ToolRegistry {
+    fn register_external(
+        &self,
+        definition: ToolDefinition,
+        execute: ToolExecutor,
+        timeout: Option<Duration>,
+        origin: ToolOrigin,
+    ) {
+        ToolRegistry::register_external(self, definition, execute, timeout, origin);
+    }
+
+    fn unregister(&self, name: &str) {
+        ToolRegistry::unregister(self, name);
+    }
+}
+
+impl ToolRegistry {
     pub fn unregister(&self, name: &str) {
         self.tools
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(name);
+        self.invalidate_definitions_cache();
     }
 
     pub fn get(&self, name: &str) -> Option<RegisteredTool> {
@@ -140,6 +181,22 @@ impl ToolRegistry {
     }
 
     pub fn list_definitions(&self) -> Vec<ToolDefinition> {
+        self.definitions_snapshot().as_ref().clone()
+    }
+
+    /// 工具定义的共享快照(2026-09-14 性能)。
+    /// 首次调用构建一次(锁内取全部定义 → 排序),之后返回同一 `Arc` 直到注册表变化。
+    /// 热路径若只需遍历/过滤,用本方法避免 `list_definitions` 的整体 clone。
+    pub fn definitions_snapshot(&self) -> Arc<Vec<ToolDefinition>> {
+        if let Some(hit) = self
+            .definitions_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .cloned()
+        {
+            return hit;
+        }
         let mut definitions: Vec<_> = self
             .tools
             .lock()
@@ -148,7 +205,12 @@ impl ToolRegistry {
             .map(|t| t.definition.clone())
             .collect();
         definitions.sort_by(|a, b| a.name.cmp(&b.name));
-        definitions
+        let snapshot = Arc::new(definitions);
+        *self
+            .definitions_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(snapshot.clone());
+        snapshot
     }
 
     /// 生成给模型看的工具使用指南(自然语言清单:名称 + 一句话功能 + 何时调用)。
@@ -236,8 +298,10 @@ impl ToolRegistry {
         ctx: ToolContext,
     ) -> Result<String, String> {
         let name = tool.definition.name.clone();
-        let args: Value = serde_json::from_str(args_json).map_err(|_| {
-            format!("工具 \"{name}\" 参数解析失败:{args_json}。下一步:改为合法 JSON 对象,键名与类型对照工具定义的 parameters")
+        // 补回 serde 原错(含行列位置):模型给出的坏 JSON 常是截断/多余逗号,
+        // 位置信息是判断「预算不足」还是「语法错误」的关键
+        let args: Value = serde_json::from_str(args_json).map_err(|e| {
+            format!("工具 \"{name}\" 参数解析失败({e}):{args_json}。下一步:改为合法 JSON 对象,键名与类型对照工具定义的 parameters")
         })?;
         // 批次 6.1 回退快照(两段式):写工具执行前取逆操作负载暂存;执行成功 commit
         // 落库,失败 discard 丢弃。快照构建含角色文件区文件读取与同步 DB 查询,
@@ -377,6 +441,81 @@ mod tests {
             .map(|definition| definition.name)
             .collect();
         assert_eq!(names, vec!["alpha", "middle", "zeta"]);
+    }
+
+    /// P3-1(2026-09-14):工具定义快照的**失效正确性**。
+    /// 这是本优化唯一的风险点——漏失效会让新注册的工具(插件/MCP)不下发给模型。
+    /// 断言:① 重复读取命中同一 Arc(缓存生效);② 注册后缓存失效、新工具可见;
+    /// ③ 注销后同样失效。
+    #[test]
+    fn definitions_snapshot_invalidates_on_register_and_unregister() {
+        let reg = ToolRegistry::new();
+        let def = |n: &str| ToolDefinition {
+            name: n.into(),
+            description: n.into(),
+            parameters: serde_json::json!({}),
+        };
+        let ex = || -> ToolExecutor { Arc::new(|_, _| Box::pin(async { Ok("ok".into()) }) as _) };
+
+        reg.register(def("alpha"), ex());
+        let first = reg.definitions_snapshot();
+        let second = reg.definitions_snapshot();
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "注册表未变时快照应命中同一 Arc(缓存生效)"
+        );
+        assert_eq!(first.len(), 1);
+
+        // 注册新工具 → 快照必须失效
+        reg.register(def("beta"), ex());
+        let after_register = reg.definitions_snapshot();
+        assert_eq!(after_register.len(), 2, "注册后快照必须失效并包含新工具");
+        assert!(
+            after_register.iter().any(|d| d.name == "beta"),
+            "新注册工具必须出现在快照里"
+        );
+        assert!(
+            !Arc::ptr_eq(&first, &after_register),
+            "注册后应返回新构建的快照"
+        );
+
+        // 注销 → 快照必须失效
+        reg.unregister("alpha");
+        let after_unregister = reg.definitions_snapshot();
+        assert_eq!(after_unregister.len(), 1, "注销后快照必须失效");
+        assert_eq!(after_unregister[0].name, "beta");
+    }
+
+    /// 通过 ToolRegistrar 窄接口注册(插件/MCP 的实际路径)同样触发失效
+    #[test]
+    fn definitions_snapshot_invalidates_via_registrar_trait() {
+        use crate::models::types::ToolRegistrar;
+        let reg = ToolRegistry::new();
+        reg.register(
+            ToolDefinition {
+                name: "builtin".into(),
+                description: "内置".into(),
+                parameters: serde_json::json!({}),
+            },
+            Arc::new(|_, _| Box::pin(async { Ok("ok".into()) })),
+        );
+        assert_eq!(reg.definitions_snapshot().len(), 1);
+
+        // 模拟 MCP 动态注册(经 &dyn ToolRegistrar)
+        let registrar: &dyn ToolRegistrar = &reg;
+        registrar.register_external(
+            ToolDefinition {
+                name: "mcp_demo_tool".into(),
+                description: "外部".into(),
+                parameters: serde_json::json!({}),
+            },
+            Arc::new(|_, _| Box::pin(async { Ok("ok".into()) })),
+            None,
+            ToolOrigin::Mcp,
+        );
+        let snap = reg.definitions_snapshot();
+        assert_eq!(snap.len(), 2, "经窄接口注册后快照必须失效");
+        assert!(snap.iter().any(|d| d.name == "mcp_demo_tool"));
     }
 
     #[test]

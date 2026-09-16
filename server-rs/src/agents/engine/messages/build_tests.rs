@@ -510,6 +510,70 @@ fn rebuild_same_input_produces_identical_messages() {
     );
 }
 
+/// 概率门控不扰动 system 前缀(2026-09-13 批次 3 核实并锁定):
+/// 上游世界书概率门控只作用于**触发条目**(worldbook.rs 的 constant 分支不参与概率),
+/// 而构建侧常驻条目(constant)并入 system 前缀、触发条目(triggered)只进尾部注入区。
+/// 两条合起来 = 概率/随机命中不会改变缓存前缀;本测试锁死构建侧这一半:
+/// system 恒含常驻文本、恒不含触发文本,且两次构建 system 逐字节一致。
+#[test]
+fn probability_entries_do_not_perturb_system_prefix() {
+    let history = prefix_case_history();
+    let constant = vec![inj("system", "常驻世界书A")];
+    let triggered = vec![inj("user", "激发世界书C")];
+    let build = |vars: &mut HashMap<String, String>| {
+        build_llm_messages_with_position(
+            "芽衣",
+            "兔族少女。",
+            "温柔",
+            "图书馆",
+            &constant,
+            &triggered,
+            &history,
+            None,
+            None,
+            Some("预设尾部。"),
+            "user",
+            None,
+            "user",
+            vars,
+            &mut AssistantVars::new(),
+            None,
+        )
+        .0
+    };
+    let m1 = {
+        let mut vars = HashMap::new();
+        build(&mut vars)
+    };
+    let m2 = {
+        let mut vars = HashMap::new();
+        build(&mut vars)
+    };
+    assert_eq!(m1[0].role, "system");
+    assert!(
+        m1[0].content.contains("常驻世界书A"),
+        "常驻条目应进 system 前缀"
+    );
+    assert!(
+        !m1[0].content.contains("激发世界书C"),
+        "触发条目不得进 system 前缀(概率只影响尾部注入)"
+    );
+    assert_eq!(
+        m1[0].content, m2[0].content,
+        "system 前缀必须逐字节稳定(概率/随机命中不得扰动)"
+    );
+    let tail: String = m1
+        .iter()
+        .skip(1)
+        .map(|m| m.content.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        tail.contains("激发世界书C"),
+        "触发条目应出现在尾部注入区:{tail}"
+    );
+}
+
 /// 历史追加后重建:公共前缀必须覆盖旧数组的「尾部注入转移区」之前的全部
 /// 消息——system/常态注入/早期历史逐字节不变;允许变化的只有尾部注入区
 /// (被注入的旧最新 user 及其后消息:位置1 激发/位置0 预设尾部随新消息转移,

@@ -10,22 +10,26 @@
 //   否则严格模式下 Agent 无法正常产出正文。
 use serde_json::Value;
 
-/// 工具来源:决定路径区域可信度。内置工具受沙箱约束,插件/MCP 的参数对引擎不透明。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ToolOrigin {
-    Builtin,
-    Plugin,
-    Mcp,
-}
+use super::command_risk::CommandRisk;
 
-/// 操作类型。派生的 Ord 顺序即危险度序(Other < ReadFile < WriteFile < DeleteFile),
+/// 工具来源**已下沉到 L1**（`crate::models::tool_policy::ToolOrigin`，2026-09-14）。
+///
+/// 理由：`plugins/` 与 `mcp/`（均为 L3）都需要标注工具来源。若该枚举留在 `tools/`（L2），
+/// 两个 L3 模块都会构成 `L3→L2` 越代依赖。此处仅重导出，服务 `tools/` 内部既有 `use`。
+pub use crate::models::tool_policy::ToolOrigin;
+
+/// 操作类型。派生的 Ord 顺序即危险度序
+/// (Other < ReadFile < WriteFile < DeleteFile < Exec),
 /// 混合操作调用取最高危项作为整体归类。
+/// `Exec` 排在末位:命令执行可造成与「删除文件」不可比的后果(提权/系统级改动),
+/// 且其授权判定独立于文件矩阵(见 permissions::decide_with_policy 的 Exec 分支)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ToolOp {
     Other,
     ReadFile,
     WriteFile,
     DeleteFile,
+    Exec,
 }
 
 /// 路径区域。Sandbox = 内置角色文件区(受 safe_rel_path 约束);
@@ -46,6 +50,10 @@ pub struct ToolAction {
     pub target: Option<String>,
     /// 授权理由(简体中文,简短);非文件操作为空
     pub reason: String,
+    /// 命令执行类操作的风险级别(仅 op=Exec 时有值)。
+    /// 放在这里而非在上游单独判一次,是为了让权限裁决能直接据其决定
+    /// 「是否需要逐条确认」,避免分级口径在两处漂移。
+    pub exec_risk: Option<CommandRisk>,
 }
 
 impl ToolAction {
@@ -55,6 +63,7 @@ impl ToolAction {
             zone: PathZone::Opaque,
             target: None,
             reason: String::new(),
+            exec_risk: None,
         }
     }
 
@@ -64,6 +73,12 @@ impl ToolAction {
             self.op,
             ToolOp::ReadFile | ToolOp::WriteFile | ToolOp::DeleteFile
         )
+    }
+
+    /// 是否为命令执行类操作。其授权不受三档文件矩阵管辖,由
+    /// 「命令级风险分级 + 强制确认」单独把关(见 permissions::decide_with_policy)。
+    pub fn is_exec_op(&self) -> bool {
+        matches!(self.op, ToolOp::Exec)
     }
 }
 
@@ -76,6 +91,10 @@ pub fn classify(name: &str, args_json: &str, origin: ToolOrigin) -> ToolAction {
         "write" => classify_write(&args),
         "create" => classify_create(&args),
         "replace" => classify_replace(&args),
+        // 命令执行:归 Exec;命令原文进 reason 供确认卡与审计展示。
+        // 注意:此处**不**做命令风险分级——分级在 tools::command_risk 里,
+        // 由 bash 工具与权限裁决共同消费(避免两处判定口径漂移)。
+        "bash" => classify_bash(&args),
         _ => ToolAction::other(),
     };
 
@@ -115,7 +134,44 @@ fn op_label(op: ToolOp) -> &'static str {
         ToolOp::ReadFile => "读取",
         ToolOp::WriteFile => "写入",
         ToolOp::DeleteFile => "删除",
+        ToolOp::Exec => "执行命令",
         ToolOp::Other => "操作",
+    }
+}
+
+/// bash:命令执行归类。target 取命令首行(截断展示),zone 恒 Opaque
+/// (命令可达任意路径,无法用「沙箱/系统路径」二值刻画)。
+/// 同时计算命令风险级(exec_risk):权限裁决据其决定是否强制逐条确认。
+fn classify_bash(args: &Value) -> ToolAction {
+    let cmd = args
+        .get("command")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
+    if cmd.is_empty() {
+        return ToolAction {
+            op: ToolOp::Exec,
+            zone: PathZone::Opaque,
+            target: None,
+            reason: "命令为空".into(),
+            // 空命令按最高危处理:宁可多确认,不给「空命令绕过」留缝
+            exec_risk: Some(CommandRisk::Admin),
+        };
+    }
+    let risk = super::command_risk::classify_command(cmd, "");
+    // 展示用摘要:截断到 200 字符,避免确认卡/审计被超长命令撑爆
+    let brief: String = cmd.chars().take(200).collect();
+    let brief = if cmd.chars().count() > 200 {
+        format!("{brief}…")
+    } else {
+        brief
+    };
+    ToolAction {
+        op: ToolOp::Exec,
+        zone: PathZone::Opaque,
+        target: Some(brief.clone()),
+        reason: format!("执行命令({}):{brief}", risk.label()),
+        exec_risk: Some(risk),
     }
 }
 
@@ -144,6 +200,7 @@ fn classify_read(args: &Value) -> ToolAction {
         zone: PathZone::Sandbox,
         target: Some(targets.join(", ")),
         reason: String::new(),
+        exec_risk: None,
     }
 }
 
@@ -163,6 +220,7 @@ fn classify_write(args: &Value) -> ToolAction {
         zone: PathZone::Sandbox,
         target,
         reason: String::new(),
+        exec_risk: None,
     }
 }
 
@@ -186,6 +244,7 @@ fn classify_create(args: &Value) -> ToolAction {
         zone: PathZone::Sandbox,
         target: Some(paths.join(", ")),
         reason: String::new(),
+        exec_risk: None,
     }
 }
 
@@ -226,6 +285,7 @@ fn classify_replace(args: &Value) -> ToolAction {
         zone: PathZone::Sandbox,
         target: (!targets.is_empty()).then(|| targets.join(", ")),
         reason: String::new(),
+        exec_risk: None,
     }
 }
 

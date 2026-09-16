@@ -22,6 +22,15 @@ use super::agent_tools_shared::subtask_candidates;
 // 常量本体在 `tools::tool_sets::SUBAGENT`(单一出处);语义:显式列举,
 // 同时作为 run_tool_loop 的闸门名单自动放行。
 
+/// 子任务输出上限的下限(2026-09-15 实测):旧实现 `clamp(64, 4096)` 把调用方传的
+/// 小预算静默抬到 64 就执行,而推理模型单是 reasoning 就能烧掉数千 token——
+/// 64 token 的预算必然「推理耗尽、正文为空」,再自愈到 128 依然烧在推理上。
+/// 实测日志:子任务 max_tokens=64 → self_heal 到 128 → 正文仍为空。
+/// 故下限抬到 16384:推理与正文都能落地,不再出现「必然截断」的档位。
+const SUBAGENT_MIN_MAX_TOKENS: u32 = 16384;
+/// 子任务输出上限的上限(与 settings 侧 `1..=131072` 校验区间一致)。
+const SUBAGENT_MAX_MAX_TOKENS: u32 = 131_072;
+
 // ==================== agentgo:排出子智能体(后台异步,read/todo 轮询) ====================
 pub(super) fn register_agentgo(registry: &ToolRegistry, deps: Arc<ToolDeps>) {
     registry.register(
@@ -38,7 +47,7 @@ pub(super) fn register_agentgo(registry: &ToolRegistry, deps: Arc<ToolDeps>) {
                             "properties": {
                                 "name": { "type": "string", "description": "任务名" },
                                 "instruction": { "type": "string", "description": "子任务指令" },
-                                "max_tokens": { "type": "integer", "description": "输出上限(默认 512)" }
+                                "max_tokens": { "type": "integer", "description": "输出上限(默认 512;低于 16384 会被抬到 16384,上限 131072)" }
                             },
                             "required": ["name", "instruction"]
                         }
@@ -92,6 +101,9 @@ pub(super) fn register_agentgo(registry: &ToolRegistry, deps: Arc<ToolDeps>) {
                 // 现在:非法项进 rejected,合法项照常 create+spawn,互不牵连。
                 let mut launched: Vec<Value> = Vec::new();
                 let mut rejected: Vec<Value> = Vec::new();
+                // 预算被抬高的项(2026-09-15):入参低于下限时不拒绝,但必须显式告知
+                // 实际生效值——旧实现静默抬升,调用方以为在压 token、实际按另一个数执行。
+                let mut low_budget: Vec<Value> = Vec::new();
                 for (index, t) in tasks.iter().enumerate() {
                     // 畸形输入按「拒绝该项」处理,不 panic:非对象元素没有可用 name/instruction
                     let Some(obj) = t.as_object() else {
@@ -131,11 +143,22 @@ pub(super) fn register_agentgo(registry: &ToolRegistry, deps: Arc<ToolDeps>) {
                         }));
                         continue;
                     }
-                    let max_tokens = obj
-                        .get("max_tokens")
-                        .and_then(|v| v.as_u64())
+                    // 原始入参(未钳制):用于判断是否被抬升,并如实回显
+                    let requested = obj.get("max_tokens").and_then(|v| v.as_u64());
+                    let max_tokens = requested
                         .unwrap_or(512)
-                        .clamp(64, 4096) as u32;
+                        .clamp(SUBAGENT_MIN_MAX_TOKENS as u64, SUBAGENT_MAX_MAX_TOKENS as u64)
+                        as u32;
+                    // 低于下限:不拒绝(避免主 agent 写得保守就整批失败),但显式记账
+                    if requested.is_some_and(|v| v < SUBAGENT_MIN_MAX_TOKENS as u64) {
+                        low_budget.push(json!({
+                            "index": index,
+                            "name": name,
+                            "requested_max_tokens": requested,
+                            "resolved_max_tokens": max_tokens,
+                            "note": "入参低于下限,已按下限执行;推理模型在小预算下会耗尽推理、正文为空",
+                        }));
+                    }
                     // 合法项:用 trim 后的值创建与派发(维持原校验/派发顺序)
                     let record = deps.subtasks.create(
                         &ctx.session_id,
@@ -160,7 +183,13 @@ pub(super) fn register_agentgo(registry: &ToolRegistry, deps: Arc<ToolDeps>) {
                         )
                         .await;
                     });
-                    launched.push(json!({ "task_id": record.id, "name": name, "status": "pending" }));
+                    // 回显实际生效预算:调用方据此确认平台真按自己给的值执行
+                    launched.push(json!({
+                        "task_id": record.id,
+                        "name": name,
+                        "status": "pending",
+                        "resolved_max_tokens": max_tokens,
+                    }));
                 }
                 // 合法项为 0 且存在 rejected:无任何派发,整批错误(文案带逐项原因供模型自纠);
                 // 原「tasks 为空」全局守卫已在前面返回,此处覆盖全废场景。
@@ -179,8 +208,14 @@ pub(super) fn register_agentgo(registry: &ToolRegistry, deps: Arc<ToolDeps>) {
                         .join("; ");
                     return Err(format!("agentgo 未派出任何子任务,逐项原因: {detail}"));
                 }
-                // 兼容既有调用/测试:保留 tasks 键;rejected 为新增键(无非法项时为空数组)
-                Ok(json!({ "ok": true, "tasks": launched, "rejected": rejected }).to_string())
+                // 兼容既有调用/测试:保留 tasks 键;rejected/low_budget 为新增键(无时为空数组)
+                Ok(json!({
+                    "ok": true,
+                    "tasks": launched,
+                    "rejected": rejected,
+                    "low_budget": low_budget,
+                })
+                .to_string())
             })
         }),
     );
@@ -412,7 +447,8 @@ async fn run_subtask_with_tools(
                 (text, Some(out), status)
             }
             Ok(_) => ("(已中断)".to_string(), None, "error"),
-            Err(e) => (e.clone(), None, "error"),
+            // 子任务追踪是字符串契约,分类在此落回文案
+            Err(e) => (e.message().to_string(), None, "error"),
         };
         svc.record_llm_call(
             tid,
@@ -471,7 +507,7 @@ async fn run_subtask_with_tools(
         }
         Err(e) => {
             if !deps.subtasks.is_ended(task_id) {
-                let _ = deps.subtasks.set_error(task_id, &e);
+                let _ = deps.subtasks.set_error(task_id, e.message());
             }
         }
     }
@@ -527,7 +563,7 @@ async fn run_subtask_plain(
         parallel_tool_calls: None,
     };
 
-    let connector = deps.connector.read().await;
+    let connector = deps.connector.read().await.clone();
     let res = connector.generate(messages, params, cancel).await;
     drop(connector);
 
@@ -551,7 +587,7 @@ async fn run_subtask_plain(
         }
         Err(e) => {
             if !deps.subtasks.is_ended(task_id) {
-                let _ = deps.subtasks.set_error(task_id, &e);
+                let _ = deps.subtasks.set_error(task_id, e.message());
             }
         }
     }
@@ -667,6 +703,11 @@ pub(super) fn register_agentend(registry: &ToolRegistry, deps: Arc<ToolDeps>) {
                     return Err("缺少 task_ids 参数".into());
                 }
                 let mut results: Vec<Value> = Vec::new();
+                // 未命中的 id 单独收口(2026-09-15):旧实现恒返回 ok:true,拼错 id 时
+                // 调用方无法从返回体区分「已清理」与「根本没这个任务」,只能细读
+                // 每条结果的 existed 字段。现在 ok 只在「全部命中」时为真,
+                // missing 明确列出未命中的 id,让拼写错误立刻可见。
+                let mut missing: Vec<String> = Vec::new();
                 for id in ids {
                     let id = id.as_str().unwrap_or("").to_string();
                     if id.is_empty() {
@@ -677,24 +718,44 @@ pub(super) fn register_agentend(registry: &ToolRegistry, deps: Arc<ToolDeps>) {
                     // 「任务早已 ended,本次是空操作」同样成立,无法证明中断成功。
                     let rec = deps.subtasks.get(&id);
                     let existed = rec.is_some();
+                    if !existed {
+                        missing.push(id.clone());
+                    }
                     let prior_status = rec
                         .as_ref()
                         .map(|r| r.status.clone())
                         .unwrap_or_default();
-                    let ended = deps.subtasks.end(&id);
-                    // interrupted = 本次调用真实中断了活跃任务(pending/running);
-                    // 判定「本次中断成功」应以本字段(或审计口径的 existed)为准。
-                    let interrupted =
-                        existed && (prior_status == "pending" || prior_status == "running");
+                    // 批次 4:end 返回显式结果(Interrupted / AlreadyFinished / Missing),
+                    // 不再靠 bool + prior_status 反推;终态记录保持原 status 与 result。
+                    let outcome = deps.subtasks.end(&id);
+                    let (ended, interrupted, outcome_label) = match &outcome {
+                        crate::services::agent_subtask_service::SubtaskEndOutcome::Missing => {
+                            (false, false, "missing")
+                        }
+                        crate::services::agent_subtask_service::SubtaskEndOutcome::Interrupted {
+                            ..
+                        } => (true, true, "interrupted"),
+                        crate::services::agent_subtask_service::SubtaskEndOutcome::AlreadyFinished {
+                            ..
+                        } => (true, false, "already_finished"),
+                    };
                     results.push(json!({
                         "task_id": id,
                         "existed": existed,
                         "prior_status": prior_status,
                         "ended": ended,
                         "interrupted": interrupted,
+                        // 显式三态:调用方无需自行组合 existed/prior_status 才能判语义
+                        "outcome": outcome_label,
                     }));
                 }
-                Ok(json!({ "ok": true, "results": results, "session_id": ctx.session_id }).to_string())
+                Ok(json!({
+                    "ok": missing.is_empty(),
+                    "results": results,
+                    "missing": missing,
+                    "session_id": ctx.session_id,
+                })
+                .to_string())
             })
         }),
     );
@@ -757,6 +818,9 @@ pub(super) fn register_todo(registry: &ToolRegistry, deps: Arc<ToolDeps>) {
                             "instruction": t.instruction,
                             "result": t.result,
                             "error": t.error,
+                            // 批次 4:终态时刻一并回显,调用方据 finished_at 判「何时完成」,
+                            // 不必再用 ended 兼表「完成后召回」与「中途中断」
+                            "finished_at": t.finished_at,
                         })
                     })
                     .collect();

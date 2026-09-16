@@ -5,6 +5,7 @@ mod sse_parser;
 #[cfg(test)]
 mod tests;
 
+use crate::models::llm_error::{LlmError, TransportFailure};
 use crate::models::types::{GenerationParams, LlmMessage, LlmStreamChunk};
 use futures::StreamExt;
 use reqwest::Client;
@@ -31,6 +32,22 @@ fn make_client() -> Client {
         .unwrap_or_else(|_| Client::new())
 }
 
+/// reqwest 错误 → 传输失败形态(L1 不感知 reqwest 类型,折算在边界处完成)。
+/// 判定顺序:超时 → 建连 → 响应体 → 请求构造;均不成立按其他传输失败处理。
+fn transport_failure_of(e: &reqwest::Error) -> TransportFailure {
+    if e.is_timeout() {
+        TransportFailure::Timeout
+    } else if e.is_connect() {
+        TransportFailure::Connect
+    } else if e.is_body() {
+        TransportFailure::Body
+    } else if e.is_request() {
+        TransportFailure::Request
+    } else {
+        TransportFailure::Other
+    }
+}
+
 /// 提取 provider host(仅用于日志,不发起请求)
 fn provider_host(base_url: &str) -> String {
     reqwest::Url::parse(base_url)
@@ -39,6 +56,7 @@ fn provider_host(base_url: &str) -> String {
         .unwrap_or_else(|| "invalid-host".into())
 }
 
+#[derive(Clone)]
 pub struct OpenAiCompatibleConnector {
     base_url: String,
     api_key: String,
@@ -189,7 +207,7 @@ impl OpenAiCompatibleConnector {
         messages: &[LlmMessage],
         params: GenerationParams,
         abort: watch::Receiver<bool>,
-    ) -> Result<Vec<LlmStreamChunk>, String> {
+    ) -> Result<Vec<LlmStreamChunk>, LlmError> {
         let (tx, mut rx) = mpsc::unbounded_channel();
         self.generate_stream(messages, params, abort, tx).await?;
         let mut chunks = Vec::new();
@@ -202,13 +220,14 @@ impl OpenAiCompatibleConnector {
     /// 流式生成:网络块到达后立即增量解析并发送,等待读取期间也监听中断。
     /// 自动重试:对 408/429/5xx 与连接错误做指数退避(尊重 Retry-After),仅在
     /// 尚未收到任何可见 token/工具调用前重试(避免重复输出);最大 MAX_ATTEMPTS 次。
+    /// 错误带分类(超时/限流/鉴权/上游/生成),供上层直接映射错误码而无需解析文案。
     pub async fn generate_stream(
         &self,
         messages: &[LlmMessage],
         params: GenerationParams,
         mut abort: watch::Receiver<bool>,
         tx: mpsc::UnboundedSender<LlmStreamChunk>,
-    ) -> Result<(), String> {
+    ) -> Result<(), LlmError> {
         let url = format!("{}/chat/completions", self.base_url);
         let tool_names: Vec<Value> = params
             .tools
@@ -273,7 +292,7 @@ impl OpenAiCompatibleConnector {
         let resp = loop {
             attempt += 1;
             if *abort.borrow() {
-                return Err("生成已中断".into());
+                return Err(LlmError::generation("生成已中断"));
             }
             let req = self
                 .client
@@ -284,7 +303,11 @@ impl OpenAiCompatibleConnector {
             let sent = tokio::time::timeout(REQUEST_TIMEOUT, req.send()).await;
             let resp = match sent {
                 Err(_) => {
-                    let e = format!("请求 OpenAI 兼容接口超时({}s)", REQUEST_TIMEOUT.as_secs());
+                    // 超时无 reqwest 错误可折算,直接判为超时分类(无字符串猜测路径)
+                    let e = LlmError::timeout(format!(
+                        "请求 OpenAI 兼容接口超时({}s)",
+                        REQUEST_TIMEOUT.as_secs()
+                    ));
                     if attempt < MAX_ATTEMPTS {
                         log_retry(&e, attempt);
                         wait_retry(retry_delay(attempt, None), &mut abort).await?;
@@ -293,7 +316,11 @@ impl OpenAiCompatibleConnector {
                     return Err(e);
                 }
                 Ok(Err(e)) => {
-                    let e = format!("请求 OpenAI 兼容接口失败: {e}");
+                    // reqwest 错误在边界处折算为传输形态,分类由 L1 纯映射决定
+                    let e = LlmError::from_transport(
+                        transport_failure_of(&e),
+                        format!("请求 OpenAI 兼容接口失败: {e}"),
+                    );
                     if attempt < MAX_ATTEMPTS {
                         log_retry(&e, attempt);
                         wait_retry(retry_delay(attempt, None), &mut abort).await?;
@@ -321,7 +348,10 @@ impl OpenAiCompatibleConnector {
                 wait_retry(retry_delay(attempt, retry_after), &mut abort).await?;
                 continue;
             }
-            return Err(format!("OpenAI 兼容接口返回 {status}: {truncated}"));
+            return Err(LlmError::from_http_status(
+                status.as_u16(),
+                format!("OpenAI 兼容接口返回 {status}: {truncated}"),
+            ));
         };
 
         let mut parser = SseParser::default();
@@ -334,29 +364,39 @@ impl OpenAiCompatibleConnector {
             tokio::select! {
                 changed = abort.changed() => {
                     if changed.is_err() || *abort.borrow() {
-                        return Err("生成已中断".into());
+                        return Err(LlmError::generation("生成已中断"));
                     }
                 }
                 _ = tokio::time::sleep(STREAM_IDLE_TIMEOUT) => {
                     let waited_ms = read_started.elapsed().as_millis() as u64;
                     tracing::warn!(waited_ms = waited_ms, timeout_s = STREAM_IDLE_TIMEOUT.as_secs(), "SSE 流空闲超时触发");
-                    return Err(format!(
+                    return Err(LlmError::timeout(format!(
                         "上游流停滞超时({}s 未收到任何数据),已中止本次生成",
                         STREAM_IDLE_TIMEOUT.as_secs()
-                    ));
+                    )));
                 }
                 next = stream.next() => match next {
                     Some(Ok(bytes)) => {
                         let mut chunks = Vec::new();
+                        // 解析失败自带分类(非法 UTF-8/JSON、坏工具参数 → 生成层失败;
+                        // 流内上游错误对象按结构化字段分类)
                         parser.push(&bytes, &mut chunks)?;
                         for chunk in chunks {
-                            tx.send(chunk).map_err(|_| "生成接收端已关闭".to_string())?;
+                            // 有意丢弃 SendError:接收端关闭即原因本身,文案已等价表达
+                            tx.send(chunk)
+                                .map_err(|_| LlmError::generation("生成接收端已关闭"))?;
                         }
                         if parser.is_done() {
                             break;
                         }
                     }
-                    Some(Err(e)) => return Err(format!("读取响应失败: {e}")),
+                    Some(Err(e)) => {
+                        // 响应体读取中断(流中途断开)→ 可重试的上游故障
+                        return Err(LlmError::from_transport(
+                            TransportFailure::Body,
+                            format!("读取响应失败: {e}"),
+                        ));
+                    }
                     None => break,
                 }
             }
@@ -364,7 +404,9 @@ impl OpenAiCompatibleConnector {
         let mut chunks = Vec::new();
         parser.finish(&mut chunks)?;
         for chunk in chunks {
-            tx.send(chunk).map_err(|_| "生成接收端已关闭".to_string())?;
+            // 有意丢弃 SendError:接收端关闭即原因本身,文案已等价表达
+            tx.send(chunk)
+                .map_err(|_| LlmError::generation("生成接收端已关闭"))?;
         }
         Ok(())
     }

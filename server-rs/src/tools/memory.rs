@@ -111,16 +111,17 @@ mod tests {
     use crate::models::db::Db;
     use crate::models::types::ToolContext;
     use crate::tools::registry::ToolRegistry;
+    use crate::utils::test_support::TempDataDir;
     use serde_json::json;
 
+    /// 返回 (守卫, ...):解构绑定按**逆序**析构,守卫在前才活到最后(见 test_support 模块头)
     fn setup() -> (
+        TempDataDir,
         ToolRegistry,
         Arc<MemoryService>,
         Arc<SessionService>,
-        std::path::PathBuf,
     ) {
-        let dir = std::env::temp_dir().join(format!("kedai-memory-tool-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = TempDataDir::new("memory-tool");
         let db = Arc::new(Db::open(&dir.join("kedai.db"), &dir).unwrap());
         let memory = Arc::new(MemoryService::new(db.clone()));
         let sessions = Arc::new(SessionService::new(db));
@@ -142,14 +143,14 @@ mod tests {
         }
         let registry = ToolRegistry::new();
         register_memory_tools(&registry, sessions.clone(), memory.clone());
-        (registry, memory, sessions, dir)
+        (dir, registry, memory, sessions)
     }
 
     /// memory 工具写入落 memory_entries(kind='tool',按会话角色归属),
     /// 不再产生旧版会话消息;读取合并新表与旧会话消息记忆。
     #[tokio::test]
     async fn memory_write_lands_in_entries_and_read_merges_legacy() {
-        let (registry, memory, sessions, dir) = setup();
+        let (_dir, registry, memory, sessions) = setup();
         let ctx = ToolContext {
             session_id: "sessM".into(),
             character_id: "charM".into(),
@@ -227,6 +228,5 @@ mod tests {
             .is_err());
 
         drop(registry);
-        std::fs::remove_dir_all(dir).ok();
     }
 }

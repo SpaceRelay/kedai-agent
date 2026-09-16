@@ -2,7 +2,7 @@
 // GET  /api/characters/{id}/contract/history?limit=50  历史列表(最新在前)
 // POST /api/characters/{id}/contract/rollback {"seq": n} 回滚到指定记录
 use crate::api::app_state::AppState;
-use crate::api::db_err;
+use crate::api::{db_err, err_status, not_found};
 use crate::contracts::changelog::ChangelogSource;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
@@ -29,7 +29,7 @@ pub async fn list(
     let records = match state.db_call(move || svc.list(&id, limit)).await {
         Err(e) => return db_err(&e),
         Ok(Ok(records)) => records,
-        Ok(Err(e)) => return err_json(e, StatusCode::INTERNAL_SERVER_ERROR),
+        Ok(Err(e)) => return err_status(e, StatusCode::INTERNAL_SERVER_ERROR),
     };
     let entries = match records
         .iter()
@@ -38,7 +38,7 @@ pub async fn list(
     {
         Ok(entries) => entries,
         Err(e) => {
-            return err_json(
+            return err_status(
                 format!("序列化历史记录失败: {e}"),
                 StatusCode::INTERNAL_SERVER_ERROR,
             )
@@ -58,7 +58,7 @@ pub async fn rollback(
 ) -> Response {
     // 1. 请求体必须为对象且含整数 seq
     let Some(seq) = body.get("seq").and_then(Value::as_i64) else {
-        return err_json("请求体必须包含整数 seq", StatusCode::BAD_REQUEST);
+        return err_status("请求体必须包含整数 seq", StatusCode::BAD_REQUEST);
     };
     // 2. 记录不存在
     let svc = state.contract_changelog.clone();
@@ -66,16 +66,16 @@ pub async fn rollback(
     let record = match state.db_call(move || svc.get(&id_q, seq)).await {
         Err(e) => return db_err(&e),
         Ok(Ok(Some(record))) => record,
-        Ok(Ok(None)) => return err_json("历史记录不存在", StatusCode::NOT_FOUND),
-        Ok(Err(e)) => return err_json(e, StatusCode::INTERNAL_SERVER_ERROR),
+        Ok(Ok(None)) => return err_status("历史记录不存在", StatusCode::NOT_FOUND),
+        Ok(Err(e)) => return err_status(e, StatusCode::INTERNAL_SERVER_ERROR),
     };
     // 3. 该记录无可恢复内容(如 remove 记录)
     let Some(after) = record.after else {
-        return err_json("该记录无可恢复内容", StatusCode::UNPROCESSABLE_ENTITY);
+        return err_status("该记录无可恢复内容", StatusCode::UNPROCESSABLE_ENTITY);
     };
     // 4. 防御性校验(入库时已校验过,理论上不触发)
     if let Err(e) = crate::contracts::parse_contract(&after) {
-        return err_json(e, StatusCode::UNPROCESSABLE_ENTITY);
+        return err_status(e, StatusCode::UNPROCESSABLE_ENTITY);
     }
     // 5. 回滚前当前契约(留痕用;必须在 set_embedded_contract 之前读取)
     let svc = state.characters.clone();
@@ -100,7 +100,7 @@ pub async fn rollback(
     };
     // 6. 写回角色卡
     if set_result.is_none() {
-        return not_found();
+        return not_found("角色卡不存在");
     }
     // 7. 失效契约缓存(下次加载读到恢复后的契约)
     state.invalidate_contracts_for_character(&id);
@@ -139,30 +139,20 @@ pub async fn rollback(
     .into_response()
 }
 
-fn not_found() -> Response {
-    err_json("角色卡不存在", StatusCode::NOT_FOUND)
-}
-
-/// 本模块统一错误响应:按状态码自动附带结构化错误码(见 api/errors.rs)。
-fn err_json(msg: impl AsRef<str>, status: StatusCode) -> Response {
-    crate::api::err_with_code(crate::api::code_for_status(status), msg, status)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::utils::test_support::TempDataDir;
     use axum::body::Body;
     use axum::http::Request;
     use tower::ServiceExt;
 
     /// 构建含契约 CRUD + 历史 + 回滚路由的测试应用,返回 (Router, 共享 AppState)。
-    fn app() -> (axum::Router, Arc<AppState>) {
+    fn app() -> (TempDataDir, axum::Router, Arc<AppState>) {
         let mut config = crate::config::AppConfig::from_env();
         config.auth_required = false;
-        let dir =
-            std::env::temp_dir().join(format!("kedai-contract-history-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
-        config.data_dir = dir;
+        let dir = TempDataDir::new("contract-history");
+        config.data_dir = dir.path().to_path_buf();
         config.connector = "mock".into();
         let state = AppState::new(config).unwrap();
         let router = axum::Router::new()
@@ -181,7 +171,7 @@ mod tests {
                 axum::routing::post(rollback),
             )
             .with_state(state.clone());
-        (router, state)
+        (dir, router, state)
     }
 
     /// 直接插入裸角色记录(不动生产代码接口)
@@ -281,7 +271,7 @@ mod tests {
     /// 1+2:PUT 首次挂载记 contract_init;再次 PUT 记 manual,且 before 为上一版。
     #[tokio::test]
     async fn put_records_init_then_manual() {
-        let (router, state) = app();
+        let (_dir, router, state) = app();
         seed_character(&state, "c-log");
         let v1 = contract_body(1);
         let (status, _) = put_contract(&router, "c-log", &v1).await;
@@ -308,7 +298,7 @@ mod tests {
     /// 3:DELETE 记录 remove(含 before=被移除的契约,after=null)。
     #[tokio::test]
     async fn delete_records_remove() {
-        let (router, state) = app();
+        let (_dir, router, state) = app();
         seed_character(&state, "c-del");
         let v2 = contract_body(2);
         let (status, _) = put_contract(&router, "c-del", &contract_body(1)).await;
@@ -341,7 +331,7 @@ mod tests {
     /// 4:rollback 恢复契约 + 留痕 rollback 记录 + 缓存已失效。
     #[tokio::test]
     async fn rollback_restores_contract_and_records() {
-        let (router, state) = app();
+        let (_dir, router, state) = app();
         seed_character(&state, "c-rb");
         let v1 = contract_body(1);
         let v2 = contract_body(2);
@@ -383,7 +373,7 @@ mod tests {
     /// 5:回滚错误路径(404 / 422 / 400)。
     #[tokio::test]
     async fn rollback_error_paths() {
-        let (router, state) = app();
+        let (_dir, router, state) = app();
         seed_character(&state, "c-err");
         let (status, _) = put_contract(&router, "c-err", &contract_body(1)).await;
         assert_eq!(status, StatusCode::OK);
@@ -424,7 +414,7 @@ mod tests {
     /// 建议 2:无内嵌契约的角色 DELETE → 幂等 204,不落空 remove 记录、不失效缓存。
     #[tokio::test]
     async fn delete_without_contract_is_noop() {
-        let (router, state) = app();
+        let (_dir, router, state) = app();
         seed_character(&state, "c-noc");
         let resp = router
             .clone()
@@ -451,7 +441,7 @@ mod tests {
     /// 6:list limit 生效:写 3 条,limit=2 返回最新 2 条(倒序)。
     #[tokio::test]
     async fn history_limit_applies() {
-        let (router, state) = app();
+        let (_dir, router, state) = app();
         seed_character(&state, "c-lim");
         for version in 1..=3 {
             let (status, _) = put_contract(&router, "c-lim", &contract_body(version)).await;
@@ -468,7 +458,7 @@ mod tests {
     /// 7:history GET 全链路:字段名 camelCase,最新在前。
     #[tokio::test]
     async fn history_get_full_chain() {
-        let (router, state) = app();
+        let (_dir, router, state) = app();
         seed_character(&state, "c-his");
         let v1 = contract_body(1);
         let (status, _) = put_contract(&router, "c-his", &v1).await;

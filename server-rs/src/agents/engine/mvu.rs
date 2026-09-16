@@ -301,7 +301,7 @@ pub(super) async fn generate_mvu_status(
     let mvu_temperature = engine.settings_snapshot().mvu_temperature.unwrap_or(0.3);
     p.temperature = mvu_temperature;
     p.tools = mvu_status_tools();
-    let connector = engine.connector.read().await;
+    let connector = engine.connector.read().await.clone();
     let mut out = generate_status_call(&connector, &messages, &p, abort).await?;
     // deepseek 偶发空输出:提高温度重试一次(重试兜底固定 0.7,与独立温度档语义分离)
     if out.text.trim().is_empty() && out.tool_calls.is_empty() {

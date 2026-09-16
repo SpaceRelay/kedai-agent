@@ -1,14 +1,13 @@
 // 引擎事件桥:任务模式没有聊天 SSE 客户端,引擎(execute_generation/run_tool_loop)
 // 只认 mpsc::Sender<SseEvent>。此处自建通道 + drain 任务,把引擎事件翻译为任务事件
 // (SseEvent::Task kind=agent_status)经 TaskService broadcast 转发到任务事件流,
-// 供「调用情况」面板/事件监控观察主 agent 进度(docs/任务引擎六模式.md 第三节·5)。
+// 供「调用情况」面板/事件监控观察主 agent 进度(docs/功能.md 第三节·5)。
 // label 为事件文案的执行者称谓(「主 agent」/team 的「主 agent N」/「子 agent」)。
 // 批次 R4:Token 不再只计字数丢弃,改经 DeltaBatcher 攒批(200ms/80 字先到先发)
 // 转发为 kind=delta 暂态事件,前端任务工作台据此实时显示「正在生成」;
 // 攒批器携带 phase/step_index 调用上下文(与 task_llm_calls 落库行同口径)。
-use crate::models::types::SseEvent;
-use crate::services::task_service::events::DELTA_FLUSH_WINDOW;
-use crate::services::task_service::TaskService;
+use crate::models::types::{SseEvent, TaskEventKind};
+use crate::services::task_core::{TaskBackend, DELTA_FLUSH_WINDOW};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -29,7 +28,7 @@ const DETAIL_MAX_CHARS: usize = 200;
 /// team 主 agent 复用同桥、step_index 为子目标全局下标;custom 工具步骤 phase=step;
 /// 子 agent phase=subagent),随 delta 事件透出供前端缓冲归键。
 pub(crate) fn spawn(
-    svc: Arc<TaskService>,
+    svc: Arc<dyn TaskBackend>,
     task_id: String,
     label: &str,
     phase: &str,
@@ -60,7 +59,7 @@ pub(crate) fn spawn(
                             // 事件边界先落批:保证 delta 先于后续状态/收尾事件到达前端
                             batcher.flush();
                             if let Some(detail) = map_event(&ev, streamed_chars, &label) {
-                                svc.emit_event("agent_status", &task_id, None, None, Some(detail));
+                                svc.emit_event(TaskEventKind::AgentStatus, &task_id, None, None, Some(detail));
                             }
                         }
                         None => break,
@@ -138,7 +137,10 @@ mod tests {
         };
         let detail = map_event(&ev, 0, "主 agent").unwrap();
         assert!(detail.contains("被任务策略拒绝"), "实际:{detail}");
-        assert!(detail.contains("写入角色文件 a.md"), "应带上拒绝理由,实际:{detail}");
+        assert!(
+            detail.contains("写入角色文件 a.md"),
+            "应带上拒绝理由,实际:{detail}"
+        );
     }
 
     #[test]

@@ -1,4 +1,4 @@
-// MCP stdio 客户端管理(批次 6.2,L3 隔离;docs/ARCHITECTURE-3H.md §4)。
+// MCP stdio 客户端管理(批次 6.2;L3 隔离;docs/契约-架构与数据.md §2.5)。
 //
 // 边界:v1 只做 stdio transport + tools(不做 SSE/HTTP,不做 resources/prompts);
 // 仅在启动时装配(mcp_enabled=false 时完全跳过:零进程、零注册),运行期改设置
@@ -6,12 +6,22 @@
 //
 // 权限:MCP 工具名带 mcp_ 前缀,不命中任何内建分类——permissions.rs default_risk
 // 的「未知工具按 Dangerous 处理」自动覆盖全部 MCP 工具,无需额外分类工作。
+//
+// ## 代际纪律(L3 青层·活;2026-09-14 依赖倒置)
+//
+// 本模块**只依赖 L1**:配置词汇(`models::tool_policy::McpServerConfig`)、
+// 工具定义与注册窄接口(`models::types::{ToolDefinition, ToolExecutor, ToolRegistrar}`)。
+// 它**不再** `use crate::services::` 或 `use crate::tools::`——L3 不得依赖 L2。
+//
+// 配置的获取方式随之改变:宿主(组合根)读设置后,把 `Vec<McpServerConfig>` **传参**进来,
+// 而不是让本模块自己去读 `RuntimeSettings`（后者是 L2 类型）。注册工具则经
+// `&dyn ToolRegistrar` 由宿主注入,而非直接持有 L2 的 `ToolRegistry`。
+// 这与 `task_core::TaskBackend` 断开 `task_engine→task_service` 是同一手法。
 pub mod client;
 pub mod process;
 
-use crate::models::types::ToolDefinition;
-use crate::services::settings_service::{McpServerConfig, RuntimeSettings};
-use crate::tools::registry::{ToolExecutor, ToolRegistry};
+use crate::models::tool_policy::McpServerConfig;
+use crate::models::types::{ToolDefinition, ToolExecutor, ToolRegistrar};
 use futures::future::BoxFuture;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -54,16 +64,15 @@ impl McpManager {
         self.servers.lock().unwrap_or_else(|e| e.into_inner()).len()
     }
 
-    /// 启动装配:遍历设置里的启用服务器,逐个 spawn → 握手 → tools/list → 注册工具。
+    /// 启动装配:遍历给定的启用服务器,逐个 spawn → 握手 → tools/list → 注册工具。
+    ///
+    /// **入参而非自读设置**:`servers` 由宿主(组合根)从 `RuntimeSettings` 过滤 `enabled`
+    /// 后传入;`registry` 是 L1 的窄接口 `&dyn ToolRegistrar`,由 L2 注册表实现。
+    /// 这样本模块（L3）不依赖任何 L2 类型。
+    ///
     /// 单台失败(spawn 失败/握手超时/协议错误)记 warn 并禁用该台,不影响其余服务器,
     /// 不 panic、不阻断整体启动(单台最坏耗时 = initialize 30s 超时,有界)。
-    pub async fn start(&self, settings: &RuntimeSettings, registry: &ToolRegistry) {
-        let servers: Vec<McpServerConfig> = settings
-            .mcp_servers
-            .iter()
-            .filter(|s| s.enabled)
-            .cloned()
-            .collect();
+    pub async fn start(&self, servers: Vec<McpServerConfig>, registry: &dyn ToolRegistrar) {
         if servers.is_empty() {
             return;
         }
@@ -90,15 +99,16 @@ impl McpManager {
         }
     }
 
-    /// 装配单台:握手(initialize)→ tools/list → 逐工具注册进 ToolRegistry。
+    /// 装配单台:握手(initialize)→ tools/list → 逐工具注册。
     /// 返回注册工具数;任何一步失败即 kill 进程并 Err(调用方记 warn 禁用)。
     /// process 为 None 是内存管测试路径(无进程可杀)。
+    /// registry 为 L1 窄接口,由宿主注入(见 [`crate::models::types::ToolRegistrar`])。
     async fn attach(
         &self,
         name: String,
         client: McpClient,
         process: Option<McpProcess>,
-        registry: &ToolRegistry,
+        registry: &dyn ToolRegistrar,
     ) -> Result<usize, String> {
         let client = Arc::new(client);
         let tools = async {
@@ -144,7 +154,7 @@ impl McpManager {
                 definition,
                 execute,
                 Some(MCP_TOOL_TIMEOUT),
-                crate::tools::action_class::ToolOrigin::Mcp,
+                crate::models::tool_policy::ToolOrigin::Mcp,
             );
             registered += 1;
         }
@@ -234,8 +244,13 @@ fn prefixed_tool_name(sanitized_server: &str, tool: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::tool_policy::ToolRisk;
     use crate::models::types::ToolContext;
-    use crate::tools::permissions::{PermissionDecision, ToolRisk};
+    // 测试自建真实注册表(McpManager::start 的装配行为需断言真实注册表状态);
+    // 生产代码不依赖 tools —— 见本文件头部「代际纪律」。
+    use crate::services::settings_service::RuntimeSettings;
+    use crate::tools::permissions::PermissionDecision;
+    use crate::tools::registry::ToolRegistry;
     use serde_json::json;
     use tokio::io::AsyncBufReadExt;
     use tokio::io::{duplex, AsyncWriteExt, BufReader, DuplexStream};
@@ -323,6 +338,11 @@ mod tests {
     }
 
     /// 空配置/全禁用:start 零注册、零服务器(默认关路径的零副作用保证)
+    ///
+    /// 代际倒置后 `start` 收「已过滤的服务器列表」,故本测试分两段断言:
+    /// ① 空列表(等价于 `mcp_enabled=false` 或设置里无服务器)→ 零副作用;
+    /// ② **宿主过滤语义**:`enabled=false` 的条目必须被宿主滤掉,不得进入 `start`。
+    ///    过滤动作在组合根(`api/app_state.rs`),此处以同一规则复现并锁定契约。
     #[tokio::test]
     async fn start_with_empty_or_disabled_config_is_noop() {
         let reg = ToolRegistry::new();
@@ -334,7 +354,15 @@ mod tests {
             args: vec![],
             enabled: false, // 显式禁用:不应起进程
         }];
-        mgr.start(&settings, &reg).await;
+        // 宿主过滤规则(与 api/app_state.rs 的启动装配一致)
+        let servers: Vec<McpServerConfig> = settings
+            .mcp_servers
+            .iter()
+            .filter(|s| s.enabled)
+            .cloned()
+            .collect();
+        assert!(servers.is_empty(), "enabled=false 的服务器应被宿主滤除");
+        mgr.start(servers, &reg).await;
         assert_eq!(mgr.server_count(), 0);
         assert!(reg.list_definitions().is_empty(), "不应注册任何工具");
     }

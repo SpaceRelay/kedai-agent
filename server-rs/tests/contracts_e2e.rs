@@ -20,9 +20,11 @@ fn test_app() -> &'static axum::Router {
     // 与 tests/assistant.rs 同款隔离:运行时主提示词目录指向空目录
     static INIT: std::sync::Once = std::sync::Once::new();
     INIT.call_once(|| {
-        let dir = std::env::temp_dir().join("kedai-test-runtime-prompt-empty");
-        std::fs::create_dir_all(&dir).unwrap();
-        std::env::set_var("KEDAI_RUNTIME_PROMPT_DIR", &dir);
+        // uuid 唯一名(避免多测试二进制并发共用同名目录);守卫随本闭包析构即回收。
+        // 目录是否存在不影响语义:with_dir 关闭内置默认回退,读不到文件即视为「无提示词」,
+        // 与「指向一个空目录」等价(全仓无测试写该文件)。
+        let dir = kedai_server::utils::test_support::TempDataDir::new("test-runtime-prompt-empty");
+        std::env::set_var("KEDAI_RUNTIME_PROMPT_DIR", dir.path());
     });
     APP.get_or_init(|| build_test_app().expect("构建测试应用失败"))
 }
@@ -232,6 +234,7 @@ async fn session_id_for(app: &axum::Router, cid: &str) -> String {
 /// 读取该会话的 kaleido_changelog(解析 entry_json;按 seq 升序返回)
 async fn kaleido_entries(app: &axum::Router, sid: &str) -> Vec<Value> {
     let _ = app;
+    // build_test_app 的进程级共享数据目录(只读直查测试库,不建目录)
     let data_dir = std::env::temp_dir().join(format!("kedai-test-{}", std::process::id()));
     let db = data_dir.join("kedai.db");
     // 直查测试库(app 与被测服务共享同一 data_dir;只读打开避免锁冲突)
@@ -254,6 +257,7 @@ async fn kaleido_entries(app: &axum::Router, sid: &str) -> Vec<Value> {
 /// 读取该会话的 kaleido_state 行(无行返回 None)
 async fn kaleido_state_row(app: &axum::Router, sid: &str) -> Option<Value> {
     let _ = app;
+    // build_test_app 的进程级共享数据目录(只读直查测试库,不建目录)
     let data_dir = std::env::temp_dir().join(format!("kedai-test-{}", std::process::id()));
     let db = data_dir.join("kedai.db");
     let conn = rusqlite::Connection::open_with_flags(

@@ -140,7 +140,7 @@ async fn mock_auto_switches_to_openai_on_save() {
     assert_eq!(conn["fallback_used"], json!(false));
     assert_eq!(conn["http_status"], json!(200));
 
-    // 持久化文件包含保存的配置
+    // 持久化文件包含保存的配置(build_test_app 的进程级共享数据目录;只读断言,不建目录)
     let settings_path = std::env::temp_dir()
         .join(format!("kedai-test-{}", std::process::id()))
         .join("settings.json");
@@ -199,7 +199,7 @@ async fn task_overlay_does_not_leak_into_roleplay_settings() {
     assert_eq!(rp_after["agent_system_prompt"], flat_before);
 }
 
-/// 提示词预览按模式合并(批次 2,docs/模式提示词边界.md 第五节):
+/// 提示词预览按模式合并(批次 2,docs/契约-协议与配置.md 第五节):
 /// task 模式追加规划器/执行者/汇总者三层固定提示词层(文本与 task_service/prompt.rs
 /// 单一来源逐字一致,预览即真实下发);roleplay(缺省)不含。三层为内置指令,
 /// 恒注入,与 task 覆盖层状态无关(共享 app 下不受同 binary 其他测试写动影响)。
@@ -373,7 +373,12 @@ async fn roleplay_default_prompt_visible_on_fresh_install() {
     assert_eq!(status, StatusCode::OK);
     let p = s["agent_system_prompt"].as_str().unwrap_or("");
     assert!(!p.trim().is_empty(), "首装角色扮演默认提示词不得为空: {s}");
-    for ph in ["{{char}}", "{{personality}}", "{{scenario}}", "{{world_info}}"] {
+    for ph in [
+        "{{char}}",
+        "{{personality}}",
+        "{{scenario}}",
+        "{{world_info}}",
+    ] {
         assert!(p.contains(ph), "默认词应含占位符 {ph} 供宏展开");
     }
     assert!(p.contains("【创作总纲】"), "默认词应含创作总纲段: {p:.80}");
@@ -382,5 +387,8 @@ async fn roleplay_default_prompt_visible_on_fresh_install() {
     let (_, t) = send_json(app, "GET", "/api/settings?mode=task", json!({})).await;
     let tp = t["agent_system_prompt"].as_str().unwrap_or("");
     assert!(!tp.trim().is_empty(), "task 缺省应有任务向默认词: {t}");
-    assert!(!tp.contains("{{char}}"), "task 默认词不得继承角色扮演宏: {tp:.80}");
+    assert!(
+        !tp.contains("{{char}}"),
+        "task 默认词不得继承角色扮演宏: {tp:.80}"
+    );
 }

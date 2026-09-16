@@ -118,6 +118,8 @@ impl Parser {
             }
         }
         let text = String::from_utf8_lossy(&self.s[start..self.pos]).to_string();
+        // 有意丢弃 ParseFloatError:唯一信息是「这段不是数字」,位置 start 已在消息中,
+        // 由用户修正表达式
         text.parse::<f64>()
             .map_err(|_| format!("位置 {} 处期望数字", start))
     }

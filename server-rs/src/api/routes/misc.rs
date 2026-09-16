@@ -2,8 +2,8 @@
 // (自 api/mod.rs build_router 迁入)
 use crate::api::app_state::AppState;
 use crate::api::{
-    audio, characters, import_export, macros, plugins, resource, skills, slash_commands, tasks,
-    user_scripts,
+    audio, characters, exec, import_export, macros, plugins, resource, skills, slash_commands,
+    tasks, user_scripts,
 };
 use axum::routing::{get, post, put};
 use axum::Router;
@@ -11,6 +11,12 @@ use std::sync::Arc;
 
 pub(crate) fn misc_routes() -> Router<Arc<AppState>> {
     Router::new()
+        // 命令执行审计与执行器状态(阶段 B/E)
+        .route("/api/exec/tier", get(exec::tier))
+        .route(
+            "/api/exec/audit",
+            get(exec::list_audit).delete(exec::clear_audit),
+        )
         // 角色卡
         .route("/api/characters", get(characters::list))
         .route("/api/characters/upload", post(characters::upload))
@@ -64,6 +70,18 @@ pub(crate) fn misc_routes() -> Router<Arc<AppState>> {
         .route(
             "/api/scripts/tree",
             get(user_scripts::get_tree).put(user_scripts::save_tree),
+        )
+        // 角色卡脚本授权台账(2026-09-14,known-limitations L12 后端授权门)
+        // GET 查询授权态(含后端实时计算的 current_hash)/ PUT 授权 / DELETE 撤销
+        .route(
+            "/api/script-authorizations",
+            get(user_scripts::get_authorization)
+                .put(user_scripts::grant_authorization)
+                .delete(user_scripts::revoke_authorization),
+        )
+        .route(
+            "/api/script-authorizations/list",
+            get(user_scripts::list_authorizations),
         )
         // slash 命令清单(阶段四 4a):前端输入框联想
         .route("/api/slash/commands", get(slash_commands::list_commands))

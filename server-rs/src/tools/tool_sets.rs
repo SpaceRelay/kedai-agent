@@ -16,7 +16,14 @@ pub const READONLY_SCOUT: &[&str] = &["read", "search", "memory_read", "calculat
 
 /// 子智能体工具白名单:读/搜索类安全工具;写类与编排类一律剔除
 /// (子 agent 不得再派子 agent;嵌套由白名单与深度守卫双重排除)。
-pub const SUBAGENT: &[&str] = &["read", "search", "todo", "sleep", "calculator", "memory_read"];
+pub const SUBAGENT: &[&str] = &[
+    "read",
+    "search",
+    "todo",
+    "sleep",
+    "calculator",
+    "memory_read",
+];
 
 /// 反思阶段工具白名单:仅禁词替换与定点修订;dirty 文本修正不引入检索类工具。
 pub const REFLECT: &[&str] = &["censor_text", "revise_passage"];
@@ -75,7 +82,11 @@ mod tests {
         let defs = vec![def("write"), def("read"), def("search")];
         let out = filter_by_names(
             defs,
-            &["read".to_string(), "search".to_string(), "missing".to_string()],
+            &[
+                "read".to_string(),
+                "search".to_string(),
+                "missing".to_string(),
+            ],
         );
         let names: Vec<&str> = out.iter().map(|d| d.name.as_str()).collect();
         assert_eq!(names, vec!["read", "search"]);
@@ -93,10 +104,20 @@ mod tests {
     #[test]
     fn constants_match_legacy_literals() {
         assert_eq!(META_TOOLS, &["get_state", "apply_patch"]);
-        assert_eq!(READONLY_SCOUT, &["read", "search", "memory_read", "calculator"]);
+        assert_eq!(
+            READONLY_SCOUT,
+            &["read", "search", "memory_read", "calculator"]
+        );
         assert_eq!(
             SUBAGENT,
-            &["read", "search", "todo", "sleep", "calculator", "memory_read"]
+            &[
+                "read",
+                "search",
+                "todo",
+                "sleep",
+                "calculator",
+                "memory_read"
+            ]
         );
         assert_eq!(REFLECT, &["censor_text", "revise_passage"]);
     }

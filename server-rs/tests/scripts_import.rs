@@ -1,6 +1,10 @@
 // 阶段六 6g-2 集成测试:后端脚本经 TavernHelper.importRaw*(character/worldbook/preset/chat)
 // 直接调用引擎各 service(绕过 HTTP)。脚本在「消息生成完成后」执行(mock 连接器);
 // 合法导入落库可见;缺 session_id / 不支持类型抛异常,仅记日志不中断主流程。
+//
+// **授权门(2026-09-14,known-limitations L12)**:角色卡脚本默认 fail-closed,不授权则
+// 后端根本不执行——importRaw* 正是被授权门保护的「写数据」能力。故此处每例都先走
+// 「GET 取 current_hash → PUT 授权」的真实流程(见 grant_card_scripts)。
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
@@ -59,7 +63,33 @@ async fn upload_character(app: &axum::Router) -> String {
     char["id"].as_str().unwrap().to_string()
 }
 
-/// 保存角色脚本树,并返回会话 id
+/// 走真实授权流程:GET 取后端计算的 current_hash → PUT 回传授权。
+/// 角色卡脚本默认 fail-closed,不调用本函数则后端不会执行该卡任何脚本。
+async fn grant_card_scripts(app: &axum::Router, cid: &str) {
+    let (status, got) = send_json(
+        app,
+        "GET",
+        &format!("/api/script-authorizations?character_id={cid}"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "查询授权态应 200: {got}");
+    let hash = got["current_hash"]
+        .as_str()
+        .expect("应返回 current_hash")
+        .to_string();
+    assert!(!hash.is_empty(), "有脚本时 current_hash 不应为空");
+    let (status, granted) = send_json(
+        app,
+        "PUT",
+        "/api/script-authorizations",
+        json!({ "character_id": cid, "script_hash": hash }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "授权应 200: {granted}");
+}
+
+/// 保存角色脚本树(并授权),返回会话 id
 async fn setup_session_with_scripts(app: &axum::Router, cid: &str, trees: Value) -> String {
     let (status, _) = send_json(
         app,
@@ -69,6 +99,8 @@ async fn setup_session_with_scripts(app: &axum::Router, cid: &str, trees: Value)
     )
     .await;
     assert_eq!(status, StatusCode::OK, "保存脚本树应成功");
+    // 保存后即授权:哈希绑定刚写入的脚本内容
+    grant_card_scripts(app, cid).await;
     let (_, session) = send_json(
         app,
         "POST",
@@ -141,6 +173,8 @@ async fn script_imports_character_and_chat() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "保存脚本树应成功");
+    // 授权门:不授权则后端不执行这些 importRaw* 脚本(它们正是被保护的能力)
+    grant_card_scripts(app, &cid).await;
 
     send_chat_ok(app, &sid, &cid).await;
 

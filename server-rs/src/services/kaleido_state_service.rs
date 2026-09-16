@@ -50,7 +50,8 @@ impl KaleidoStateService {
                 let meta: KaleidoMeta = serde_json::from_str(&meta_json)
                     .map_err(|e| format!("解析契约运行态 meta 失败: {e}"))?;
                 Ok(Some((
-                    u32::try_from(version).map_err(|_| "契约版本越界".to_string())?,
+                    // 补回原值:仅「越界」无法定位是脏数据还是旧库残留
+                    u32::try_from(version).map_err(|_| format!("契约版本越界:{version}"))?,
                     meta,
                 )))
             }
@@ -84,10 +85,11 @@ impl KaleidoStateService {
             return Ok(None);
         };
         Ok(Some(KaleidoStateRow {
-            contract_version: u32::try_from(version).map_err(|_| "契约版本越界".to_string())?,
+            contract_version: u32::try_from(version)
+                .map_err(|_| format!("契约版本越界:{version}"))?,
             stat_data,
             meta_json,
-            revision_seq: u64::try_from(seq).map_err(|_| "运行态序号越界".to_string())?,
+            revision_seq: u64::try_from(seq).map_err(|_| format!("运行态序号越界:{seq}"))?,
             revision_hash: hash,
             updated_at,
         }))
@@ -125,10 +127,10 @@ impl KaleidoStateService {
             )
             .map_err(|e| format!("写入契约运行态变更记录失败: {e}"))?;
             // 回填权威 seq(表内自增主键),供回滚/重放按 seq 定位
-            let seq = tx
-                .last_insert_rowid()
+            let rowid = tx.last_insert_rowid();
+            let seq = rowid
                 .try_into()
-                .map_err(|_| "变更序号越界".to_string())?;
+                .map_err(|_| format!("变更序号越界:{rowid}"))?;
             entry.seq = seq;
             // seq 已知后再序列化落库:读出的 entry_json 自带权威 seq
             tx.execute(

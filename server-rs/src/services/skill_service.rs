@@ -2,7 +2,7 @@
 // 渐进披露(落地项 3):system 只注入 name+description 紧凑清单(skill_manifest),
 // 正文按需经 read(type=skill) 读取;allowed_tools/run_as_subagent/model 为
 // 子智能体调度增强预留元数据(旧库缺列由迁移补默认)。
-use super::log_query_failure;
+use super::{log_query_failure, log_read_pool_failure};
 use crate::models::db::{now_iso, Db};
 use crate::models::types::SkillRecord;
 use rusqlite::{params, OptionalExtension};
@@ -77,7 +77,10 @@ impl SkillService {
     }
 
     pub fn list(&self, only_enabled: bool) -> Vec<SkillRecord> {
-        let conn = self.db.read().expect("获取只读连接失败");
+        let conn = match self.db.read() {
+            Ok(c) => c,
+            Err(e) => return log_read_pool_failure("技能列表", e),
+        };
         let sql = if only_enabled {
             "SELECT id, name, description, content, enabled, created_at, allowed_tools, run_as_subagent, model FROM skills WHERE enabled = 1 ORDER BY name ASC"
         } else {
@@ -221,16 +224,13 @@ impl SkillService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::utils::test_support::TempDataDir;
 
-    fn service() -> SkillService {
-        let dir = std::env::temp_dir().join(format!(
-            "kedai-skill-test-{}-{}",
-            std::process::id(),
-            uuid::Uuid::new_v4()
-        ));
-        let _ = std::fs::create_dir_all(&dir);
+    /// 返回 (守卫, 服务):解构绑定按**逆序**析构,守卫在前才活到最后(见 test_support 模块头)
+    fn service() -> (TempDataDir, SkillService) {
+        let dir = TempDataDir::new("skill-test");
         let db = Arc::new(Db::open(&dir.join("t.db"), &dir).unwrap());
-        SkillService::new(db)
+        (dir, SkillService::new(db))
     }
 
     /// 渐进披露清单:格式固定「- name:description」,按 name 稳定排序,
@@ -308,7 +308,7 @@ mod tests {
     /// 旧格式(缺字段)导入回退默认;更新接口可改 enabled 与新字段;往返一致。
     #[test]
     fn import_and_update_progressive_metadata() {
-        let svc = service();
+        let (_dir, svc) = service();
         // 旧格式导入:缺三个新字段 → 默认 [] / false / ''
         svc.import(vec![SkillImport {
             name: "旧技能".into(),

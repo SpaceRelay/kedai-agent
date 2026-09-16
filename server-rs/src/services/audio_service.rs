@@ -213,13 +213,12 @@ fn validate_audio_url(url: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::utils::test_support::TempDataDir;
     use std::fs;
 
-    fn temp_dir(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("kedai-audio-{}-{}", std::process::id(), tag));
-        let _ = fs::remove_dir_all(&dir);
-        let _ = fs::create_dir_all(&dir);
-        dir
+    /// 隔离临时数据目录(uuid 唯一:此前按 pid 命名会被同进程内并发测试共用)
+    fn temp_dir(tag: &str) -> TempDataDir {
+        TempDataDir::new(&format!("audio-{tag}"))
     }
 
     #[test]
@@ -236,7 +235,7 @@ mod tests {
     #[test]
     fn save_then_load_roundtrip() {
         let dir = temp_dir("roundtrip");
-        let mut service = AudioService::new(dir.clone());
+        let mut service = AudioService::new(dir.path().to_path_buf());
         service
             .update_playlist(
                 AudioChannel::Bgm,
@@ -256,27 +255,25 @@ mod tests {
             )
             .unwrap();
 
-        let reloaded = AudioService::new(dir.clone());
+        let reloaded = AudioService::new(dir.path().to_path_buf());
         let state = reloaded.get();
         assert_eq!(state.bgm.playlist.len(), 1);
         assert_eq!(state.bgm.playlist[0].title, "开场曲");
         assert_eq!(state.ambient.volume, 80);
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn corrupted_file_falls_back_to_default() {
         let dir = temp_dir("corrupt");
         fs::write(dir.join("audio.json"), "{ 不是合法 JSON").unwrap();
-        let service = AudioService::new(dir.clone());
+        let service = AudioService::new(dir.path().to_path_buf());
         assert_eq!(service.get().bgm.mode, AudioMode::RepeatAll);
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn volume_clamped_to_100() {
         let dir = temp_dir("volume");
-        let mut service = AudioService::new(dir.clone());
+        let mut service = AudioService::new(dir.path().to_path_buf());
         service
             .update_settings(
                 AudioChannel::Bgm,
@@ -287,13 +284,12 @@ mod tests {
             )
             .unwrap();
         assert_eq!(service.get().bgm.volume, 100);
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn playlist_rejects_disallowed_schemes() {
         let dir = temp_dir("scheme");
-        let mut service = AudioService::new(dir.clone());
+        let mut service = AudioService::new(dir.path().to_path_buf());
         let err = service
             .update_playlist(
                 AudioChannel::Bgm,
@@ -307,7 +303,6 @@ mod tests {
         // 校验失败不落盘、不改内存
         assert!(service.get().bgm.playlist.is_empty());
         assert!(!dir.join("audio.json").exists());
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -320,7 +315,7 @@ mod tests {
     #[test]
     fn settings_patch_merges_partial_fields() {
         let dir = temp_dir("patch");
-        let mut service = AudioService::new(dir.clone());
+        let mut service = AudioService::new(dir.path().to_path_buf());
         // 只改 muted,其余保持默认
         service
             .update_settings(
@@ -335,6 +330,5 @@ mod tests {
         assert!(state.bgm.muted);
         assert_eq!(state.bgm.volume, 50);
         assert_eq!(state.bgm.mode, AudioMode::RepeatAll);
-        let _ = fs::remove_dir_all(&dir);
     }
 }

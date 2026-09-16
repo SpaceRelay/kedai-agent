@@ -6,18 +6,17 @@
 // 续跑执行段复用 solo 的 run_agent_loop 与 legacy 的 summarize_task_retry(语义对齐)。
 // 结果契约(批次 R1):
 // - planned 态:计划清单文本(「计划已产出,共 N 步:…」)落 tasks.result,语义 =
-//   待批准的计划清单(批准前预览;由 task_engine/mod.rs 的 AwaitApproval 分支经
-//   planned_mode_run 写入,只更新 result 列、不动状态);
+//   待批准的计划清单(批准前预览;经 TaskTerminal::AwaitApproval →
+//   finalize_terminal → planned_mode_run 写入,只更新 result 列、不动状态);
 // - 续跑完成:result = 汇总文本 + "\n\n## 最终计划\n" + 最终计划段(每步:名称、
 //   状态 done/error、result 概要按字符截断 ≤200),前端按 `## ` 段拆成独立卡
 //   (对齐 team.rs「## 审计结论」拆卡契约;两模式 result 段结构各自独立)。
 use super::context::TaskRunContext;
-use super::executor::{usage_as_output, ModeExecutor, TaskOutcome};
+use super::executor::{usage_as_output, ModeExecutor};
 use super::solo::{run_agent_loop, AgentLoopCall};
 use crate::agents::engine::AgentEngine;
-use crate::models::types::{TaskStatus, TaskStep, TaskStepStatus, TokenUsage};
-use crate::services::task_service::executor::{plan_task_retry, summarize_task_retry};
-use crate::services::task_service::TaskService;
+use crate::models::types::{TaskEventKind, TaskStatus, TaskStep, TaskStepStatus, TokenUsage};
+use crate::services::task_core::{TaskBackend, TaskTerminal};
 use futures::future::BoxFuture;
 use std::sync::Arc;
 
@@ -28,7 +27,7 @@ use std::sync::Arc;
 /// summarize_task_retry(SUMMARIZER_PROMPT + 空输出分级重试)汇总产出最终 result;
 /// 含 error 步骤时终态 partial(对齐 legacy「有产出则 partial」语义)。
 pub(crate) struct ApprovedPlanExecutor {
-    svc: Arc<TaskService>,
+    svc: Arc<dyn TaskBackend>,
     engine: Arc<AgentEngine>,
     /// 已批准计划(approve 处已落库,可为用户修改版)
     plan: Vec<TaskStep>,
@@ -36,14 +35,14 @@ pub(crate) struct ApprovedPlanExecutor {
 
 impl ApprovedPlanExecutor {
     pub(crate) fn new(
-        svc: Arc<TaskService>,
+        svc: Arc<dyn TaskBackend>,
         engine: Arc<AgentEngine>,
         plan: Vec<TaskStep>,
     ) -> Self {
         ApprovedPlanExecutor { svc, engine, plan }
     }
 
-    async fn run_inner(&self, ctx: TaskRunContext) -> Result<TaskOutcome, String> {
+    async fn run_inner(&self, ctx: TaskRunContext) -> Result<(TaskTerminal, TokenUsage), String> {
         let svc = &self.svc;
         let mut total = TokenUsage::default();
         let mut plan = self.plan.clone();
@@ -117,29 +116,34 @@ impl ApprovedPlanExecutor {
         let Some(task) = svc.get(&ctx.task_id) else {
             return Err("任务不存在".into());
         };
-        let out = summarize_task_retry(svc, &task, &plan, &ctx.cancel).await?;
+        let out =
+            super::retry::summarize_task_retry(svc.as_ref(), &task, &plan, &ctx.cancel).await?;
         svc.record_usage(&ctx.task_id, "summary", None, &out);
         total.prompt_tokens += out.prompt_tokens;
         total.completion_tokens += out.completion_tokens;
         total.total_tokens += out.prompt_tokens + out.completion_tokens;
         // 结果契约(批次 R1,对齐 team.rs「## 审计结论」拆卡):result = 汇总文本 +
         // 「## 最终计划」段(各步名称/状态/result 概要);planned 态写入的计划清单
-        // 文本由 complete_mode_run 以此整体覆盖
+        // 文本由 TaskTerminal::Complete → complete_mode_run 以此整体覆盖
         let text = format!(
             "{}\n\n## 最终计划\n{}",
             out.text.trim(),
             format_final_plan_section(&plan)
         );
-        Ok(TaskOutcome {
-            text,
-            usage: total,
-            status: if had_error {
-                Some(TaskStatus::Partial)
-            } else {
-                None
+        // 含 error 步骤但成果已产出 → partial(对齐 legacy「有产出则 partial」语义)
+        let status = if had_error {
+            TaskStatus::Partial
+        } else {
+            TaskStatus::Done
+        };
+        Ok((
+            TaskTerminal::Complete {
+                result: text,
+                status,
+                error: None,
             },
-            error: None,
-        })
+            total,
+        ))
     }
 }
 
@@ -174,7 +178,7 @@ fn format_final_plan_section(plan: &[TaskStep]) -> String {
 /// 收尾只写任务终态,步骤态归执行器负责,不留永远 pending 的步骤)。
 /// 本执行器单线程逐步推进,取消检查点不存在 running 态步骤(当前步已在 Err 分支置
 /// error),故只需扫 pending。
-fn fail_pending_steps_on_cancel(svc: &TaskService, task_id: &str, plan: &mut [TaskStep]) {
+fn fail_pending_steps_on_cancel(svc: &Arc<dyn TaskBackend>, task_id: &str, plan: &mut [TaskStep]) {
     let mut dirty = false;
     for s in plan.iter_mut() {
         if s.status == TaskStepStatus::Pending {
@@ -189,29 +193,35 @@ fn fail_pending_steps_on_cancel(svc: &TaskService, task_id: &str, plan: &mut [Ta
 }
 
 impl ModeExecutor for ApprovedPlanExecutor {
-    fn run<'a>(&'a self, ctx: TaskRunContext) -> BoxFuture<'a, Result<TaskOutcome, String>> {
+    fn run<'a>(
+        &'a self,
+        ctx: TaskRunContext,
+    ) -> BoxFuture<'a, Result<(TaskTerminal, TokenUsage), String>> {
         Box::pin(async move { self.run_inner(ctx).await })
     }
 }
 
-/// plan 执行器:只需任务服务(规划/落库/事件),不经聊天引擎。
+/// plan 执行器:只需任务后端(规划/落库/事件),不经聊天引擎。
 pub(crate) struct PlanExecutor {
-    svc: Arc<TaskService>,
+    svc: Arc<dyn TaskBackend>,
 }
 
 impl PlanExecutor {
-    pub(crate) fn new(svc: Arc<TaskService>) -> Self {
+    pub(crate) fn new(svc: Arc<dyn TaskBackend>) -> Self {
         PlanExecutor { svc }
     }
 }
 
 impl ModeExecutor for PlanExecutor {
-    fn run<'a>(&'a self, ctx: TaskRunContext) -> BoxFuture<'a, Result<TaskOutcome, String>> {
+    fn run<'a>(
+        &'a self,
+        ctx: TaskRunContext,
+    ) -> BoxFuture<'a, Result<(TaskTerminal, TokenUsage), String>> {
         Box::pin(async move {
             // 显式置 planning(run 入口 reset_task 已是 planning,幂等;语义上规划阶段归执行器所有)
             self.svc.set_status(&ctx.task_id, TaskStatus::Planning);
-            let (steps, out) = plan_task_retry(
-                &self.svc,
+            let (steps, out) = super::retry::plan_task_retry(
+                self.svc.as_ref(),
                 &ctx.task_id,
                 &ctx.goal,
                 ctx.character_id.as_deref(),
@@ -229,29 +239,25 @@ impl ModeExecutor for PlanExecutor {
             self.svc.set_plan(&ctx.task_id, &steps);
             self.svc.set_status(&ctx.task_id, TaskStatus::Planned);
             self.svc.emit_event(
-                "approval_required",
+                TaskEventKind::ApprovalRequired,
                 &ctx.task_id,
                 None,
                 Some(TaskStatus::Planned),
                 Some("计划已产出,待批准".into()),
             );
-            // 批次 R1:本清单文本经 task_engine/mod.rs 的 AwaitApproval 分支落
-            // tasks.result(planned 态 result 语义 = 待批准的计划清单,批准前预览用)
+            // 批次 R1:本清单文本经 TaskTerminal::AwaitApproval 落 tasks.result
+            //(planned 态 result 语义 = 待批准的计划清单,批准前预览用)
             let mut summary = format!("计划已产出,共 {} 步:", steps.len());
             for (i, s) in steps.iter().enumerate() {
                 summary.push_str(&format!("\n{}. {}:{}", i + 1, s.name, s.goal));
             }
-            Ok(TaskOutcome {
-                text: summary,
-                usage: crate::models::types::TokenUsage {
-                    prompt_tokens: out.prompt_tokens,
-                    completion_tokens: out.completion_tokens,
-                    total_tokens: out.prompt_tokens + out.completion_tokens,
-                    ..Default::default()
-                },
-                status: None,
-                error: None,
-            })
+            let usage = TokenUsage {
+                prompt_tokens: out.prompt_tokens,
+                completion_tokens: out.completion_tokens,
+                total_tokens: out.prompt_tokens + out.completion_tokens,
+                ..Default::default()
+            };
+            Ok((TaskTerminal::AwaitApproval { plan_text: summary }, usage))
         })
     }
 }

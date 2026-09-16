@@ -1,6 +1,7 @@
 // 设置路由:/api/settings(连接测试/模型列表/信息/模型切换/运行期设置读写)
 use crate::api::app_state::AppState;
-use crate::api::WithStatus;
+use crate::api::json_body::JsonBody;
+use crate::api::{err_with_code, internal, not_found, validation, ErrorCode};
 use crate::services::settings_service::{
     normalize_base_url, AppMode, McpServerConfig, RuntimeSettings, DEFAULT_SEARCH_ENDPOINT,
 };
@@ -158,6 +159,18 @@ pub struct UpdateSettingsBody {
     /// MCP 服务器列表(全量替换语义,与 bypass_blacklist 一致)
     #[serde(default)]
     pub mcp_servers: Option<Vec<McpServerConfig>>,
+    /// 命令执行总开关(阶段 E;缺省保持不变)。默认关闭。
+    #[serde(default)]
+    pub exec_enabled: Option<bool>,
+    /// Android 允许 ROOT 档(缺省保持不变)。默认关闭。
+    #[serde(default)]
+    pub exec_allow_root: Option<bool>,
+    /// Android 允许 Shizuku 档(缺省保持不变)。默认关闭。
+    #[serde(default)]
+    pub exec_allow_shizuku: Option<bool>,
+    /// Android 允许沙箱档(缺省保持不变)。默认关闭。
+    #[serde(default)]
+    pub exec_allow_sandbox: Option<bool>,
     /// 执行者人设完整开关(R3a):true = 完整(含 scenario+mes_example),false = 精简;
     /// 缺省保持不变
     #[serde(default)]
@@ -227,6 +240,10 @@ fn settings_json(s: &RuntimeSettings) -> Value {
         "subagent_result_max_chars": s.subagent_result_max_chars,
         "mcp_enabled": s.mcp_enabled,
         "mcp_servers": s.mcp_servers,
+        "exec_enabled": s.exec_enabled,
+        "exec_allow_root": s.exec_allow_root,
+        "exec_allow_shizuku": s.exec_allow_shizuku,
+        "exec_allow_sandbox": s.exec_allow_sandbox,
         "task_persona_full": s.task_persona_full,
         "task_prompt_inject_enabled": s.task_prompt_inject_enabled,
         "tool_history_keep_rounds": s.tool_history_keep_rounds,
@@ -255,12 +272,12 @@ pub async fn get_settings(
 pub async fn update_settings(
     State(state): State<Arc<AppState>>,
     Query(query): Query<ModeQuery>,
-    Json(body): Json<UpdateSettingsBody>,
+    JsonBody(body): JsonBody<UpdateSettingsBody>,
 ) -> Response {
     let mode = query.app_mode();
     // 事务锁覆盖“读取当前值 → 应用 patch → 原子落盘 → 替换内存”，防止并发部分更新丢字段。
     // 只持有 tokio MutexGuard；std::sync::MutexGuard 均在同步代码块内释放，不跨 await。
-    let _update_guard = state.settings_update.lock().await;
+    let _update_guard = state.guards.settings_update.lock().await;
     let (mut candidate, old_base, old_key, old_model) = {
         let current = state.settings.lock().unwrap_or_else(|e| e.into_inner());
         (
@@ -315,9 +332,7 @@ pub async fn update_settings(
             if v == 0 || (16..=8192).contains(&v) {
                 s.embedding_dim = v;
             } else {
-                return Json(json!({ "error": "embedding_dim 必须为 0(自动)或 16..=8192" }))
-                    .into_response()
-                    .with_status(StatusCode::BAD_REQUEST);
+                return validation("embedding_dim 必须为 0(自动)或 16..=8192");
             }
         }
 
@@ -347,20 +362,14 @@ pub async fn update_settings(
                 }
             }
             if let Some(v) = body.default_max_tokens {
-                if v == 0 || v > 65_536 {
-                    return Json(json!({ "error": "default_max_tokens 必须在 1..=65536" }))
-                        .into_response()
-                        .with_status(StatusCode::BAD_REQUEST);
+                if v == 0 || v > 131_072 {
+                    return validation("default_max_tokens 必须在 1..=131072");
                 }
                 apply!(s, is_task, default_max_tokens, v);
             }
             if let Some(v) = body.max_context_tokens {
                 if !(65_536..=1_048_576).contains(&v) {
-                    return Json(
-                        json!({ "error": "max_context_tokens 必须在 65536..=1048576(64K~1M)" }),
-                    )
-                    .into_response()
-                    .with_status(StatusCode::BAD_REQUEST);
+                    return validation("max_context_tokens 必须在 65536..=1048576(64K~1M)");
                 }
                 apply!(s, is_task, max_context_tokens, v);
             }
@@ -425,11 +434,7 @@ pub async fn update_settings(
                 let parsed = match crate::tools::permissions::AuthorizationMode::parse(v.trim()) {
                     Some(m) => m,
                     None => {
-                        return Json(json!({
-                            "error": "authorization_mode 仅支持 strict / loose / bypass"
-                        }))
-                        .into_response()
-                        .with_status(StatusCode::BAD_REQUEST);
+                        return validation("authorization_mode 仅支持 strict / loose / bypass");
                     }
                 };
                 apply!(s, is_task, authorization_mode, parsed);
@@ -450,22 +455,14 @@ pub async fn update_settings(
             // 授权等待超时(秒):30..=1800
             if let Some(v) = body.tool_authorization_timeout_secs {
                 if !(30..=1800).contains(&v) {
-                    return Json(json!({
-                        "error": "tool_authorization_timeout_secs 必须在 30..=1800"
-                    }))
-                    .into_response()
-                    .with_status(StatusCode::BAD_REQUEST);
+                    return validation("tool_authorization_timeout_secs 必须在 30..=1800");
                 }
                 apply!(s, is_task, tool_authorization_timeout_secs, v);
             }
             // 任务模式工具策略:all / deny_dangerous / allowlist
             if let Some(v) = &body.task_tool_policy {
                 if !matches!(v.as_str(), "all" | "deny_dangerous" | "allowlist") {
-                    return Json(json!({
-                        "error": "task_tool_policy 仅支持 all / deny_dangerous / allowlist"
-                    }))
-                    .into_response()
-                    .with_status(StatusCode::BAD_REQUEST);
+                    return validation("task_tool_policy 仅支持 all / deny_dangerous / allowlist");
                 }
                 apply!(s, is_task, task_tool_policy, v.clone());
             }
@@ -475,9 +472,7 @@ pub async fn update_settings(
             // 工具循环轮次上限:仅接受 1..=200(防止误填 0 或超大值打爆模型请求)
             if let Some(v) = body.max_tool_rounds {
                 if !(1..=200).contains(&v) {
-                    return Json(json!({ "error": "max_tool_rounds 必须在 1..=200" }))
-                        .into_response()
-                        .with_status(StatusCode::BAD_REQUEST);
+                    return validation("max_tool_rounds 必须在 1..=200");
                 }
                 apply!(s, is_task, max_tool_rounds, v);
             }
@@ -495,9 +490,7 @@ pub async fn update_settings(
             // 上下文压缩阈值:仅接受 0.5..=0.95
             if let Some(v) = body.compaction_threshold {
                 if !(0.5..=0.95).contains(&v) {
-                    return Json(json!({ "error": "compaction_threshold 必须在 0.5..=0.95" }))
-                        .into_response()
-                        .with_status(StatusCode::BAD_REQUEST);
+                    return validation("compaction_threshold 必须在 0.5..=0.95");
                 }
                 apply!(s, is_task, compaction_threshold, v);
             }
@@ -550,27 +543,21 @@ pub async fn update_settings(
             // 子智能体嵌套深度上限(1..=4,越界拒绝)
             if let Some(v) = body.subagent_max_depth {
                 if !(1..=4).contains(&v) {
-                    return Json(json!({ "error": "subagent_max_depth 必须在 1..=4" }))
-                        .into_response()
-                        .with_status(StatusCode::BAD_REQUEST);
+                    return validation("subagent_max_depth 必须在 1..=4");
                 }
                 apply!(s, is_task, subagent_max_depth, v);
             }
             // 子智能体并发上限(1..=16,越界拒绝)
             if let Some(v) = body.subagent_max_concurrency {
                 if !(1..=16).contains(&v) {
-                    return Json(json!({ "error": "subagent_max_concurrency 必须在 1..=16" }))
-                        .into_response()
-                        .with_status(StatusCode::BAD_REQUEST);
+                    return validation("subagent_max_concurrency 必须在 1..=16");
                 }
                 apply!(s, is_task, subagent_max_concurrency, v);
             }
             // 子智能体结果字符上限(500..=8000,越界拒绝)
             if let Some(v) = body.subagent_result_max_chars {
                 if !(500..=8000).contains(&v) {
-                    return Json(json!({ "error": "subagent_result_max_chars 必须在 500..=8000" }))
-                        .into_response()
-                        .with_status(StatusCode::BAD_REQUEST);
+                    return validation("subagent_result_max_chars 必须在 500..=8000");
                 }
                 apply!(s, is_task, subagent_result_max_chars, v);
             }
@@ -588,6 +575,21 @@ pub async fn update_settings(
                 });
                 apply!(s, is_task, mcp_servers, servers);
             }
+            // 命令执行开关(阶段 E):bool 免校验。这些是**全局**能力开关,
+            // 不随 roleplay/task 覆盖层分叉(exec: 权限是进程级事实,不是模式偏好),
+            // 故直接写扁平字段而非走 apply!(is_task,...)。
+            if let Some(v) = body.exec_enabled {
+                s.exec_enabled = v;
+            }
+            if let Some(v) = body.exec_allow_root {
+                s.exec_allow_root = v;
+            }
+            if let Some(v) = body.exec_allow_shizuku {
+                s.exec_allow_shizuku = v;
+            }
+            if let Some(v) = body.exec_allow_sandbox {
+                s.exec_allow_sandbox = v;
+            }
             // 执行者人设完整开关(R3a;bool 免校验,task 模式写覆盖层)
             if let Some(v) = body.task_persona_full {
                 apply!(s, is_task, task_persona_full, v);
@@ -601,19 +603,13 @@ pub async fn update_settings(
             // 引擎侧消费口径一致);越界拒绝,与 load 钳制区间一致
             if let Some(v) = body.tool_history_keep_rounds {
                 if !(1..=32).contains(&v) {
-                    return Json(json!({ "error": "tool_history_keep_rounds 必须在 1..=32" }))
-                        .into_response()
-                        .with_status(StatusCode::BAD_REQUEST);
+                    return validation("tool_history_keep_rounds 必须在 1..=32");
                 }
                 s.tool_history_keep_rounds = v;
             }
             if let Some(v) = body.tool_history_budget_tokens {
                 if v != 0 && !(1024..=1_048_576).contains(&v) {
-                    return Json(
-                        json!({ "error": "tool_history_budget_tokens 须为 0(禁用)或 1024..=1048576" }),
-                    )
-                    .into_response()
-                    .with_status(StatusCode::BAD_REQUEST);
+                    return validation("tool_history_budget_tokens 须为 0(禁用)或 1024..=1048576");
                 }
                 s.tool_history_budget_tokens = v;
             }
@@ -632,15 +628,22 @@ pub async fn update_settings(
     let (candidate, save_result) = match save_outcome {
         Ok(pair) => pair,
         Err(e) => {
-            return Json(json!({ "error": format!("设置保存失败: {e}") }))
-                .into_response()
-                .with_status(StatusCode::INTERNAL_SERVER_ERROR);
+            // 泄露封堵(批次 1):JoinError/IO 原文只进日志,回给用户稳定文案 + code
+            tracing::error!(error = %e, "设置保存失败:阻塞任务");
+            return err_with_code(
+                ErrorCode::Internal,
+                "设置保存失败,详情见服务端日志",
+                StatusCode::INTERNAL_SERVER_ERROR,
+            );
         }
     };
     if let Err(e) = save_result {
-        return Json(json!({ "error": format!("设置保存失败: {e}") }))
-            .into_response()
-            .with_status(StatusCode::INTERNAL_SERVER_ERROR);
+        tracing::error!(error = %e, "设置保存失败:写配置文件");
+        return err_with_code(
+            ErrorCode::Internal,
+            "设置保存失败,详情见服务端日志",
+            StatusCode::INTERNAL_SERVER_ERROR,
+        );
     }
     let connector_changed =
         candidate.openai_base_url != old_base || candidate.openai_api_key != old_key;
@@ -657,7 +660,14 @@ pub async fn update_settings(
             candidate.openai_api_key.clone(),
             candidate.model.clone(),
         );
-        let type_name = state.engine.connector.read().await.type_name().to_string();
+        let type_name = state
+            .engine
+            .connector
+            .read()
+            .await
+            .clone()
+            .type_name()
+            .to_string();
         let target = if type_name == "mock" && (!base_url.is_empty() || !api_key.is_empty()) {
             "openai-compatible"
         } else {
@@ -679,7 +689,7 @@ pub async fn update_settings(
 
 /// POST /api/settings/refresh-models:向已保存的 API 请求可用模型列表(立即生效,不保存)
 pub async fn refresh_models(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
-    let connector = state.engine.connector.read().await;
+    let connector = state.engine.connector.read().await.clone();
     let models = connector.available_models().await;
     // openai-compatible 下若只拿到回退的 1 个当前模型,大概率是服务不支持 /models 接口
     let message = if connector.type_name() == "openai-compatible" && models.len() <= 1 {
@@ -695,18 +705,30 @@ pub async fn refresh_models(State(state): State<Arc<AppState>>) -> Json<serde_js
 
 /// POST /api/settings/connect:测试连接
 pub async fn connect(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
-    let diagnostic = state.engine.connector.read().await.test().await;
+    let diagnostic = state.engine.connector.read().await.clone().test().await;
     Json(diagnostic)
 }
 
 /// GET /api/settings/models:可用模型列表
 pub async fn models(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
-    let models = state.engine.connector.read().await.available_models().await;
+    let models = state
+        .engine
+        .connector
+        .read()
+        .await
+        .clone()
+        .available_models()
+        .await;
     Json(json!({ "models": models }))
 }
 
 /// POST /api/settings/embedding/test:测试向量化连接(嵌入一条固定文本)。
 /// 成功回传实际维度与耗时;失败回传错误原因。不写库、不改配置。
+///
+/// 形状(批次 1):保留 200 + `ok:false`,`ok:false` 是**正常业务上报**(测试结果),
+/// 不是 HTTP 错误——前端 settings.ts 的 testEmbedding 把该对象直接渲染到设置页,
+/// 改成非 2xx 会让 request() 抛 ApiError,把「测试未通过」变成异常弹窗(破坏既有 UX)。
+/// 这里补 `code`/`error` 供程序化分支;`message` 保留原文(用户需要据此修正自己的配置)。
 pub async fn test_embedding(State(state): State<Arc<AppState>>) -> Response {
     let settings = state.settings_snapshot();
     let svc = crate::services::embedding_service::EmbeddingService::new();
@@ -718,13 +740,26 @@ pub async fn test_embedding(State(state): State<Arc<AppState>>) -> Response {
             "message": format!("连接成功:向量维度 {dim},耗时 {ms} ms"),
         }))
         .into_response(),
-        Err(e) => Json(json!({ "ok": false, "message": e.to_string() })).into_response(),
+        Err(e) => {
+            // 未配置 → VALIDATION(用户可自行修正);已配置但调用失败 → UPSTREAM(上游)
+            let code = match &e {
+                crate::services::embedding_service::EmbedError::NotConfigured(_) => {
+                    ErrorCode::Validation
+                }
+                crate::services::embedding_service::EmbedError::Failed(_) => ErrorCode::Upstream,
+            };
+            let message = e.to_string();
+            Json(
+                json!({ "ok": false, "code": code.as_str(), "error": message, "message": message }),
+            )
+            .into_response()
+        }
     }
 }
 
 /// GET /api/settings/info:连接器信息 + 模型列表 + 可用连接器
 pub async fn info(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
-    let connector = state.engine.connector.read().await;
+    let connector = state.engine.connector.read().await.clone();
     let type_name = connector.type_name();
     let models = connector.available_models().await;
     let model = connector.model().to_string();
@@ -739,13 +774,11 @@ pub async fn info(State(state): State<Arc<AppState>>) -> Json<serde_json::Value>
 /// PUT /api/settings/model:切换模型(立即生效)
 pub async fn switch_model(
     State(state): State<Arc<AppState>>,
-    Json(body): Json<SwitchModelBody>,
+    JsonBody(body): JsonBody<SwitchModelBody>,
 ) -> Response {
     let model = body.model.trim().to_string();
     if model.is_empty() {
-        return Json(json!({ "error": "缺少 model" }))
-            .into_response()
-            .with_status(StatusCode::BAD_REQUEST);
+        return validation("缺少 model");
     }
     let changed = state.engine.model() != model;
     if changed {
@@ -768,9 +801,7 @@ pub async fn get_agent_prompt(State(state): State<Arc<AppState>>) -> Response {
         Ok(content) => {
             Json(json!({ "ok": true, "path": path, "content": content })).into_response()
         }
-        Err(e) => Json(json!({ "error": e }))
-            .into_response()
-            .with_status(StatusCode::NOT_FOUND),
+        Err(e) => not_found(e),
     }
 }
 
@@ -838,14 +869,10 @@ pub async fn prompt_preview(
             push_preview_layer(&mut layers, "runtime_prompt", "system", 5, runtime)
         }
         Ok(None) => {}
-        Err(error) => {
-            return Json(json!({ "error": error }))
-                .into_response()
-                .with_status(StatusCode::INTERNAL_SERVER_ERROR)
-        }
+        Err(error) => return internal(error),
     }
 
-    // 预览按模式走 for_mode 合并值(docs/模式提示词边界.md 第五节):
+    // 预览按模式走 for_mode 合并值(docs/契约-协议与配置.md 第五节):
     // 缺省/未知值按 roleplay(旧客户端零变化);task 为覆盖层合并后的有效设置,
     // agent_system_prompt 经类型级隔离转换(None 已注入内置任务默认词)。
     let mode = match query.mode.as_deref() {
@@ -900,7 +927,7 @@ pub async fn prompt_preview(
     }
 
     // 任务模式注入默认隔离(2026-09-10 实测修复):task 模式且未显式开启继承时,
-    // 不推送注入层——预览必须与真实下发一致(docs/模式提示词边界.md 第五节)。
+    // 不推送注入层——预览必须与真实下发一致(docs/契约-协议与配置.md 第五节)。
     let inject_gated = matches!(mode, AppMode::Task) && !settings.task_prompt_inject_enabled;
     if !inject_gated {
         let inject = state
@@ -1080,13 +1107,11 @@ pub async fn prompt_preview(
 /// PUT /api/settings/agent-prompt:原子保存主 Agent 提示词到 DATA_DIR。
 pub async fn save_agent_prompt(
     State(state): State<Arc<AppState>>,
-    Json(body): Json<SaveAgentPromptBody>,
+    JsonBody(body): JsonBody<SaveAgentPromptBody>,
 ) -> Response {
     let path = state.runtime_prompt.path().display().to_string();
     match state.runtime_prompt.write(&body.content) {
         Ok(_) => Json(json!({ "ok": true, "path": path })).into_response(),
-        Err(e) => Json(json!({ "error": e }))
-            .into_response()
-            .with_status(StatusCode::BAD_REQUEST),
+        Err(e) => validation(e),
     }
 }

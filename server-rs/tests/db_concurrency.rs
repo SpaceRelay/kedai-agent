@@ -167,3 +167,107 @@ async fn write_then_read_visible_via_read_pool() {
     assert_eq!(msgs.len(), 1);
     assert_eq!(msgs[0]["content"], json!("你好,并发测试"));
 }
+
+/// 同一角色 data_raw 的并发读改写不丢更新(批次 D.1)。
+///
+/// 场景:角色卡内嵌世界书保存(`PUT /api/characters/{id}/world-entries`,改
+/// `data_raw.character_book.entries`)与角色字段更新(`PUT /api/characters/{id}`,
+/// 改 description + `data_raw.description`)并发作用于同一张卡——两条路径都读改写
+/// 整份 `data_raw`。
+///
+/// 修复前:两步各自「read 取快照 → 改 → write 回写」,读与写之间不持锁,后写者会用旧
+/// 快照整体覆盖先写者 → 丢更新。修复后都在同一写锁事务内读改写,世界书条目与角色描述
+/// 必须**同时**保留(任一被覆盖即失败)。
+#[tokio::test]
+async fn concurrent_data_raw_writes_do_not_lose_updates() {
+    let app = test_app();
+    // 上传一张自带 character_book 的卡(世界书保存的前提)
+    let card = json!({
+        "spec": "chara_card_v2",
+        "spec_version": "1.0",
+        "name": "并发写data_raw角色",
+        "description": "初始描述",
+        "first_mes": "你好",
+        "character_book": { "name": "内嵌书", "entries": [] }
+    });
+    let body = format!(
+        "--BOUND\r\nContent-Disposition: form-data; name=\"file\"; filename=\"并发写.json\"\r\nContent-Type: application/json\r\n\r\n{}\r\n--BOUND--\r\n",
+        card
+    );
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/characters/upload")
+        .header("content-type", "multipart/form-data; boundary=BOUND")
+        .body(Body::from(body))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let uploaded: Value = serde_json::from_slice(&bytes).unwrap();
+    let cid = uploaded["id"].as_str().unwrap().to_string();
+
+    // 并发:A) 角色字段更新(改 description)× 6  B) 世界书条目保存 × 6
+    // 两者都读改写同一份 data_raw;若读改写不在同一锁内,必然互相覆盖。
+    let entry = json!({
+        "name": "并发条目",
+        "content": "并发写入的世界书内容",
+        "keys": ["并发"],
+        "enabled": true
+    });
+    let mut handles = Vec::new();
+    for i in 0..6 {
+        let app_a = app.clone();
+        let cid_a = cid.clone();
+        handles.push(tokio::spawn(async move {
+            send_json(
+                &app_a,
+                "PUT",
+                &format!("/api/characters/{cid_a}"),
+                json!({ "description": format!("并发描述-{i}") }),
+            )
+            .await
+            .0
+        }));
+        let app_b = app.clone();
+        let cid_b = cid.clone();
+        let entry_b = entry.clone();
+        handles.push(tokio::spawn(async move {
+            send_json(
+                &app_b,
+                "PUT",
+                &format!("/api/characters/{cid_b}/world-entries"),
+                json!({ "entries": [entry_b] }),
+            )
+            .await
+            .0
+        }));
+    }
+    for h in handles {
+        assert_eq!(h.await.unwrap(), StatusCode::OK, "并发写出现失败");
+    }
+
+    // 终态:description 与 character_book.entries 必须**同时**存在(无丢更新)
+    let (status, detail) =
+        send_json(app, "GET", &format!("/api/characters/{cid}"), json!({})).await;
+    assert_eq!(status, StatusCode::OK);
+    let desc = detail["description"].as_str().unwrap_or_default();
+    assert!(
+        desc.starts_with("并发描述-"),
+        "角色描述应保留某次并发写入的值,实际: {desc}"
+    );
+    let entries = detail["data_raw"]["character_book"]["entries"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        !entries.is_empty(),
+        "世界书条目应保留(为空说明被角色更新用旧快照覆盖 —— 丢更新)。detail: {detail}"
+    );
+    let raw_desc = detail["data_raw"]["description"]
+        .as_str()
+        .unwrap_or_default();
+    assert_eq!(
+        raw_desc, desc,
+        "data_raw.description 应与列 description 一致(同事务写入,未出现半写)"
+    );
+}

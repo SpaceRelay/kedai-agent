@@ -2,7 +2,7 @@
 // 职责:
 //   - 汇总近 N 条请求的缓存命中/未命中 token(加权命中率、费用与节省估算);
 //   - 上下文四级水位报告(soft 0.5 / snip 0.6 / compact 0.8 / force 0.9,
-//     与 docs/learn-harness-2026-08.md 的 estimate.mjs level+gaps 算法对齐):
+//     与 docs/archive/learn-harness-2026-08.md 的 estimate.mjs level+gaps 算法对齐):
 //     输入 tokens 对照 max_context_tokens 判档,并给出距下一档的 token gap。
 // 单价为「每百万 token」结构体(默认 DeepSeek 参考价:命中 0.27 / 输入 2 / 输出 8 元),
 // 不做货币换算;后续可挪到设置项。

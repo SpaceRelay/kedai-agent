@@ -2,7 +2,7 @@
 // POST /api/prompt-inject/import:导入酒馆(SillyTavern)预设 JSON → 楼层
 use crate::api::app_state::AppState;
 use crate::api::characters::{parse_boundary, parse_multipart};
-use crate::api::WithStatus;
+use crate::api::{err_with_code, validation, ErrorCode};
 use crate::parsing::preset::parse_st_preset;
 use crate::services::prompt_inject_service::PromptInjectConfig;
 use axum::extract::State;
@@ -45,9 +45,15 @@ pub async fn update_prompt_inject(
         .await;
     match result {
         Ok(Ok(cfg)) => Json(json!({ "ok": true, "config": cfg })).into_response(),
-        Ok(Err(e)) | Err(e) => Json(json!({ "error": format!("保存失败: {e}") }))
-            .into_response()
-            .with_status(StatusCode::INTERNAL_SERVER_ERROR),
+        // 泄露封堵(批次 1):写盘错误原文(可能含盘符路径)只进日志,响应给稳定文案 + code
+        Ok(Err(e)) | Err(e) => {
+            tracing::error!(error = %e, "保存提示词注入配置失败");
+            err_with_code(
+                ErrorCode::Internal,
+                "保存失败,详情见服务端日志",
+                StatusCode::INTERNAL_SERVER_ERROR,
+            )
+        }
     }
 }
 
@@ -66,34 +72,24 @@ pub async fn import(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
     let Some(boundary) = parse_boundary(content_type) else {
-        return Json(json!({ "error": "缺少文件字段(file)" }))
-            .into_response()
-            .with_status(StatusCode::BAD_REQUEST);
+        return validation("缺少文件字段(file)");
     };
     let parts = parse_multipart(&body, &boundary);
     let Some(file_part) = parts.iter().find(|p| p.field == "file") else {
-        return Json(json!({ "error": "缺少文件字段(file)" }))
-            .into_response()
-            .with_status(StatusCode::BAD_REQUEST);
+        return validation("缺少文件字段(file)");
     };
     if file_part.content.len() > MAX_PRESET {
-        return Json(json!({ "error": "预设文件超过 30MB 上限" }))
-            .into_response()
-            .with_status(StatusCode::BAD_REQUEST);
+        return validation("预设文件超过 30MB 上限");
     }
     let text = String::from_utf8_lossy(&file_part.content);
     let floors = match parse_st_preset(&text) {
         Ok(f) => f,
         Err(e) => {
-            return Json(json!({ "error": e }))
-                .into_response()
-                .with_status(StatusCode::BAD_REQUEST);
+            return validation(e);
         }
     };
     if floors.is_empty() {
-        return Json(json!({ "error": "预设中没有可导入的提示词条目" }))
-            .into_response()
-            .with_status(StatusCode::BAD_REQUEST);
+        return validation("预设中没有可导入的提示词条目");
     }
     let mode = parts
         .iter()
@@ -133,8 +129,13 @@ pub async fn import(
         Ok(Ok((imported, config))) => {
             Json(json!({ "ok": true, "imported": imported, "config": config })).into_response()
         }
-        Ok(Err(e)) | Err(e) => Json(json!({ "error": format!("导入失败: {e}") }))
-            .into_response()
-            .with_status(StatusCode::INTERNAL_SERVER_ERROR),
+        Ok(Err(e)) | Err(e) => {
+            tracing::error!(error = %e, "导入提示词预设失败");
+            err_with_code(
+                ErrorCode::Internal,
+                "导入失败,详情见服务端日志",
+                StatusCode::INTERNAL_SERVER_ERROR,
+            )
+        }
     }
 }

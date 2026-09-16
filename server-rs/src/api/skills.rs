@@ -1,7 +1,7 @@
 // Skill 库路由:/api/skills(列表/导入/更新/删除)
 // 导入格式:单对象 {name,description,content} 或数组 [{...}] 或 {skills: [...]} 包壳
 use crate::api::app_state::AppState;
-use crate::api::{db_err, WithStatus};
+use crate::api::{db_err, err_status};
 use crate::services::skill_service::SkillImport;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -65,7 +65,7 @@ pub async fn import_skills(
     match state.db_call(move || svc.import(items)).await {
         Err(e) => db_err(&e),
         Ok(Ok(n)) => Json(json!({ "ok": true, "imported": n })).into_response(),
-        Ok(Err(e)) => err_json(&e),
+        Ok(Err(e)) => err_status(&e, StatusCode::NOT_FOUND),
     }
 }
 
@@ -93,7 +93,7 @@ pub async fn update(
     match updated {
         Err(e) => db_err(&e),
         Ok(Some(s)) => Json(json!({ "ok": true, "skill": s })).into_response(),
-        Ok(None) => err_json("技能不存在"),
+        Ok(None) => err_status("技能不存在", StatusCode::NOT_FOUND),
     }
 }
 
@@ -103,12 +103,6 @@ pub async fn delete(State(state): State<Arc<AppState>>, Path(id): Path<String>) 
     match state.db_call(move || svc.delete(&id)).await {
         Err(e) => db_err(&e),
         Ok(true) => Json(json!({ "ok": true })).into_response(),
-        Ok(false) => err_json("技能不存在"),
+        Ok(false) => err_status("技能不存在", StatusCode::NOT_FOUND),
     }
-}
-
-fn err_json(msg: &str) -> Response {
-    Json(json!({ "error": msg }))
-        .into_response()
-        .with_status(StatusCode::NOT_FOUND)
 }

@@ -57,7 +57,35 @@ pub(super) fn register_read(registry: &ToolRegistry, deps: Arc<ToolDeps>) {
                         "character_prompt" => read_character_prompt(&deps, &ctx),
                         "skill" => read_skill(&deps, &name, &keywords),
                         "file" => read_file_checked(&deps, &ctx, &name),
-                        "subtask" => read_subtask(&deps, &ctx, &name),
+                        "subtask" => {
+                            // 子任务走结构化三态:命中给内容,未命中/歧义给「失败 + 候选」。
+                            // 旧实现把候选清单塞进与正常结果同构的 content 字符串,消费方
+                            // 必须先解析 JSON 再判 matched_by,漏判就把候选清单当成任务
+                            // 结果用;候选还随会话任务数线性增长(实测一次回带 15 条)。
+                            match read_subtask(&deps, &ctx, &name) {
+                                Ok(SubtaskLookup::Hit(hit)) => {
+                                    let hit_text = hit.to_string();
+                                    let clipped: String = hit_text.chars().take(max_chars).collect();
+                                    let content = if hit_text.chars().count() > max_chars {
+                                        format!("{clipped}\n…(已截断)")
+                                    } else {
+                                        clipped
+                                    };
+                                    results.push(json!({
+                                        "type": qtype, "name": name, "ok": true, "content": content,
+                                    }));
+                                    continue;
+                                }
+                                Ok(SubtaskLookup::Miss { reason, candidates }) => {
+                                    results.push(json!({
+                                        "type": qtype, "name": name, "ok": false,
+                                        "error": reason, "candidates": candidates,
+                                    }));
+                                    continue;
+                                }
+                                Err(e) => Err(e),
+                            }
+                        }
                         _ => Err(format!("未知查询类型: {qtype}")),
                     };
                     let content = match content {
@@ -69,9 +97,17 @@ pub(super) fn register_read(registry: &ToolRegistry, deps: Arc<ToolDeps>) {
                                 clipped
                             }
                         }
-                        Err(e) => format!("读取失败: {e}"),
+                        Err(e) => {
+                            // 统一结构化失败:ok=false + error 文本(旧实现把它包成
+                            // content 字符串,消费方无法一眼区分「读到了内容」与「读取失败」)
+                            results.push(json!({
+                                "type": qtype, "name": name, "ok": false,
+                                "error": format!("读取失败: {e}"),
+                            }));
+                            continue;
+                        }
                     };
-                    results.push(json!({ "type": qtype, "name": name, "content": content }));
+                    results.push(json!({ "type": qtype, "name": name, "ok": true, "content": content }));
                 }
                 Ok(json!({ "results": results }).to_string())
             })
@@ -171,34 +207,67 @@ fn read_skill(deps: &ToolDeps, name: &str, keywords: &[String]) -> Result<String
     Ok(parts.join("\n\n"))
 }
 
+/// 子任务查询结果三态(2026-09-15 结构化改造):命中给内容,未命中/歧义给候选。
+///
+/// 为什么不再用「与正常结果同构的 content 字符串」:旧实现把未命中/歧义都拼成
+/// JSON 塞进 `content`,与正常命中完全同形,消费方必须先解析再判 `matched_by`,
+/// 漏判就会把候选清单当成任务结果;且候选随会话任务数线性增长(实测一次 15 条),
+/// 长会话里每次误查都是一笔无谓的 token 开销。
+enum SubtaskLookup {
+    /// 命中的子任务(含 id/name 双向别名与 matched_by)
+    Hit(Value),
+    /// 未命中或歧义:带可读原因 + 裁剪后的候选
+    Miss {
+        reason: String,
+        candidates: Vec<Value>,
+    },
+}
+
+/// 候选裁剪(2026-09-15):默认排除已 `ended` 的记录(它们不再有取用价值,却最占位置),
+/// 再截断到 top-3。让「未命中」的返回体保持稳定体积,不随会话任务数膨胀。
+fn trimmed_candidates(records: &[&crate::models::types::AgentSubtaskRecord]) -> Vec<Value> {
+    records
+        .iter()
+        .filter(|t| t.status != "ended")
+        .take(3)
+        .map(|t| json!({ "id": t.id, "name": t.name, "status": t.status }))
+        .collect()
+}
+
 /// 子任务查询(审计项 C):三键命中,首次命中即返回,避免模型只知子任务名却查不到。
 /// 命中顺序:先精确 id(deps.subtasks.get,含内存覆盖层)返回 matched_by:"id";
 /// 再在会话作用域候选集内精确 name(trim 相等)返回 matched_by:"name";
 /// 最后候选集内 name 大小写不敏感子串命中返回 matched_by:"name_like"。
 /// 候选集口径:能取到任务前缀就用 list_by_session_prefix(覆盖 team 的 :main:/:sub:
 /// 派生虚拟 session),否则 list_by_session(聊天路径);与 todo 共用 shared helper。
-/// 命中唯一时返回 JSON 同时含 id 与 name(双向别名);子串多命中返回候选清单让模型自选;
-/// 一条不中时报错列出可用候选,给出自纠线索。
-fn read_subtask(deps: &ToolDeps, ctx: &ToolContext, name: &str) -> Result<String, String> {
+/// 命中唯一时返回 JSON 同时含 id 与 name(双向别名);多命中/未命中返回 `Miss`
+///(候选 top-3、默认排除 ended),由调用方落成结构化失败项。
+fn read_subtask(deps: &ToolDeps, ctx: &ToolContext, name: &str) -> Result<SubtaskLookup, String> {
     use super::agent_tools_shared::subtask_candidates;
 
     // 1) 精确 id:内存覆盖层与 DB 都能命中(不依赖会话候选集)
     if let Some(task) = deps.subtasks.get(name) {
-        return Ok(subtask_json(&task, "id"));
+        return Ok(SubtaskLookup::Hit(subtask_hit_json(&task, "id")));
     }
 
     let candidates = subtask_candidates(deps, &ctx.session_id);
     let needle = name.trim();
-    // 2) 候选集内精确 name(trim 后相等);同名多条同样返回候选清单
+    // 2) 候选集内精确 name(trim 后相等);同名多条同样走歧义分支
     let exact: Vec<&crate::models::types::AgentSubtaskRecord> = candidates
         .iter()
         .filter(|t| t.name.trim() == needle)
         .collect();
     if exact.len() == 1 {
-        return Ok(subtask_json(exact[0], "name"));
+        return Ok(SubtaskLookup::Hit(subtask_hit_json(exact[0], "name")));
     }
     if exact.len() > 1 {
-        return Ok(ambiguous_json(name, &exact));
+        return Ok(SubtaskLookup::Miss {
+            reason: format!(
+                "子任务「{name}」匹配到 {} 条同名记录,请改用 id 精确查询",
+                exact.len()
+            ),
+            candidates: trimmed_candidates(&exact),
+        });
     }
     // 3) 候选集内 name 大小写不敏感子串
     let needle_lower = needle.to_lowercase();
@@ -208,46 +277,41 @@ fn read_subtask(deps: &ToolDeps, ctx: &ToolContext, name: &str) -> Result<String
         .collect();
     match matched.len() {
         0 => {
-            // 无命中:列出可用候选的 id 与 name(现状只说「子任务不存在」,无自纠线索)
             if candidates.is_empty() {
-                return Err(format!(
-                    "子任务「{name}」不存在,且当前会话无可查询的子任务。\
-                     下一步:先用 agentgo 排出子任务,再按返回的 task_id 查询"
-                ));
+                return Ok(SubtaskLookup::Miss {
+                    reason: format!(
+                        "子任务「{name}」不存在,且当前会话无可查询的子任务。\
+                         下一步:先用 agentgo 排出子任务,再按返回的 task_id 查询"
+                    ),
+                    candidates: Vec::new(),
+                });
             }
-            let list = candidates
-                .iter()
-                .map(|t| format!("{} (id={})", t.name, t.id))
-                .collect::<Vec<_>>()
-                .join("; ");
-            Err(format!(
-                "子任务「{name}」未命中任何候选。可用候选: {list}。\
-                 下一步:改用候选中的 id 或完整 name 查询"
-            ))
+            Ok(SubtaskLookup::Miss {
+                reason: format!(
+                    "子任务「{name}」未命中任何候选。\
+                     下一步:改用 candidates 中的 id 或完整 name 查询"
+                ),
+                candidates: trimmed_candidates(&candidates.iter().collect::<Vec<_>>()),
+            })
         }
-        1 => Ok(subtask_json(matched[0], "name_like")),
-        // 子串匹配到多条:返回候选清单让模型自选,不随便挑一条
-        _ => Ok(ambiguous_json(name, &matched)),
+        1 => Ok(SubtaskLookup::Hit(subtask_hit_json(
+            matched[0],
+            "name_like",
+        ))),
+        // 子串匹配到多条:给候选让模型自选,不随便挑一条
+        _ => Ok(SubtaskLookup::Miss {
+            reason: format!(
+                "子任务「{name}」匹配到 {} 条(子串匹配),请用 id 或完整 name 精确查询",
+                matched.len()
+            ),
+            candidates: trimmed_candidates(&matched),
+        }),
     }
 }
 
-/// 多条候选:返回精简清单 {id,name,status} + 提示改用精确键查询
-fn ambiguous_json(query: &str, matched: &[&crate::models::types::AgentSubtaskRecord]) -> String {
-    let list: Vec<Value> = matched
-        .iter()
-        .map(|t| json!({ "id": t.id, "name": t.name, "status": t.status }))
-        .collect();
-    json!({
-        "matched_by": "ambiguous",
-        "query": query,
-        "candidates": list,
-        "note": "匹配到多条子任务,请用 id 或完整 name 重新查询",
-    })
-    .to_string()
-}
-
-/// 子任务结果 JSON:id 与 name 双向别名 + matched_by 命中方式;字段沿用现状
-fn subtask_json(task: &crate::models::types::AgentSubtaskRecord, matched_by: &str) -> String {
+/// 命中结果 JSON:id 与 name 双向别名 + matched_by 命中方式;字段沿用现状
+/// (批次 4 起含 finished_at:终态时刻自证,不必用 ended 反推有无结果)
+fn subtask_hit_json(task: &crate::models::types::AgentSubtaskRecord, matched_by: &str) -> Value {
     json!({
         "id": task.id,
         "name": task.name,
@@ -256,6 +320,6 @@ fn subtask_json(task: &crate::models::types::AgentSubtaskRecord, matched_by: &st
         "instruction": task.instruction,
         "result": task.result,
         "error": task.error,
+        "finished_at": task.finished_at,
     })
-    .to_string()
 }

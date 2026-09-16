@@ -1,10 +1,16 @@
 // 提示词共享能力(WP7 提示词管线整合):角色扮演(agents/engine)与任务模式
 // (task_service)共用的纯函数原语,双侧调用同一实现,消除两份重复逻辑漂移风险。
-//   constant_world_text          世界书常驻条目过滤/排序/格式化
+//   constant_world_body / constant_world_text  世界书常驻条目过滤/排序/格式化
+//   triggered_entry_hits / world_entry_roll / world_entry_text
+//                                             激发条目「窗口→匹配→概率」判定与格式化
+//                                             (2026-09-14 收敛,见下文原语注释)
 //   system_inject_text           提示词注入文本(简单合成 / 复杂 system 楼层)
 //   render_character_placeholders 角色占位符渲染({{char}} 等 6 个共享 + 模式专属 extra)
 //   untrusted_boundary           外部文本防注入包裹(自 agents/engine/messages/build.rs 迁入)
 // 模式隔离(哪些设置字段 task 不回退 roleplay)属 settings_service 职责,不在此模块。
+//
+// **防第四份**:世界书注入的判定逻辑只应存在于本模块。新增注入场景时,
+// 请复用 triggered_entry_hits / world_entry_text 并按场景传参,不要在新位置重写组合逻辑。
 use crate::models::types::CharacterRecord;
 use crate::parsing::world_book::WorldEntry;
 use crate::services::prompt_inject_service::{FloorRole, InjectMode, PromptInjectConfig};
@@ -34,6 +40,75 @@ pub fn constant_world_text(entries: &[WorldEntry]) -> String {
     } else {
         format!("世界书设定:\n{body}")
     }
+}
+
+// ---------------- 激发条目判定与格式化原语(三处调用点收敛,2026-09-14) ----------------
+//
+// 背景:世界书注入曾有**三份判定实现**(①本模块的常驻过滤、②`agents/engine/worldbook.rs`
+// 的分组注入、③`api/chat.rs` 的 generate-raw 扁平注入)。三处的纯函数层
+// (`entry_matches_texts` / `entry_probability_pass` / `scan_window_len`)已共享,但
+// **「窗口→匹配→概率」的组合顺序**与**注入文本格式化**仍各写一遍,已实际产生漂移:
+//   - 概率 roll 来源不一致:② 用引擎 `simple_roll()`,③ 用 `subsec_nanos()%100`;
+//   - 格式化不一致:② 即使 comment 为空也输出 `[]\ncontent`,③ 空 comment 时只输出 content。
+//
+// 下列原语把「组合顺序」与「格式化」也收敛为单点。三处的**场景差异**
+// (扫描哪些消息、未声明 scan_depth 时的兜底值)经参数显式传入,不靠隐式分支,
+// 使「为什么这里不一样」在调用点一眼可见。
+
+/// 激发条目命中判定:统一「窗口 → 匹配 → 概率」三步与顺序。
+///
+/// 参数化的两处场景差异(**调用方必须显式选定,不得隐式继承**):
+/// - `texts`:参与扫描的文本集合。引擎侧只传 **user 消息**;generate-raw 侧传**全部消息**
+///   (作者页自组的是扁平完整上下文,触发词常落在 assistant 侧注释行上)。
+/// - `window_fallback`:条目未声明 `scan_depth` 时的窗口兜底。引擎侧传 `e.depth`
+///   (保持存量卡行为);generate-raw 侧传 `0`(= 扫全部,该场景无「最近聊天」概念)。
+///
+/// 判定顺序固定为「先算窗口 → 空窗口直接不命中 → 匹配 → 概率」,与三处原实现一致;
+/// 概率在匹配**之后**判定,保证 `use_probability` 只对命中条目生效。
+pub fn triggered_entry_hits(
+    e: &WorldEntry,
+    texts: &[String],
+    window_fallback: i64,
+    roll: i64,
+) -> bool {
+    use crate::parsing::world_book::{
+        entry_matches_texts, entry_probability_pass, scan_window_len,
+    };
+    let window_len = scan_window_len(e, texts.len(), window_fallback);
+    let window = &texts[texts.len().saturating_sub(window_len)..];
+    if window.is_empty() {
+        return false;
+    }
+    entry_matches_texts(e, window) && entry_probability_pass(e, roll)
+}
+
+/// 激发条目的概率 roll(单点):返回 `0..100` 的整数。
+///
+/// 收敛前 ② 用引擎的 `simple_roll()`、③ 用 `SystemTime::subsec_nanos() % 100`——
+/// 两者分布等价但**来源不同**,导致同一轮多条目行为不可复现地分叉。
+/// 现统一走本函数;阈值判定仍由 `entry_probability_pass` 负责。
+pub fn world_entry_roll() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    (SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0)
+        % 100) as i64
+}
+
+/// 世界书条目注入文本格式化(单点):`[comment]\ncontent`。
+///
+/// `keep_empty_bracket` 表达两种既有约定,**调用方须显式选择**:
+/// - `true`(引擎侧):comment 为空也输出 `[]\ncontent` —— 保持存量卡的逐字节行为;
+/// - `false`(generate-raw 侧):comment 为空时只输出 content,不产生空 `[]` 行。
+///
+/// 收敛前这是两处**隐式分叉**的格式化;现改为显式参数,使差异成为调用点的可见决策。
+pub fn world_entry_text(comment: &str, content: &str, keep_empty_bracket: bool) -> String {
+    let content = content.trim();
+    if comment.is_empty() && !keep_empty_bracket {
+        return content.to_string();
+    }
+    format!("[{comment}]\n{content}")
 }
 
 /// 提示词注入文本:简单模式取合成文本;复杂模式取 role=system 的启用楼层内容。
@@ -158,5 +233,98 @@ mod tests {
         assert!(wrapped.contains(r#"<UNTRUSTED_PROMPT_SOURCE source="character">"#));
         assert!(wrapped.contains("人设文本"));
         assert!(wrapped.contains("</UNTRUSTED_PROMPT_SOURCE>"));
+    }
+
+    /// 构造测试用激发条目（`WorldEntry` 无 `Default`，显式列出字段以免将来加字段时静默漏配）。
+    fn triggered_entry(keys: &[&str], probability: i64) -> WorldEntry {
+        WorldEntry {
+            id: 1,
+            comment: "t".to_string(),
+            keys: keys.iter().map(|s| s.to_string()).collect(),
+            keys_secondary: Vec::new(),
+            regex: None,
+            use_regex: false,
+            content: "正文".to_string(),
+            constant: false,
+            enabled: true,
+            position: 0,
+            depth: 4,
+            scan_depth: None,
+            order: 100,
+            case_sensitive: false,
+            sticky: 0,
+            cooldown: 0,
+            probability,
+            use_probability: true,
+            role: None,
+            decorators: Vec::new(),
+        }
+    }
+
+    /// 激发判定:同一「窗口→匹配→概率」顺序在两种扫描场景下可复用。
+    ///
+    /// 本测试锁定收敛后的语义契约:命中窗口、窗口兜底、概率阈值三者组合一致。
+    /// 场景差异(只看 user / 看全部)由 `texts` 传入体现,不在函数内部分支。
+    #[test]
+    fn triggered_entry_hits_respects_window_fallback_and_probability() {
+        // 命中:最近一条含触发词,窗口兜底覆盖到它
+        let hit_texts = vec!["无关".to_string(), "这里有触发词".to_string()];
+        assert!(triggered_entry_hits(
+            &triggered_entry(&["触发词"], 100),
+            &hit_texts,
+            2,
+            0
+        ));
+
+        // 未命中:触发词落在窗口之外(兜底 1 = 只看最近 1 条)
+        let miss_texts = vec!["这里有触发词".to_string(), "无关".to_string()];
+        assert!(!triggered_entry_hits(
+            &triggered_entry(&["触发词"], 100),
+            &miss_texts,
+            1,
+            0
+        ));
+
+        // 概率闸:probability=0 时即使命中也不注入(0 永不注入)
+        assert!(!triggered_entry_hits(
+            &triggered_entry(&["触发词"], 0),
+            &hit_texts,
+            2,
+            0
+        ));
+    }
+
+    /// 空扫描集不得命中(防「无历史却注入激发条目」)。
+    #[test]
+    fn triggered_entry_hits_empty_texts_never_hits() {
+        assert!(!triggered_entry_hits(
+            &triggered_entry(&["x"], 100),
+            &[],
+            4,
+            0
+        ));
+    }
+
+    /// 格式化单点:两种既有约定经 `keep_empty_bracket` 显式区分。
+    #[test]
+    fn world_entry_text_covers_both_bracket_conventions() {
+        // 引擎侧:空 comment 也保留空 `[]` 行(存量卡逐字节行为)
+        assert_eq!(world_entry_text("", "正文", true), "[]\n正文");
+        // generate-raw 侧:空 comment 时不产生空 `[]` 行
+        assert_eq!(world_entry_text("", "正文", false), "正文");
+        // 非空 comment:两侧一致
+        assert_eq!(world_entry_text("注释", "正文", true), "[注释]\n正文");
+        assert_eq!(world_entry_text("注释", "正文", false), "[注释]\n正文");
+        // content 两侧都 trim
+        assert_eq!(world_entry_text("c", "  正文  ", false), "[c]\n正文");
+    }
+
+    /// roll 分布边界:必须落在 `0..100`(概率阈值的定义域),否则概率闸会失真。
+    #[test]
+    fn world_entry_roll_stays_in_range() {
+        for _ in 0..200 {
+            let r = world_entry_roll();
+            assert!((0..100).contains(&r), "roll 越界: {r}");
+        }
     }
 }

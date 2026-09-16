@@ -1,9 +1,8 @@
 // Token 计数路由:/api/token/count + /api/token/session-total + /api/token/global-total
 use crate::api::app_state::AppState;
-use crate::api::WithStatus;
+use crate::api::{internal, validation};
 use crate::models::types::LlmMessage;
 use axum::extract::{Query, State};
-use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::Deserialize;
@@ -22,9 +21,7 @@ pub async fn count(
     Json(body): Json<TokenCountBody>,
 ) -> Response {
     if body.messages.is_empty() {
-        return Json(json!({ "error": "缺少 messages 数组" }))
-            .into_response()
-            .with_status(StatusCode::BAD_REQUEST);
+        return validation("缺少 messages 数组");
     }
     let model = body.model.unwrap_or_else(|| state.engine.model());
     let total = {
@@ -49,11 +46,7 @@ pub async fn session_total(
 ) -> Response {
     let conn = match state.db.read() {
         Ok(c) => c,
-        Err(e) => {
-            return Json(json!({ "error": e }))
-                .into_response()
-                .with_status(StatusCode::INTERNAL_SERVER_ERROR)
-        }
+        Err(e) => return internal(e),
     };
     let row: Option<(i64, i64, i64)> = conn
         .query_row(
@@ -84,11 +77,7 @@ pub async fn session_total(
 pub async fn global_total(State(state): State<Arc<AppState>>) -> Response {
     let conn = match state.db.read() {
         Ok(c) => c,
-        Err(e) => {
-            return Json(json!({ "error": e }))
-                .into_response()
-                .with_status(StatusCode::INTERNAL_SERVER_ERROR)
-        }
+        Err(e) => return internal(e),
     };
     let row: Option<(i64, i64, i64)> = conn
         .query_row(

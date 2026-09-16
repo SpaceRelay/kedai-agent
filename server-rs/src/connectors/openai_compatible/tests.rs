@@ -1,6 +1,7 @@
 // OpenAI 兼容连接器单测(自 openai_compatible.rs 尾部 #[cfg(test)] 迁入)
 use super::sse_parser::{parse_usage, MAX_BAD_JSON_EVENTS};
 use super::*;
+use crate::models::llm_error::LlmErrorKind;
 use crate::models::types::{ToolCallArgs, ToolDefinition};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -152,7 +153,7 @@ async fn generate_stream_aborts_while_waiting_for_next_chunk() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(result.unwrap_err(), "生成已中断");
+    assert_eq!(result.unwrap_err().message(), "生成已中断");
 }
 
 /// usage 解析:DeepSeek 格式带 prompt_cache_hit_tokens/prompt_cache_miss_tokens(命中率数据源)
@@ -278,6 +279,117 @@ async fn capture_request_server() -> (String, Arc<std::sync::Mutex<Option<String
         socket.write_all(b"\r\n0\r\n\r\n").await.unwrap();
     });
     (format!("http://{addr}"), holder)
+}
+
+/// 启动一个只返回固定 HTTP 错误的模拟上游(不重试的状态用);返回 base_url。
+async fn fixed_status_server(status_line: &'static str) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut request = vec![0; 4096];
+        let _ = socket.read(&mut request).await;
+        let response = format!(
+            "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: 13\r\n\r\n{{\"e\":\"r\"}}\n"
+        );
+        let _ = socket.write_all(response.as_bytes()).await;
+        let _ = socket.flush().await;
+    });
+    format!("http://{addr}")
+}
+
+/// 批次 4.3:流内错误对象的分类取自上游结构化 type/code 字段(非自由文案),
+/// 保证 HTTP 200 流内上报的限流/鉴权仍得到正确错误码与可重试性。
+#[test]
+fn sse_parser_classifies_upstream_error_object_by_structured_type() {
+    let cases: [(&[u8], LlmErrorKind, &str, bool); 5] = [
+        (
+            b"data: {\"error\":{\"message\":\"slow\",\"type\":\"request_timeout\"}}\n\n",
+            LlmErrorKind::Timeout,
+            "request_timeout",
+            true,
+        ),
+        (
+            b"data: {\"error\":{\"message\":\"rate limited\",\"type\":\"rate_limit_exceeded\"}}\n\n",
+            LlmErrorKind::RateLimited,
+            "rate_limited",
+            true,
+        ),
+        (
+            b"data: {\"error\":{\"message\":\"bad key\",\"type\":\"invalid_api_key\"}}\n\n",
+            LlmErrorKind::AuthFailed,
+            "auth_failed",
+            false,
+        ),
+        (
+            b"data: {\"error\":{\"message\":\"boom\",\"code\":\"server_error\"}}\n\n",
+            LlmErrorKind::Upstream,
+            "upstream_error",
+            true,
+        ),
+        (
+            b"data: {\"error\":{\"message\":\"over quota\",\"type\":\"insufficient_quota\"}}\n\n",
+            LlmErrorKind::Upstream,
+            "upstream_error",
+            true,
+        ),
+    ];
+    for (payload, kind, code, retryable) in cases {
+        let mut parser = SseParser::default();
+        let mut out = Vec::new();
+        let err = parser.push(payload, &mut out).unwrap_err();
+        assert_eq!(err.kind(), kind, "分类错误: {err}");
+        assert_eq!(err.code(), code, "错误码错误: {err}");
+        assert_eq!(err.retryable(), retryable, "可重试性错误: {err}");
+    }
+}
+
+/// 批次 4.3:HTTP 状态在连接器边界被映射为分类(鉴权/参数错误不可重试),
+/// 上游文案原样保留——上层不再解析文案判定 code/retryable。
+#[tokio::test]
+async fn http_status_maps_to_typed_error_kind() {
+    for (status_line, kind, code, retryable) in [
+        (
+            "401 Unauthorized",
+            crate::models::llm_error::LlmErrorKind::AuthFailed,
+            "auth_failed",
+            false,
+        ),
+        (
+            "403 Forbidden",
+            crate::models::llm_error::LlmErrorKind::AuthFailed,
+            "auth_failed",
+            false,
+        ),
+        (
+            "400 Bad Request",
+            crate::models::llm_error::LlmErrorKind::Generation,
+            "generation_failed",
+            false,
+        ),
+    ] {
+        let base_url = fixed_status_server(status_line).await;
+        let connector = OpenAiCompatibleConnector::new(&base_url, "key", "model");
+        let (_abort_tx, abort_rx) = watch::channel(false);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let err = connector
+            .generate_stream(
+                &[LlmMessage::plain("user", "hi")],
+                test_params(),
+                abort_rx,
+                tx,
+            )
+            .await
+            .expect_err("非成功状态应报错");
+        assert_eq!(err.kind(), kind, "{status_line} 分类错误");
+        assert_eq!(err.code(), code, "{status_line} 错误码错误");
+        assert_eq!(err.retryable(), retryable, "{status_line} 可重试性错误");
+        assert!(
+            err.message()
+                .contains(status_line.split(' ').next().unwrap()),
+            "应保留上游状态文案: {err}"
+        );
+    }
 }
 
 /// M2:tool_choice 与 parallel_tool_calls 按 GenerationParams 序列化进请求体;

@@ -25,6 +25,95 @@ std::thread_local! {
 /// evalTemplate 嵌套渲染深度上限
 const MAX_EVAL_TEMPLATE_DEPTH: usize = 16;
 
+// ===== 渲染资源预算(线程局部)=====
+// 角色卡属外部不可信输入:模板可含 `while(true){}` / `for(;;){}` 等死循环,
+// 而渲染在 async fn 内**同步**执行(worldbook.rs / inject_tag.rs 等),会挂死 tokio worker;
+// 深嵌套表达式还会让递归下降解析器爆栈。故对「单次顶层渲染」设迭代步数与墙钟双上限。
+//
+// 预算计数为 0 表示**不限制**(未进入渲染入口时的默认值):这样既保证旧调用路径行为不变,
+// 又避免任何入口遗漏导致误报。仅最外层渲染入口设置预算,嵌套 evalTemplate 共享同一预算
+// (见 enter_render/leave_render)。
+std::thread_local! {
+    static RENDER_STEPS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static RENDER_DEADLINE: std::cell::Cell<Option<std::time::Instant>> =
+        const { std::cell::Cell::new(None) };
+    static RENDER_NEST_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// 单次顶层渲染的循环迭代总步数上限(正常角色卡用量在数百级,20 万留足余量)
+pub(super) const MAX_RENDER_STEPS: u64 = 200_000;
+/// 单次顶层渲染的墙钟上限(毫秒);同步执行无法被 tokio 超时打断,故循环内自查
+pub(super) const MAX_RENDER_MILLIS: u128 = 2_000;
+
+/// 进入一次渲染:仅最外层设置预算与墙钟基准;返回 true 表示调用方需在退出时恢复。
+/// 嵌套渲染(evalTemplate → render_template_with_ctx)复用外层预算,不重置——
+/// 否则内层可无限次「重新充满」预算绕过限制。
+fn enter_render() -> bool {
+    RENDER_NEST_DEPTH.with(|d| {
+        let outermost = d.get() == 0;
+        d.set(d.get() + 1);
+        if outermost {
+            RENDER_STEPS.with(|b| b.set(MAX_RENDER_STEPS));
+            RENDER_DEADLINE.with(|dl| dl.set(Some(std::time::Instant::now())));
+        }
+        outermost
+    })
+}
+
+/// 退出一次渲染(参数即为 enter_render 的返回值);最外层退出时清空预算。
+fn leave_render(outermost: bool) {
+    RENDER_NEST_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+    if outermost {
+        RENDER_STEPS.with(|b| b.set(0));
+        RENDER_DEADLINE.with(|dl| dl.set(None));
+    }
+}
+
+/// 渲染预算 RAII 守卫:渲染入口持有一个,函数退出(含 panic 展开)时自动恢复,
+/// 避免预算计数泄漏到同线程的下一次渲染。
+pub(super) struct RenderGuard {
+    outermost: bool,
+}
+
+impl RenderGuard {
+    pub(super) fn new() -> Self {
+        RenderGuard {
+            outermost: enter_render(),
+        }
+    }
+}
+
+impl Drop for RenderGuard {
+    fn drop(&mut self) {
+        leave_render(self.outermost);
+    }
+}
+
+/// 循环每轮「收费」:先扣迭代预算,再查墙钟是否超出。返回 Err 时由 exec 逐层冒泡,
+/// 最终被 render_template_with_ctx 的逐语句错误收集吞掉(该块回退原文,不影响其余块)。
+pub(super) fn charge_step() -> Result<(), String> {
+    RENDER_STEPS.with(|b| -> Result<(), String> {
+        let left = b.get();
+        // 0 = 未设预算(不限制);扣到 1 即最后一轮,视为耗尽
+        if left == 0 {
+            return Ok(());
+        }
+        if left == 1 {
+            return Err("EJS 渲染超出步数预算(疑似死循环,已中止)".to_string());
+        }
+        b.set(left - 1);
+        Ok(())
+    })?;
+    RENDER_DEADLINE.with(|dl| -> Result<(), String> {
+        if let Some(t0) = dl.get() {
+            if t0.elapsed().as_millis() >= MAX_RENDER_MILLIS {
+                return Err("EJS 渲染超出时间预算(2 秒,已中止)".to_string());
+            }
+        }
+        Ok(())
+    })
+}
+
 /// 嵌套渲染(evalTemplate / getwi / getqr / getpreset 的内容渲染共用):
 /// 共享同一渲染上下文(重新拷贝引用),嵌套登记的注入清单合并回父级;
 /// 深度超限或渲染出错返回原文,保证模板不炸、不无限递归。
@@ -109,6 +198,8 @@ pub(super) fn exec(env: &mut Env, stmt: &Stmt) -> Result<Flow, String> {
                         break;
                     }
                 }
+                // 资源预算:防 `for(;;)` 死循环挂死 worker
+                charge_step()?;
                 env.push_scope();
                 let flow = exec(env, body)?;
                 if matches!(flow, Flow::Break | Flow::Return(_)) {
@@ -130,6 +221,8 @@ pub(super) fn exec(env: &mut Env, stmt: &Stmt) -> Result<Flow, String> {
                 _ => Vec::new(),
             };
             for item in items {
+                // 资源预算:数组可被脚本放大,同样计入循环步数
+                charge_step()?;
                 env.push_scope();
                 env.declare(name, item);
                 let flow = exec(env, body)?;
@@ -146,6 +239,8 @@ pub(super) fn exec(env: &mut Env, stmt: &Stmt) -> Result<Flow, String> {
                 if !truthy(&eval_expr(env, cond)?) {
                     break;
                 }
+                // 资源预算:防 `while(true)` 死循环挂死 worker
+                charge_step()?;
                 env.push_scope();
                 let flow = exec(env, body)?;
                 if matches!(flow, Flow::Break | Flow::Return(_)) {
@@ -911,6 +1006,7 @@ mod tests {
             enabled: true,
             position: 0,
             depth: 4,
+            scan_depth: None,
             order: 100,
             case_sensitive: false,
             sticky: 0,

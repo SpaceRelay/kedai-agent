@@ -11,15 +11,14 @@
 //   events.rs   任务事件 broadcast 通道与发射(WP4 SSE 实时化)
 //   cancel.rs   取消信号与执行 token 登记
 //   prompt.rs   提示词组装(任务设置/世界书/注入/Agent 系统提示词/人设)
-//   parse.rs    计划 JSON 解析(含 parse_plan 单测)
-//   executor.rs 后台执行引擎(run/stop、LLM 调用、分级重试、后台主体)
+//   executor.rs 后台执行引擎(run/stop、LLM 单次生成原语、后台主体)
 use super::log_query_failure;
 use crate::connectors::Connector;
 use crate::models::db::{now_iso, Db, PooledRead};
 use crate::models::types::{
-    CharacterRecord, GenerationParams, LlmMessage, LlmStreamChunk, SseEvent, TaskFollowupMode,
-    TaskLlmCallRecord, TaskMessageRecord, TaskRecord, TaskRunMode, TaskStatus, TaskStep,
-    TaskStepStatus, TaskSubtaskRecord, TaskSubtaskStatus, ToolCallArgs, ToolChoice, ToolContext,
+    CharacterRecord, GenerationParams, LlmMessage, LlmStreamChunk, SseEvent, TaskEventKind,
+    TaskFollowupMode, TaskLlmCallRecord, TaskMessageRecord, TaskRecord, TaskRunMode, TaskStatus,
+    TaskStep, TaskSubtaskRecord, TaskSubtaskStatus, ToolCallArgs, ToolChoice, ToolContext,
     ToolDefinition,
 };
 use crate::services::agent_flow_service::AgentFlowService;
@@ -36,12 +35,12 @@ use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, watch, RwLock};
 use uuid::Uuid;
 
-// 按职责拆分的子模块(纯代码移动):DB 读写 / 取消信号 / 提示词组装 / 计划解析 / 后台执行
+// 按职责拆分的子模块(纯代码移动):DB 读写 / 取消信号 / 提示词组装 / 后台执行
+pub(crate) mod backend_impl;
 pub(crate) mod cancel;
 pub(crate) mod db;
 pub(crate) mod events;
 pub(crate) mod executor;
-pub(crate) mod parse;
 pub(crate) mod prompt;
 
 use self::db::{row_to_task, TASK_COLS};
@@ -52,19 +51,9 @@ use self::db::{row_to_task, TASK_COLS};
 /// 均在数十秒量级,5 分钟上限足够宽裕)。
 const TASK_LLM_TOTAL_TIMEOUT: Duration = Duration::from_secs(300);
 
-/// 空输出重试前的退避间隔(避免对上游瞬时抖动形成紧循环)。
-const EMPTY_RETRY_BACKOFF: Duration = Duration::from_millis(500);
-
-/// 空输出重试时的 max_tokens 翻倍上限(与设置页 max_tokens 上限一致)。
-const RETRY_MAX_TOKENS_CAP: u32 = 65536;
-
-/// 规划调用的初始 max_tokens。推理模型的 reasoning 与正文共用同一预算,
-/// 1024 曾被 reasoning 整体吃光导致正文零输出/JSON 半截(2026-08-27 exe 实测),
-/// 故起始预算给到 2048。
-const PLAN_INITIAL_MAX_TOKENS: u32 = 2048;
-
-/// 规划解析失败的最大尝试次数(截断/空输出每次翻倍预算,纯格式错误同预算重试)。
-const PLAN_MAX_ATTEMPTS: u32 = 3;
+// 空输出分级重试与规划解析的算法/常量(EMPTY_RETRY_BACKOFF / RETRY_MAX_TOKENS_CAP /
+// PLAN_INITIAL_MAX_TOKENS / PLAN_MAX_ATTEMPTS / parse_plan)已于批次 4.2 上移
+// task_engine::retry + task_engine::parse(任务引擎职责,非宿主能力)。
 
 /// 规划器只读侦察白名单(问题②,2026-08-31 实测:计划模式下模型只写计划、
 /// 不调用工具收集信息,对「测试 agent 框架能力」这类目标只能凭空编造步骤):
@@ -79,22 +68,9 @@ const PLANNER_SCOUT_TOOLS: &[&str] = crate::tools::tool_sets::READONLY_SCOUT;
 /// (计划契约不变);侦察是增强环节,轮数封底防模型沉迷收集迟迟不出计划。
 const PLANNER_SCOUT_MAX_ROUNDS: usize = 2;
 
-/// 任务模式单次 LLM 调用的完整产出:正文 + 诊断信息。
-/// 诊断字段来自流式 Usage/Finish/Reasoning 块,用于日志排障、空输出分级重试与 usage 落库。
-pub(crate) struct TaskGenOutput {
-    pub text: String,
-    /// stop/length/content_filter 等;上游未下发时为 None
-    pub finish_reason: Option<String>,
-    pub prompt_tokens: i64,
-    pub completion_tokens: i64,
-    /// completion 中推理消耗的 token(推理模型;0 = 无观测)
-    pub reasoning_tokens: i64,
-    /// 推理正文字符数(reasoning_content 流;与 reasoning_tokens 互补,部分上游只给其一)
-    pub reasoning_chars: usize,
-    /// 本次调用模型请求的工具调用(仅下发 tools 的调用可能非空;问题②规划器侦察轮用,
-    /// 其余调用方恒空)。来自流式 ToolCall 块聚合(与 execute_generation 同口径)。
-    pub tool_calls: Vec<ToolCallArgs>,
-}
+/// 任务模式单次 LLM 调用的完整产出:正文 + 诊断信息(批次 B.3 搬迁至 task_core,
+/// 本处再导出保持既有调用方零改动)。
+pub(crate) use crate::services::task_core::TaskGenOutput;
 
 pub struct TaskService {
     db: Arc<Db>,
@@ -152,7 +128,7 @@ impl TaskService {
         // + error 文本;DB 写成功后逐个发射 status 事件(WP4 纪律:先写库后发射)
         for id in db::recover_orphan_tasks(&svc.db) {
             svc.emit_event(
-                "status",
+                TaskEventKind::Status,
                 &id,
                 None,
                 Some(TaskStatus::Ended),
@@ -193,7 +169,7 @@ impl TaskService {
         // 落库失败不阻断创建(消息是展示层增强,任务本身已建好)。
         let _ = self.add_task_message(&id, "user", "goal", title);
         self.emit_event(
-            "created",
+            TaskEventKind::Created,
             &id,
             Some(title.to_string()),
             Some(TaskStatus::Pending),
@@ -262,7 +238,13 @@ impl TaskService {
             .map(|n| n > 0)
             .unwrap_or(false);
         if deleted {
-            self.emit_event("deleted", id, None, None, Some("任务已删除".into()));
+            self.emit_event(
+                TaskEventKind::Deleted,
+                id,
+                None,
+                None,
+                Some("任务已删除".into()),
+            );
         }
         deleted
     }

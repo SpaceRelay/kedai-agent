@@ -4,11 +4,28 @@
 use crate::api::app_state::AppState;
 use crate::services::cache_diagnostics::{summarize, watermark, CachePricing, CacheUsageRow};
 use axum::extract::{Query, State};
+use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::Deserialize;
 use serde_json::json;
 use std::sync::Arc;
+
+use super::{err_with_code, ErrorCode};
+
+/// 全会话统计:窗口参数是 `?1`。
+const SQL_ALL_SESSIONS: &str = "SELECT session_id, created_at, prompt_tokens, completion_tokens,
+        prompt_cache_hit_tokens, prompt_cache_miss_tokens
+ FROM llm_requests ORDER BY id DESC LIMIT ?1";
+
+/// 单会话统计:`?1` = session_id,`?2` = 窗口。
+///
+/// 两个 SQL 的**参数序号必须与各自绑定处一致**——曾因无会话分支沿用了 `?2` 而只绑定
+/// 一个参数,使「不带 session_id」的请求(前端优化面板的默认路径)恒定报
+/// `Wrong number of parameters passed to query`。改 SQL 时请同时改绑定处。
+const SQL_BY_SESSION: &str = "SELECT session_id, created_at, prompt_tokens, completion_tokens,
+        prompt_cache_hit_tokens, prompt_cache_miss_tokens
+ FROM llm_requests WHERE session_id = ?1 ORDER BY id DESC LIMIT ?2";
 
 #[derive(Deserialize)]
 pub struct CacheQuery {
@@ -26,17 +43,13 @@ pub async fn cache(State(state): State<Arc<AppState>>, Query(q): Query<CacheQuer
         let conn = match state.db.read() {
             Ok(c) => c,
             Err(e) => {
-                return Json(json!({ "error": e })).into_response();
+                tracing::error!(error = %e, "读取缓存统计失败:获取只读连接");
+                return err_with_code(
+                    ErrorCode::Db,
+                    "读取缓存统计失败",
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                );
             }
-        };
-        let sql = if q.session_id.is_some() {
-            "SELECT session_id, created_at, prompt_tokens, completion_tokens,
-                    prompt_cache_hit_tokens, prompt_cache_miss_tokens
-             FROM llm_requests WHERE session_id = ?1 ORDER BY id DESC LIMIT ?2"
-        } else {
-            "SELECT session_id, created_at, prompt_tokens, completion_tokens,
-                    prompt_cache_hit_tokens, prompt_cache_miss_tokens
-             FROM llm_requests ORDER BY id DESC LIMIT ?2"
         };
         let map_row = |row: &rusqlite::Row<'_>| -> rusqlite::Result<CacheUsageRow> {
             Ok(CacheUsageRow {
@@ -48,34 +61,30 @@ pub async fn cache(State(state): State<Arc<AppState>>, Query(q): Query<CacheQuer
                 miss: row.get(5)?,
             })
         };
-        let result: Result<Vec<_>, _> = if let Some(sid) = &q.session_id {
-            let mut stmt = match conn.prepare(sql) {
-                Ok(s) => s,
-                Err(e) => {
-                    return Json(json!({ "error": format!("读取缓存统计失败: {e}") }))
-                        .into_response();
-                }
-            };
-            stmt.query_map(rusqlite::params![sid, window as i64], map_row)
-                .and_then(|rows| rows.collect())
-        } else {
-            let mut stmt = match conn.prepare(sql) {
-                Ok(s) => s,
-                Err(e) => {
-                    return Json(json!({ "error": format!("读取缓存统计失败: {e}") }))
-                        .into_response();
-                }
-            };
-            stmt.query_map(rusqlite::params![window as i64], map_row)
-                .and_then(|rows| rows.collect())
+        // 绑定参数与所选 SQL 的序号一一对应(见两个 SQL 常量的注释)
+        let outcome: rusqlite::Result<Vec<CacheUsageRow>> = match &q.session_id {
+            Some(sid) => conn.prepare(SQL_BY_SESSION).and_then(|mut stmt| {
+                stmt.query_map(rusqlite::params![sid, window as i64], map_row)
+                    .and_then(|rows| rows.collect())
+            }),
+            None => conn.prepare(SQL_ALL_SESSIONS).and_then(|mut stmt| {
+                stmt.query_map(rusqlite::params![window as i64], map_row)
+                    .and_then(|rows| rows.collect())
+            }),
         };
-        match result {
+        match outcome {
             Ok(mut v) => {
                 v.reverse(); // DESC 取最近 N 条 → 反转为时间正序
                 v
             }
             Err(e) => {
-                return Json(json!({ "error": format!("读取缓存统计失败: {e}") })).into_response();
+                // 原始错误(含 SQLite 文案)只进日志;响应给通用文案,不把内部细节透传给客户端
+                tracing::error!(error = %e, window, "读取缓存统计失败");
+                return err_with_code(
+                    ErrorCode::Db,
+                    "读取缓存统计失败",
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                );
             }
         }
     };

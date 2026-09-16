@@ -86,33 +86,25 @@ pub(crate) fn collect_world_text_grouped_with(
             if !rendered.trim().is_empty() {
                 constant_parts.push(WorldInjection {
                     role: WorldInjection::from_entry(e, "system"),
-                    text: format!("[{}]\n{}", e.comment, rendered.trim()),
+                    // keep_empty_bracket=true:保持存量卡的逐字节行为(空 comment 也出 `[]`)。
+                    // 差异化约定与单点实现见 services::prompt_kit::world_entry_text。
+                    text: crate::services::prompt_kit::world_entry_text(
+                        &e.comment, &rendered, true,
+                    ),
                 });
             }
             continue;
         }
-        // 扫描窗口:depth<=0 用全部;否则最近 depth 条用户消息
-        let depth = if e.depth <= 0 {
-            all_user.len()
-        } else {
-            (e.depth as usize).min(all_user.len())
-        };
-        let window: Vec<&String> = all_user
-            .iter()
-            .skip(all_user.len().saturating_sub(depth))
-            .collect();
-        if window.is_empty() {
-            continue;
-        }
-        // 命中判定(与 generate-raw 共用 entry_matches_texts):正则优先
-        // (无独立 regex 字段时 keys 按 ST 语义当正则);否则 keys + 副关键词子串
-        let owned: Vec<String> = window.iter().map(|s| (*s).clone()).collect();
-        let hit = crate::parsing::world_book::entry_matches_texts(e, &owned);
-        if !hit {
-            continue;
-        }
-        // 概率:use_probability 时按 probability% 随机决定(0 永不注入,100 恒注入)
-        if !crate::parsing::world_book::entry_probability_pass(e, simple_roll()) {
+        // 激发判定(「窗口→匹配→概率」三步已收敛到 prompt_kit::triggered_entry_hits):
+        // 本场景只扫 **user 消息**,未声明 scan_depth 时兜底用条目 depth(存量卡行为)。
+        // 概率 roll 统一走 prompt_kit::world_entry_roll(收敛前用本模块的 simple_roll,
+        // 与 generate-raw 侧的 subsec_nanos 不同源,现已统一)。
+        if !crate::services::prompt_kit::triggered_entry_hits(
+            e,
+            &all_user,
+            e.depth,
+            crate::services::prompt_kit::world_entry_roll(),
+        ) {
             continue;
         }
         if !e.content.trim().is_empty() {
@@ -120,7 +112,9 @@ pub(crate) fn collect_world_text_grouped_with(
             if !rendered.trim().is_empty() {
                 triggered_parts.push(WorldInjection {
                     role: WorldInjection::from_entry(e, "user"),
-                    text: format!("[{}]\n{}", e.comment, rendered.trim()),
+                    text: crate::services::prompt_kit::world_entry_text(
+                        &e.comment, &rendered, true,
+                    ),
                 });
             }
         }
@@ -228,16 +222,9 @@ fn append_state_block(world_text: Option<String>, vars: &AssistantVars) -> Optio
     })
 }
 
-/// 构建 mvu few-shot 示例对:引导模型在回复末尾输出 <UpdateVariable> 块。
-/// 简易随机 0-99(无 rand 依赖;注入概率判定用,无需加密级)
-fn simple_roll() -> i64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.subsec_nanos())
-        .unwrap_or(0);
-    (nanos % 100) as i64
-}
+/// 注:本文件原有的 `simple_roll()` 已于 2026-09-14 移除——激发概率的 roll 来源统一收敛到
+/// `crate::services::prompt_kit::world_entry_roll()`(此前与 generate-raw 侧各自实现,
+/// 来源不同导致同轮行为不可复现地分叉)。若需随机 roll,请调用该单点函数,勿再写一份。
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -262,6 +249,7 @@ mod tests {
             enabled,
             position: 0,
             depth: 4,
+            scan_depth: None,
             order: 100,
             case_sensitive: false,
             sticky: 0,
@@ -287,6 +275,7 @@ mod tests {
             enabled,
             position: 0,
             depth: 4,
+            scan_depth: None,
             order: 100,
             case_sensitive: false,
             sticky: 0,
@@ -340,6 +329,34 @@ mod tests {
         let history2 = vec![message("user", "我在图书馆里看书")];
         let text = collect_world_text(&entries, &history2, &mut AssistantVars::new()).unwrap();
         assert!(text.contains("图书馆很安静"));
+    }
+
+    /// 概率门控只作用于触发条目:constant 条目即使 use_probability=true/probability=0
+    /// 也必须注入(2026-09-13 批次 3 核实并锁定:常驻条目进 system 前缀,若参与概率
+    /// 会每轮扰动缓存前缀;实现上概率判定位于 constant 分支之后,本测试锁死该不变式)。
+    #[test]
+    fn constant_entries_ignore_probability() {
+        let mut e = entry("世界观", vec![], "常驻设定", true, true);
+        e.use_probability = true;
+        e.probability = 0; // 0 = 永不注入;若常驻条目参与概率,本断言即失败
+        let history = vec![message("user", "你好")];
+        let text = collect_world_text(&[e], &history, &mut AssistantVars::new())
+            .expect("常驻条目不参与概率,必须注入");
+        assert!(text.contains("常驻设定"));
+    }
+
+    /// 触发条目参与概率:probability=0 时命中也不注入(证明门控确实作用于触发条目,
+    /// 与上一条共同锁定「概率只影响尾部注入、不影响 system 前缀」)
+    #[test]
+    fn triggered_entries_respect_probability() {
+        let mut e = entry("地点", vec!["图书馆"], "图书馆很安静", false, true);
+        e.use_probability = true;
+        e.probability = 0;
+        let history = vec![message("user", "我在图书馆")];
+        assert!(
+            collect_world_text(&[e], &history, &mut AssistantVars::new()).is_none(),
+            "触发条目 probability=0 应被概率门控拦下"
+        );
     }
 
     /// 未启用 / 非 constant 且无 key / 命中与否的多种组合
@@ -415,7 +432,9 @@ mod tests {
         assert!(collect_world_text(&entries, &history, &mut AssistantVars::new()).is_none());
     }
 
-    /// depth 扫描深度:关键词只扫最近 N 条用户消息,超出窗口不命中
+    /// 扫描窗口兜底:条目未声明 scan_depth 时沿用条目 depth 作窗口
+    /// (存量卡行为不变;ST 语义上 depth 是插入深度,此处为兼容保留,见
+    /// parsing::world_book::scan_window_len)
     #[test]
     fn depth_limits_scan_window() {
         let mut e = entry("地点", vec!["图书馆"], "图书馆安静。", false, true);
@@ -424,14 +443,14 @@ mod tests {
             message("user", "上次去过图书馆"),
             message("user", "今天在家看书"),
         ];
-        // depth=1 只扫最近 1 条用户消息("今天在家看书"),图书馆不命中
+        // 窗口 1 只扫最近 1 条用户消息("今天在家看书"),图书馆不命中
         assert!(collect_world_text(&[e.clone()], &history, &mut AssistantVars::new()).is_none());
-        // depth=0 = 全部历史,命中
+        // 窗口 0 = 全部历史,命中
         e.depth = 0;
         assert!(collect_world_text(&[e], &history, &mut AssistantVars::new()).is_some());
     }
 
-    /// 回归:角色卡把 depth 写在 extensions 内时,扫描窗口须按该值生效。
+    /// 回归:角色卡把 depth 写在 extensions 内时,它作为窗口兜底须按该值生效。
     /// 赛马娘卡的【开局】/【怪奇IF】条目作者设定 depth=2,而首楼界面替换后选项文案
     /// 会继续留在历史里;旧实现把 depth 当缺省 4,使这些条目超出作者窗口后仍命中,
     /// 污染提示词(实测:4 条消息窗口下误注入)。
@@ -444,6 +463,7 @@ mod tests {
         ] });
         let entries = crate::parsing::world_book::collect_entries(&raw);
         assert_eq!(entries[0].depth, 2, "extensions.depth 应被解析");
+        assert_eq!(entries[0].scan_depth, None, "该卡未声明 scan_depth");
 
         // 关键词只在第 1 条,其后 3 条无关 → 共 4 条用户消息
         let history = vec![
@@ -452,10 +472,10 @@ mod tests {
             message("user", "无关消息二"),
             message("user", "无关消息三"),
         ];
-        // depth=2 只扫最近 2 条,关键词落在窗口外 → 不命中(旧实现 depth=4 会误命中)
+        // 兜底窗口 2 只扫最近 2 条,关键词落在窗口外 → 不命中(旧实现缺省 4 会误命中)
         assert!(
             collect_world_text(&entries, &history, &mut AssistantVars::new()).is_none(),
-            "extensions.depth=2 不应扫到 4 条窗口外的关键词"
+            "extensions.depth=2 兜底窗口不应扫到 4 条窗口外的关键词"
         );
         // 关键词回到窗口内(最后一条)则命中
         let near = vec![
@@ -464,6 +484,29 @@ mod tests {
             message("user", "【开场场景】野史大学习"),
         ];
         assert!(collect_world_text(&entries, &near, &mut AssistantVars::new()).is_some());
+    }
+
+    /// 条目声明 scanDepth 时以它为准,depth 兜底不再参与 —— 吸血鬼卡格式条目
+    /// extensions.depth=1 但 (ST 语义)扫描窗口应由 scanDepth 决定;
+    /// 声明 scanDepth=0(全部历史)时必须扫到历史里的触发词。
+    #[test]
+    fn scan_depth_wins_over_depth_fallback() {
+        let raw = serde_json::json!({ "entries": [
+            { "uid": 1, "comment": "格式规范", "keys": ["system log"],
+              "content": "仅输出一个 JSON", "constant": false, "disable": false,
+              "extensions": { "depth": 1, "scan_depth": 0 } }
+        ] });
+        let entries = crate::parsing::world_book::collect_entries(&raw);
+        let history = vec![
+            message("user", "/* system log(IGNORE the line): */ 开场"),
+            message("user", "无关消息一"),
+            message("user", "无关消息二"),
+        ];
+        // depth=1 若当窗口会漏掉首条;scanDepth=0 应扫全部 → 命中
+        assert!(
+            collect_world_text(&entries, &history, &mut AssistantVars::new()).is_some(),
+            "scanDepth=0 应覆盖 depth=1 兜底,扫全部历史"
+        );
     }
 
     /// 副关键词(keysecondary)与主关键词并列命中

@@ -26,7 +26,9 @@ async fn test_lock() -> MutexGuard<'static, ()> {
     LOCK.get_or_init(|| Mutex::new(())).lock().await
 }
 
-/// 测试数据目录(与 lib.rs build_test_app 同规则:temp/kedai-test-{pid})
+/// 测试数据目录(与 lib.rs build_test_app 同规则:temp/kedai-test-{pid})。
+/// build_test_app 的数据目录是**进程级共享**单例,生命周期等于测试进程,
+/// 不能套 RAII 守卫(会删掉后续用例要用的库)。
 fn data_dir() -> PathBuf {
     std::env::temp_dir().join(format!("kedai-test-{}", std::process::id()))
 }

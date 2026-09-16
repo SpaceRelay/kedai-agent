@@ -68,7 +68,7 @@ pub async fn guard(State(state): State<Arc<AppState>>, request: Request, next: N
                 .get::<ConnectInfo<SocketAddr>>()
                 .map(|ConnectInfo(addr)| addr.ip().to_string())
                 .unwrap_or_default();
-            if !bootstrap_rate_ok(&state.bootstrap_limiter, &peer) {
+            if !bootstrap_rate_ok(&state.guards.bootstrap_limiter, &peer) {
                 return reject(StatusCode::TOO_MANY_REQUESTS, "bootstrap 请求过于频繁");
             }
         }

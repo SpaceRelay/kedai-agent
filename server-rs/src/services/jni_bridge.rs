@@ -24,10 +24,7 @@ use std::ffi::c_void;
 use std::sync::{Mutex, OnceLock};
 
 /// 需要按名调用的桥接类(Kotlin object,静态方法入参/出参均为 String)
-const BRIDGE_CLASSES: &[&str] = &[
-    "com/kedai/app/KeystoreBridge",
-    "com/kedai/app/KedaiNative",
-];
+const BRIDGE_CLASSES: &[&str] = &["com/kedai/app/KeystoreBridge", "com/kedai/app/KedaiNative"];
 
 /// 桥接方法签名:入参 String,返回 String
 const BRIDGE_SIG: &str = "(Ljava/lang/String;)Ljava/lang/String;";
@@ -84,7 +81,11 @@ fn cache_class(env: &mut JNIEnv<'_>, class: &'static str) -> Result<(), String> 
 /// 调用指定桥接类的静态方法(入参/出参均为 String)。
 ///
 /// `class` 必须是 [`BRIDGE_CLASSES`] 中的全限定名(`/` 分隔)。
-pub fn call_string_static(class: &'static str, method: &str, input: &str) -> Result<String, String> {
+pub fn call_string_static(
+    class: &'static str,
+    method: &str,
+    input: &str,
+) -> Result<String, String> {
     let vm = VM
         .get()
         .ok_or_else(|| "Android JVM 未就绪(JNI_OnLoad 未执行)".to_string())?;

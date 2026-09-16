@@ -75,6 +75,9 @@ async fn health() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(json["ok"], json!(true));
     assert!(json["ts"].is_number());
+    // 批次 2:依赖探测。`ok` 必须保持 liveness 语义(桌面壳 health_ok() 依赖它,
+    // src-tauri/src/lib.rs),依赖态只经 dependencies 上报;正常库应为 "ok"。
+    assert_eq!(json["dependencies"]["db"], json!("ok"));
 }
 
 #[tokio::test]
@@ -940,9 +943,11 @@ async fn test_lock() -> MutexGuard<'static, ()> {
     // 被注入 mock 断言(与 build_test_app 临时数据目录的隔离语义一致)。Once 保证只设一次。
     static INIT: std::sync::Once = std::sync::Once::new();
     INIT.call_once(|| {
-        let dir = std::env::temp_dir().join("kedai-test-runtime-prompt-empty");
-        std::fs::create_dir_all(&dir).unwrap();
-        std::env::set_var("KEDAI_RUNTIME_PROMPT_DIR", &dir);
+        // uuid 唯一名(避免多测试二进制并发共用同名目录);守卫随本闭包析构即回收。
+        // 目录是否存在不影响语义:with_dir 关闭内置默认回退,读不到文件即视为「无提示词」,
+        // 与「指向一个空目录」等价(全仓无测试写该文件)。
+        let dir = kedai_server::utils::test_support::TempDataDir::new("test-runtime-prompt-empty");
+        std::env::set_var("KEDAI_RUNTIME_PROMPT_DIR", dir.path());
     });
     LOCK.get_or_init(|| Mutex::new(())).lock().await
 }
@@ -1176,6 +1181,80 @@ async fn state_block_auto_injected_into_system() {
     );
 }
 
+/// 可观测性问题①(2026-09-15):聊天路径的 finish 事件须透出 finish_reason。
+/// 此前 SseEvent::Finish 只有 usage/content,聊天被 max_tokens 截断时前端完全静默
+/// (任务模式早有「截断」徽标)。此处经 mock [[finish:length|…]] 钩子直造截断终态。
+#[tokio::test]
+async fn chat_finish_event_exposes_finish_reason_on_truncation() {
+    let _guard = test_lock().await;
+    let app = test_app();
+    let (_, character) = upload_character(app, "截断测试.json").await;
+    let cid = character["id"].as_str().unwrap().to_string();
+    let (_, session) = send_json(
+        app,
+        "POST",
+        "/api/chat/sessions",
+        json!({ "character_id": cid }),
+    )
+    .await;
+    let sid = session["id"].as_str().unwrap().to_string();
+
+    // [[finish:length|半截正文]] → 产出该正文并带 finish_reason=length
+    let events = sse_events(
+        app,
+        &sid,
+        &cid,
+        "[[finish:length|这段回复在输出上限处被截断]]",
+        "fast",
+    )
+    .await;
+    let finish = events
+        .iter()
+        .find(|e| e["type"] == "finish")
+        .expect("缺 finish 事件");
+    assert_eq!(
+        finish["finish_reason"], "length",
+        "聊天 finish 事件应透出 finish_reason: {finish}"
+    );
+
+    // 正常收尾(stop)不得被误标截断
+    let (_, session2) = send_json(
+        app,
+        "POST",
+        "/api/chat/sessions",
+        json!({ "character_id": cid }),
+    )
+    .await;
+    let sid2 = session2["id"].as_str().unwrap().to_string();
+    let events2 = sse_events(app, &sid2, &cid, "[[finish:stop|完整回复]]", "fast").await;
+    let finish2 = events2
+        .iter()
+        .find(|e| e["type"] == "finish")
+        .expect("缺 finish 事件");
+    assert_eq!(finish2["finish_reason"], "stop", "正常收尾应为 stop");
+
+    // 落库的 assistant 消息带 extra.truncated=true(刷新后提示仍在)
+    let (_, history) = send_json(
+        app,
+        "GET",
+        &format!("/api/chat/history?session_id={sid}"),
+        json!({}),
+    )
+    .await;
+    let msgs = history["messages"]
+        .as_array()
+        .expect("history 应含 messages");
+    let assistant = msgs
+        .iter()
+        .rev()
+        .find(|m| m["role"] == "assistant")
+        .expect("应有 assistant 消息");
+    assert_eq!(
+        assistant["extra"]["truncated"], true,
+        "截断应落库 extra.truncated(刷新后提示仍在): {assistant}"
+    );
+}
+
 /// custom 多步流程:中间步骤的 <UpdateVariable> 补丁在步骤完成时立即应用。
 /// 断言:第一个 vars 事件出现在步骤 2 执行之前(旧实现只在收尾解析,中间步骤变量会丢),
 /// 且最终消息 extra.mvu 快照落库正确。
@@ -1389,6 +1468,78 @@ async fn agent_tool_loop_exceeds_eight_rounds() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "恢复 max_tool_rounds 应 200");
+}
+
+/// P0-2(2026-09-14):工具循环「重复调用熔断」端到端回归。
+///
+/// 背景:此前普通 agent 工具循环**没有任何重复调用检测**,唯一终止条件是
+/// max_tool_rounds。实测 plan 模式任务在单步反复调用同一工具时,7 分钟烧掉
+/// 150 万 prompt token 仍未收敛,必须人工 stop。
+///
+/// 本用例用 [[tool_loop_repeat:...]] 钩子模拟「模型以完全相同参数反复调用同一工具」
+/// (真实死循环形态),断言:
+///   1. 引擎在远小于 max_tool_rounds 的轮次内自行中止;
+///   2. 中止理由以 step 事件显式透出(不静默截断);
+///   3. 已执行的每个工具调用都有 tool_result 终态(无 running 悬挂)。
+#[tokio::test]
+async fn agent_tool_loop_duplicate_call_breaks_early() {
+    let _guard = test_lock().await;
+    let app = test_app();
+    // 上限放大到 32:确保中止来自熔断而非轮次上限
+    let (status, _) = send_json(
+        app,
+        "PUT",
+        "/api/settings",
+        json!({ "max_tool_rounds": 32 }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, char) = upload_character(app, "重复调用熔断.json").await;
+    let cid = char["id"].as_str().unwrap().to_string();
+    let (_, session) = send_json(
+        app,
+        "POST",
+        "/api/chat/sessions",
+        json!({ "character_id": cid }),
+    )
+    .await;
+    let sid = session["id"].as_str().unwrap().to_string();
+    // 参数逐字相同重复 20 轮(远小于上限 32)
+    let args = r#"{"queries":[{"type":"character_prompt"}]}"#;
+    let events = sse_events(
+        app,
+        &sid,
+        &cid,
+        &format!("[[tool_loop_repeat:read|20 {args}]]"),
+        "agent",
+    )
+    .await;
+
+    let tool_calls = events.iter().filter(|e| e["type"] == "tool_call").count();
+    let tool_results = events.iter().filter(|e| e["type"] == "tool_result").count();
+    let broke = events
+        .iter()
+        .any(|e| e["type"] == "step" && e["step"] == "重复调用熔断");
+
+    assert!(broke, "同参数重复调用应触发熔断并透出理由: {events:?}");
+    assert!(
+        tool_calls < 20,
+        "应在 mock 请求的 20 轮之前中止(实际 {tool_calls} 轮): {events:?}"
+    );
+    assert_eq!(
+        tool_results, tool_calls,
+        "已执行的工具调用必须都有 tool_result 终态(无 running 悬挂): {events:?}"
+    );
+    // 熔断文案应指明工具名,便于用户诊断
+    let detail = events
+        .iter()
+        .find(|e| e["type"] == "step" && e["step"] == "重复调用熔断")
+        .and_then(|e| e["detail"].as_str())
+        .unwrap_or("");
+    assert!(
+        detail.contains("read") && detail.contains("重复调用"),
+        "熔断理由应含工具名与说明,实际: {detail}"
+    );
 }
 
 /// M1 回归:轮次上限配置生效——设置上限 3,模型持续请求工具时,每次生成尝试内恰好
@@ -1618,12 +1769,14 @@ async fn upstream_model_error_emits_error_terminal_event() {
     )
     .await;
     let sid = session["id"].as_str().unwrap().to_string();
-    // mock [[fail:...]]:模型请求返回错误(非中断)
+    // mock [[fail:文案@分类]]:模型请求返回错误(非中断)。
+    // 分类由 mock 钩子显式声明(@timeout)——错误分类不再由引擎对文案做子串猜测,
+    // 见 server-rs/src/models/llm_error.rs(批次 4.3 未类型化的字符串回退已删除)。
     let events = sse_events(
         app,
         &sid,
         &cid,
-        "触发错误 [[fail:上游连接超时 504]]",
+        "触发错误 [[fail:上游连接超时 504@timeout]]",
         "deep",
     )
     .await;
@@ -1657,7 +1810,7 @@ async fn resource_proxy_rejects_invalid_urls() {
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "http 应拒绝: {body}");
-    assert!(body["ok"] == json!(false));
+    assert_eq!(body["code"], json!("VALIDATION"));
     // javascript: 拒绝
     let (status, body) = send_json(
         app,
@@ -1978,6 +2131,7 @@ async fn render_frame_document_is_served() {
 
 /// 直插 llm_requests 缓存统计行(绕过引擎,精确控制命中/未命中数据)
 fn insert_cache_rows(sid: &str) {
+    // build_test_app 的进程级共享数据目录(只读/直插,不受本批次守卫管理)
     let db_path = std::env::temp_dir()
         .join(format!("kedai-test-{}", std::process::id()))
         .join("kedai.db");
@@ -2065,6 +2219,61 @@ async fn diagnostics_cache_reports_hit_rate_and_pricing() {
     .await;
     assert_eq!(body["totals"]["count"], json!(1));
     assert_eq!(body["entries"][0]["hit"], json!(600));
+}
+
+/// 回归:不带 session_id 时必须成功(全会话合并统计)。
+///
+/// 该分支曾因 SQL 沿用 `LIMIT ?2` 而只绑定一个参数,恒定返回
+/// `{"error":"... Wrong number of parameters ..."}`;且错误分支用 200 返回,
+/// 于是前端 `CacheHealthPanel`(默认不传 sessionId)把 `{error}` 当成
+/// `CacheDiagnostics`,访问 `data.totals.hit_rate` 抛 TypeError。
+/// 本测试锁定「200 + 正常结构」,不允许错误体出现在成功路径上。
+#[tokio::test]
+async fn diagnostics_cache_without_session_id_returns_all_sessions() {
+    let app = test_app();
+    let (_, char) = upload_character(app, "缓存诊断无会话.json").await;
+    let cid = char["id"].as_str().unwrap().to_string();
+    let (_, session) = send_json(
+        app,
+        "POST",
+        "/api/chat/sessions",
+        json!({ "character_id": cid, "title": "无会话过滤" }),
+    )
+    .await;
+    let sid = session["id"].as_str().unwrap().to_string();
+    insert_cache_rows(&sid);
+
+    // window=500(上限)避开与本文件其它用例的时间序竞争
+    let (status, body) =
+        send_json(app, "GET", "/api/diagnostics/cache?window=500", json!({})).await;
+    assert_eq!(status, StatusCode::OK, "无 session_id 应正常返回: {body}");
+    assert!(
+        body.get("error").is_none(),
+        "成功路径不得出现 error 字段: {body}"
+    );
+    // 结构完整:totals 为对象且统计到至少本用例插入的两条
+    assert!(body["totals"].is_object(), "totals 应为对象: {body}");
+    let count = body["totals"]["count"].as_u64().unwrap_or(0);
+    assert!(
+        count >= 2,
+        "全会话统计应包含本用例的 2 条,实际 {count}: {body}"
+    );
+    // entries 与 count 自洽,且每行字段齐全(校验无会话分支的列映射未错位)。
+    // 这里不断言「本用例的会话一定在窗口内」:本文件所有用例共用一个库并行执行,
+    // 窗口截断取决于其它用例插入的行数,依赖它会引入时序 flake。
+    let entries = body["entries"].as_array().expect("entries 应为数组");
+    assert_eq!(
+        entries.len() as u64,
+        count,
+        "entries 条数应与 totals.count 一致: {body}"
+    );
+    let first = entries.first().expect("至少有 1 条明细");
+    for key in ["session_id", "created_at", "hit", "miss", "prompt_tokens"] {
+        assert!(first.get(key).is_some(), "明细缺少字段 {key}: {first}");
+    }
+    // 缺省 session_id 回传 null(前端据此区分「全会话」与「单会话」)
+    assert_eq!(body["session_id"], json!(null));
+    assert!(body["watermark"]["max_context_tokens"].is_u64());
 }
 
 // ===== 跨会话记忆蒸馏(落地项 2) =====
@@ -2687,4 +2896,409 @@ async fn spa_fallback_returns_404_for_missing_assets() {
     // 路由式路径(无点、非 assets)仍回退 index.html,保证前端路由可刷新
     let (status, _) = send_json(app, "GET", "/some-spa-route", json!({})).await;
     assert_eq!(status, StatusCode::OK, "路由路径应回退 index.html");
+}
+
+/// 静态资源缓存策略落地为真实响应头(2026-09-16 性能批次 P-2):
+/// index.html 是版本指针必须恒禁缓存;这里同时断言它没被误改成可缓存。
+#[tokio::test]
+async fn index_html_is_served_no_store() {
+    let app = test_app();
+    let _guard = test_lock().await;
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/index.html")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "index.html 应可取得");
+    let cc = resp.headers()["cache-control"]
+        .to_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        cc.contains("no-store"),
+        "index.html 必须 no-store(版本指针,缓存会导致加载旧 hash 资源),实际: {cc}"
+    );
+}
+
+// ==================== 批次 1:错误面收口(状态码 + code + 泄露守卫) ====================
+//
+// 约定(批次 7 先行的核心契约):错误响应必须断言**真实 HTTP 状态码 + JSON 的 code 字段**,
+// 而不是仅断言「有 error 字段」;涉及内部失败的出口另加「泄露守卫」断言——
+// 响应体不得回显 SQLite 报错片段、serde 内部类型名或盘符路径。
+
+/// 断言错误响应:状态码匹配、body 为 JSON 且 code 符合预期
+#[track_caller]
+fn assert_error_shape(
+    status: StatusCode,
+    body: &Value,
+    expect_status: StatusCode,
+    expect_code: &str,
+) {
+    assert_eq!(
+        status, expect_status,
+        "状态码不符(期望 {expect_status}): {body}"
+    );
+    assert_eq!(
+        body["code"], expect_code,
+        "code 不符(期望 {expect_code}): {body}"
+    );
+    assert!(
+        body["error"].as_str().is_some_and(|s| !s.is_empty()),
+        "错误响应缺少可读 error 文案: {body}"
+    );
+}
+
+/// 泄露守卫:响应体不得包含内部实现细节
+#[track_caller]
+fn assert_no_internal_leak(body: &Value) {
+    let text = body.to_string();
+    for needle in [
+        "SQLite",
+        "no such column",
+        "no such table",
+        "Failed to deserialize",
+        "missing field",
+        r"C:\",
+        "D:\\",
+        "rusqlite",
+        "panicked at",
+        "os error",
+    ] {
+        assert!(
+            !text.contains(needle),
+            "响应体泄露内部细节「{needle}」: {text}"
+        );
+    }
+}
+
+/// 未知 /api 路径(资源式,含扩展名)必须 404 + JSON + code,不是空 body 也不是 HTML
+#[tokio::test]
+async fn unknown_api_path_is_json_404_with_code() {
+    let app = test_app();
+    let (status, body) = send_json(app, "GET", "/api/definitely-not-a-route.json", json!({})).await;
+    assert_error_shape(status, &body, StatusCode::NOT_FOUND, "NOT_FOUND");
+    assert_no_internal_leak(&body);
+}
+
+/// 方法不允许(如 DELETE /api/health):405 必须是 JSON + code(此前是 405 空 body)
+#[tokio::test]
+async fn method_not_allowed_is_json_405_with_code() {
+    let app = test_app();
+    let (status, body) = send_json(app, "DELETE", "/api/health", json!({})).await;
+    assert_error_shape(status, &body, StatusCode::METHOD_NOT_ALLOWED, "VALIDATION");
+    assert_no_internal_leak(&body);
+}
+
+/// 头像服务:不存在的文件与带非法字符的名字都必须是真实 404 + code
+/// (此前是 `200 + {"error":"Not Found"}` 的假成功,前端 http 层看不到失败)
+#[tokio::test]
+async fn avatar_missing_and_traversal_are_404_with_code() {
+    let app = test_app();
+    // 不存在(合法文件名)
+    let (status, body) = send_json(app, "GET", "/api/avatars/no-such-avatar.png", json!({})).await;
+    assert_error_shape(status, &body, StatusCode::NOT_FOUND, "NOT_FOUND");
+    // 含非法字符(空格 URL 解码后与净化结果不一致 → 目录穿越拒绝分支)
+    let (status, body) = send_json(app, "GET", "/api/avatars/my%20pic.png", json!({})).await;
+    assert_error_shape(status, &body, StatusCode::NOT_FOUND, "NOT_FOUND");
+    assert_no_internal_leak(&body);
+}
+
+/// 资源代理:各类失败统一 `{error, code}` + 真实状态码,且不再回显上游/内部原文
+#[tokio::test]
+async fn resource_proxy_errors_carry_code_without_leaking_upstream_detail() {
+    let app = test_app();
+    // 非 https → 400 VALIDATION
+    let (status, body) = send_json(
+        app,
+        "GET",
+        "/api/resource/proxy?url=http%3A%2F%2Fexample.com%2Fpage.html",
+        json!({}),
+    )
+    .await;
+    assert_error_shape(status, &body, StatusCode::BAD_REQUEST, "VALIDATION");
+    // SSRF 私网拒绝 → 400 VALIDATION
+    let (status, body) = send_json(
+        app,
+        "GET",
+        "/api/resource/proxy?url=https%3A%2F%2F127.0.0.1%2Fpage",
+        json!({}),
+    )
+    .await;
+    assert_error_shape(status, &body, StatusCode::BAD_REQUEST, "VALIDATION");
+    // javascript: → 400 VALIDATION
+    let (status, body) = send_json(
+        app,
+        "GET",
+        "/api/resource/proxy?url=javascript%3Aalert(1)",
+        json!({}),
+    )
+    .await;
+    assert_error_shape(status, &body, StatusCode::BAD_REQUEST, "VALIDATION");
+
+    // 上游主机无法解析(.invalid 保留域)→ 在 SSRF 解析阶段被拒:400 VALIDATION,
+    // 且不回显 DNS/OS 原文(该分支此前会拼 `os error 11001` 与「搜索端点」错域措辞)
+    let (status, body) = send_json(
+        app,
+        "GET",
+        "/api/resource/proxy?url=https%3A%2F%2Fkedai-upstream-does-not-exist.invalid%2Fx.html",
+        json!({}),
+    )
+    .await;
+    assert_error_shape(status, &body, StatusCode::BAD_REQUEST, "VALIDATION");
+    assert_eq!(
+        body["error"],
+        json!("资源地址不可用,请确认其为公开可访问的 https 地址")
+    );
+    assert!(
+        !body.to_string().contains("搜索端点"),
+        "不应把搜索工具的错域文案透给资源卡片: {body}"
+    );
+    assert!(
+        !body.to_string().contains("os error"),
+        "不应回显 DNS/OS 原文: {body}"
+    );
+    assert_no_internal_leak(&body);
+}
+
+/// 仓库索引不可用时的上报形态:`available:false` 语义保留,补 code,且不回显
+/// serde 解析细节(此前 `reason` 里直接拼 `{e}`)
+#[tokio::test]
+async fn repo_index_unavailable_reports_code_without_parse_detail() {
+    let app = test_app();
+    let _guard = test_lock().await;
+    // 指向一个存在但内容非法的索引文件,命中「解析失败」分支
+    // (守卫目录:断言失败/panic 时也不在 TEMP 残留)
+    let bad_dir = kedai_server::utils::test_support::TempDataDir::new("bad-index");
+    let bad = bad_dir.join("index.json");
+    std::fs::write(&bad, b"{ this is not json").unwrap();
+    let prev = std::env::var_os("KEDAI_REPO_INDEX");
+    std::env::set_var("KEDAI_REPO_INDEX", &bad);
+
+    let (status, body) = send_json(app, "GET", "/api/repo-index", json!({})).await;
+
+    // 恢复环境变量(避免污染同进程其它用例)
+    match prev {
+        Some(v) => std::env::set_var("KEDAI_REPO_INDEX", v),
+        None => std::env::remove_var("KEDAI_REPO_INDEX"),
+    }
+    // 索引不可用属正常上报(HTTP 200 + available:false),不改状态码
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "索引不可用不上报为 HTTP 错误: {body}"
+    );
+    assert_eq!(body["available"], json!(false));
+    assert_eq!(body["code"], json!("INTERNAL"));
+    assert!(
+        body["reason"]
+            .as_str()
+            .is_some_and(|s| s.contains("重新运行")),
+        "应给出可操作的重新生成指引: {body}"
+    );
+    assert_no_internal_leak(&body);
+}
+
+/// 插件热重载:有失败项时保留 loaded/errors 业务数据,补 code 供前端统一分支
+#[tokio::test]
+async fn plugins_reload_error_keeps_payload_and_carries_code() {
+    let app = test_app();
+    let _guard = test_lock().await;
+    // 往测试数据目录写一个非法插件文件,触发 parse_all 的逐项错误
+    let dir = std::env::temp_dir()
+        .join(format!("kedai-test-{}", std::process::id()))
+        .join("plugins")
+        .join("tools");
+    std::fs::create_dir_all(&dir).unwrap();
+    let bad = dir.join("b1-broken_plugin.json");
+    std::fs::write(&bad, b"{ broken").unwrap();
+
+    let (status, body) = send_json(app, "POST", "/api/plugins/tools/reload", json!({})).await;
+
+    let _ = std::fs::remove_file(&bad);
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert_error_shape(status, &body, StatusCode::BAD_REQUEST, "VALIDATION");
+    // 业务数据必须保留:loaded 数量 + 逐项错误清单
+    assert!(body["loaded"].is_number(), "loaded 计数不应丢失: {body}");
+    assert!(
+        body["errors"].as_array().is_some_and(|a| !a.is_empty()),
+        "逐项错误清单不应丢失: {body}"
+    );
+}
+
+/// 向量化连接测试:测试失败属「业务上报」而非 HTTP 错误,保留 200 + ok:false,
+/// 补 code 供程序化分支(未配置 → VALIDATION)
+#[tokio::test]
+async fn embedding_test_reports_code_without_http_error() {
+    let app = test_app();
+    let (status, body) = send_json(app, "POST", "/api/settings/embedding/test", json!({})).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "测试结果上报不应变成 HTTP 错误: {body}"
+    );
+    assert_eq!(body["ok"], json!(false));
+    assert_eq!(body["code"], json!("VALIDATION"));
+    // message 保留(用户需要据此修正自己的配置),且不含内部实现细节
+    assert!(
+        body["message"].as_str().is_some_and(|s| !s.is_empty()),
+        "保留可读 message: {body}"
+    );
+    assert_no_internal_leak(&body);
+}
+
+/// 发送原始字节请求体(用于构造畸形 JSON),返回 (状态码, content-type, 原始文本体)
+async fn send_raw_body(
+    app: &axum::Router,
+    method: &str,
+    path: &str,
+    raw: &str,
+) -> (StatusCode, String, String) {
+    let req = Request::builder()
+        .method(method)
+        .uri(path)
+        .header("content-type", "application/json")
+        .body(Body::from(raw.to_string()))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    let status = resp.status();
+    let ct = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    (status, ct, String::from_utf8_lossy(&bytes).to_string())
+}
+
+/// 畸形 JSON 请求体统一为 JSON + code(批次 1 · JsonBody 接入):
+/// 逐个热门 handler 断言「400 + application/json + code=VALIDATION」,而非
+/// axum 默认的 `400 text/plain`(前端 request() 解析不出任何可读原因)。
+#[tokio::test]
+async fn malformed_json_body_is_uniform_json_400_on_hot_handlers() {
+    let app = test_app();
+    let _guard = test_lock().await;
+    // 覆盖 chat / tasks / settings / characters 四域各自的 JSON 入口
+    let routes: &[(&str, &str)] = &[
+        ("POST", "/api/chat/send"),
+        ("POST", "/api/chat/stop"),
+        ("POST", "/api/chat/compact"),
+        ("POST", "/api/tasks"),
+        ("PUT", "/api/settings"),
+        ("PUT", "/api/settings/model"),
+        ("PUT", "/api/settings/agent-prompt"),
+    ];
+    for (method, path) in routes {
+        let (status, ct, raw) = send_raw_body(app, method, path, "{这不是合法 JSON").await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "{method} {path} 状态码: {raw}"
+        );
+        assert!(
+            ct.starts_with("application/json"),
+            "{method} {path} 应为 JSON content-type(而非 text/plain):{ct} / {raw}"
+        );
+        let body: Value = serde_json::from_str(&raw)
+            .unwrap_or_else(|e| panic!("{method} {path} 响应不是 JSON({e}): {raw}"));
+        assert_eq!(body["code"], "VALIDATION", "{method} {path}: {body}");
+        assert!(
+            !raw.contains("Failed to deserialize"),
+            "{method} {path} 泄露 serde 解析原文: {raw}"
+        );
+    }
+}
+
+/// 结构合法但字段类型不符(缺失必填字段)同样收口为 JSON + VALIDATION
+#[tokio::test]
+async fn missing_required_field_is_uniform_json_400() {
+    let app = test_app();
+    let _guard = test_lock().await;
+    // 任务标题必填:缺 title
+    let (status, ct, raw) =
+        send_raw_body(app, "POST", "/api/tasks", r#"{"character_id":null}"#).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "缺 title: {raw}");
+    assert!(ct.starts_with("application/json"), "content-type: {ct}");
+    let body: Value = serde_json::from_str(&raw).unwrap();
+    assert_eq!(body["code"], "VALIDATION", "{body}");
+    // 发送字符串而非对象(类型不符)
+    let (status, _, raw) = send_raw_body(app, "POST", "/api/chat/send", r#""just a string""#).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "类型不符: {raw}");
+}
+
+/// 多线程 runtime 上的聊天生成 + 并发读不被阻塞(2026-09-16 性能批次 P-7)。
+///
+/// 覆盖缺口:本文件其余用例都是 `#[tokio::test]`(current_thread),而生产 chat 生成经
+/// `tokio::spawn` 跑在 multi-thread 的 worker 上(api/chat.rs:329)——`finalize_messages`
+/// 里的同步 IO 让出逻辑(`utils::blocking::park_worker`)在这两种 flavor 下走**不同分支**,
+/// 只在 current_thread 下测等于没覆盖生产路径。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn chat_send_on_multi_thread_runtime_keeps_reads_alive() {
+    let app = test_app();
+    let _guard = test_lock().await;
+    let (_, char) = upload_character(app, "多线程聊天.json").await;
+    let cid = char["id"].as_str().unwrap().to_string();
+    let (_, session) = send_json(
+        app,
+        "POST",
+        "/api/chat/sessions",
+        json!({ "character_id": cid }),
+    )
+    .await;
+    let sid = session["id"].as_str().unwrap().to_string();
+
+    // 生成任务:走完整 finalize_messages(含 session_vars 落库、运行时提示词读取、记忆读取)
+    let gen_app = app.clone();
+    let gen_cid = cid.clone();
+    let gen_sid = sid.clone();
+    let generator = tokio::spawn(async move {
+        sse_events(
+            &gen_app,
+            &gen_sid,
+            &gen_cid,
+            "[[reply:并发读验证正文]]",
+            "fast",
+        )
+        .await
+    });
+
+    // 生成期间持续并发读:任何失败都说明 worker 被同步 IO 卡住
+    let mut reads = 0usize;
+    while !generator.is_finished() {
+        let mut handles = Vec::new();
+        for _ in 0..4 {
+            let app = app.clone();
+            handles.push(tokio::spawn(async move {
+                let (st, _) = send_json(&app, "GET", "/api/health", json!({})).await;
+                st
+            }));
+        }
+        for h in handles {
+            assert_eq!(
+                h.await.unwrap(),
+                StatusCode::OK,
+                "生成期间并发读必须成功(worker 不应被同步 IO 阻塞)"
+            );
+            reads += 1;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+
+    // 生成本身必须正常完成并产出 finish 事件
+    let events = generator.await.unwrap();
+    let finish = events
+        .iter()
+        .find(|e| e["type"] == "finish")
+        .expect("应收到 finish 事件(multi-thread 下 finalize_messages 让出后链路仍完整)");
+    assert!(
+        finish["finish_reason"].is_string(),
+        "finish 事件应带 finish_reason: {finish}"
+    );
+    assert!(reads > 0, "应至少完成一轮并发读");
 }

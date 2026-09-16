@@ -1,7 +1,8 @@
 // 会话与消息路由:/api/chat/sessions、/history、/messages/:id、/clear
 // services 同步 DB 调用均经 state.db_call 挪进阻塞线程池(DB 并发改造)
 use crate::api::app_state::AppState;
-use crate::api::{db_err, WithStatus};
+use crate::api::json_body::JsonBody;
+use crate::api::{db_err, err_status, WithStatus};
 use crate::parsing::macros::{expand_macros, MacroCtx};
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
@@ -104,7 +105,7 @@ pub async fn list_sessions(
         return Json(json!({ "sessions": all })).into_response();
     };
     if cid.trim().is_empty() {
-        return err_json("缺少 character_id 查询参数", StatusCode::BAD_REQUEST);
+        return err_status("缺少 character_id 查询参数", StatusCode::BAD_REQUEST);
     }
     let svc = state.sessions.clone();
     let sessions = match state.db_call(move || svc.list_by_character(&cid)).await {
@@ -116,13 +117,13 @@ pub async fn list_sessions(
 
 pub async fn create_session(
     State(state): State<Arc<AppState>>,
-    Json(body): Json<CreateSessionBody>,
+    JsonBody(body): JsonBody<CreateSessionBody>,
 ) -> Response {
     let Some(cid) = body.character_id else {
-        return err_json("缺少 character_id", StatusCode::BAD_REQUEST);
+        return err_status("缺少 character_id", StatusCode::BAD_REQUEST);
     };
     if cid.trim().is_empty() {
-        return err_json("缺少 character_id", StatusCode::BAD_REQUEST);
+        return err_status("缺少 character_id", StatusCode::BAD_REQUEST);
     }
     let svc = state.sessions.clone();
     let characters = state.characters.clone();
@@ -140,7 +141,7 @@ pub async fn create_session(
     {
         Err(e) => db_err(&e),
         Ok(Ok(s)) => Json(s).into_response().with_status(StatusCode::CREATED),
-        Ok(Err(e)) => err_json(e, StatusCode::INTERNAL_SERVER_ERROR),
+        Ok(Err(e)) => err_status(e, StatusCode::INTERNAL_SERVER_ERROR),
     }
 }
 
@@ -193,7 +194,7 @@ pub(crate) fn seed_first_message(
 pub async fn regreet(
     State(state): State<Arc<AppState>>,
     Path(session_id): Path<String>,
-    Json(body): Json<RegreetBody>,
+    JsonBody(body): JsonBody<RegreetBody>,
 ) -> Response {
     let svc = state.sessions.clone();
     let characters = state.characters.clone();
@@ -215,7 +216,7 @@ pub async fn regreet(
         .await;
     match found {
         Err(e) => return db_err(&e),
-        Ok(None) => return err_json("会话不存在", StatusCode::NOT_FOUND),
+        Ok(None) => return err_status("会话不存在", StatusCode::NOT_FOUND),
         Ok(Some(())) => {}
     }
     Json(json!({ "ok": true, "greeting_index": body.greeting_index })).into_response()
@@ -230,11 +231,13 @@ pub async fn delete_session(
     let id_c = id.clone();
     match state
         .db_call(move || {
-            // P6:kaleido 两表无 FK 级联,显式清理契约运行态;失败仅记日志不阻断删除
+            // P6/批次 2:无 FK 级联的从属表显式清理;失败仅记日志不阻断删除
             // (残留行仅占用存储,不影响正确性——读写均按 session_id 过滤)。
+            // 顺序关键:message 作用域变量需要 messages 行还在,故必须在 svc.delete 之前清理。
+            let dependent_err = svc.cleanup_dependent_rows_before_delete(&id_c).err();
             if svc.delete(&id_c) {
                 let cleanup_err = kaleido.delete_for_session(&id_c).err();
-                Some(cleanup_err)
+                Some((dependent_err, cleanup_err))
             } else {
                 None
             }
@@ -242,18 +245,25 @@ pub async fn delete_session(
         .await
     {
         Err(e) => db_err(&e),
-        Ok(Some(cleanup_err)) => {
+        Ok(Some((dependent_err, cleanup_err))) => {
+            if let Some(e) = dependent_err {
+                tracing::warn!(session_id = id, error = e, "会话从属数据清理失败");
+            }
             if let Some(e) = cleanup_err {
                 tracing::warn!(session_id = id, error = e, "会话契约运行态清理失败");
             }
             // 会话删除后清理其显式授权,避免 session_grants 无限积累;
             // 失败仅告警不阻断删除(残留授权指向已删会话,不会再被读取)。
-            if let Err(e) = state.tool_registry.permissions().revoke_scope("session", &id) {
+            if let Err(e) = state
+                .tool_registry
+                .permissions()
+                .revoke_scope("session", &id)
+            {
                 tracing::warn!(session_id = id, error = e, "会话授权清理失败");
             }
             StatusCode::NO_CONTENT.into_response()
         }
-        Ok(None) => err_json("会话不存在", StatusCode::NOT_FOUND),
+        Ok(None) => err_status("会话不存在", StatusCode::NOT_FOUND),
     }
 }
 
@@ -262,10 +272,10 @@ pub async fn history(
     Query(q): Query<MessageQuery>,
 ) -> Response {
     let Some(sid) = q.session_id else {
-        return err_json("缺少 session_id 查询参数", StatusCode::BAD_REQUEST);
+        return err_status("缺少 session_id 查询参数", StatusCode::BAD_REQUEST);
     };
     if sid.trim().is_empty() {
-        return err_json("缺少 session_id 查询参数", StatusCode::BAD_REQUEST);
+        return err_status("缺少 session_id 查询参数", StatusCode::BAD_REQUEST);
     }
     let svc = state.sessions.clone();
     let characters = state.characters.clone();
@@ -282,7 +292,7 @@ pub async fn history(
         .await;
     let (_session, messages, character, session_vars, assistant_vars) = match loaded {
         Err(e) => return db_err(&e),
-        Ok(None) => return err_json("会话不存在", StatusCode::NOT_FOUND),
+        Ok(None) => return err_status("会话不存在", StatusCode::NOT_FOUND),
         Ok(Some(v)) => v,
     };
     // 显示层宏展开(只读):让宏在聊天气泡渲染时持续工作。
@@ -356,16 +366,16 @@ pub async fn update_message(
     State(state): State<Arc<AppState>>,
     Path(id): Path<i64>,
     Query(q): Query<MessageQuery>,
-    Json(body): Json<UpdateMessageBody>,
+    JsonBody(body): JsonBody<UpdateMessageBody>,
 ) -> Response {
     let Some(sid) = q.session_id else {
-        return err_json("缺少 session_id 或 id", StatusCode::BAD_REQUEST);
+        return err_status("缺少 session_id 或 id", StatusCode::BAD_REQUEST);
     };
     let Some(content) = body.content else {
-        return err_json("缺少 content", StatusCode::BAD_REQUEST);
+        return err_status("缺少 content", StatusCode::BAD_REQUEST);
     };
     if sid.trim().is_empty() {
-        return err_json("缺少 session_id 或 id", StatusCode::BAD_REQUEST);
+        return err_status("缺少 session_id 或 id", StatusCode::BAD_REQUEST);
     }
     let svc = state.sessions.clone();
     match state
@@ -374,7 +384,7 @@ pub async fn update_message(
     {
         Err(e) => db_err(&e),
         Ok(Some(m)) => Json(m).into_response(),
-        Ok(None) => err_json("消息不存在", StatusCode::NOT_FOUND),
+        Ok(None) => err_status("消息不存在", StatusCode::NOT_FOUND),
     }
 }
 
@@ -385,28 +395,28 @@ pub async fn swipe_message(
     State(state): State<Arc<AppState>>,
     Path(id): Path<i64>,
     Query(q): Query<MessageQuery>,
-    Json(body): Json<SwipeBody>,
+    JsonBody(body): JsonBody<SwipeBody>,
 ) -> Response {
     let Some(sid) = q.session_id else {
-        return err_json("缺少 session_id 或 id", StatusCode::BAD_REQUEST);
+        return err_status("缺少 session_id 或 id", StatusCode::BAD_REQUEST);
     };
     if sid.trim().is_empty() {
-        return err_json("缺少 session_id 或 id", StatusCode::BAD_REQUEST);
+        return err_status("缺少 session_id 或 id", StatusCode::BAD_REQUEST);
     }
     let svc = state.sessions.clone();
     let sid_c = sid.clone();
     let msg = match state.db_call(move || svc.get_message(&sid_c, id)).await {
         Err(e) => return db_err(&e),
         Ok(Some(m)) => m,
-        Ok(None) => return err_json("消息不存在", StatusCode::NOT_FOUND),
+        Ok(None) => return err_status("消息不存在", StatusCode::NOT_FOUND),
     };
     let swipes = match msg.extra.get("swipes").and_then(|s| s.as_array()) {
         Some(arr) if !arr.is_empty() => arr,
-        _ => return err_json("该消息没有可切换的版本", StatusCode::BAD_REQUEST),
+        _ => return err_status("该消息没有可切换的版本", StatusCode::BAD_REQUEST),
     };
     let swipe = match swipes.get(body.swipe_id) {
         Some(v) => v,
-        None => return err_json("swipe_id 越界", StatusCode::BAD_REQUEST),
+        None => return err_status("swipe_id 越界", StatusCode::BAD_REQUEST),
     };
     let content = swipe
         .get("content")
@@ -426,7 +436,7 @@ pub async fn swipe_message(
         .await;
     match written {
         Err(e) => return db_err(&e),
-        Ok(None) => return err_json("消息不存在", StatusCode::NOT_FOUND),
+        Ok(None) => return err_status("消息不存在", StatusCode::NOT_FOUND),
         Ok(Some(())) => {}
     }
     Json(json!({ "content": content, "swipe_id": body.swipe_id, "swipes_count": swipes_count }))
@@ -439,25 +449,28 @@ pub async fn delete_message(
     Query(q): Query<MessageQuery>,
 ) -> Response {
     let Some(sid) = q.session_id else {
-        return err_json("缺少 session_id 或 id", StatusCode::BAD_REQUEST);
+        return err_status("缺少 session_id 或 id", StatusCode::BAD_REQUEST);
     };
     if sid.trim().is_empty() {
-        return err_json("缺少 session_id 或 id", StatusCode::BAD_REQUEST);
+        return err_status("缺少 session_id 或 id", StatusCode::BAD_REQUEST);
     }
     let svc = state.sessions.clone();
     match state.db_call(move || svc.delete_message(&sid, id)).await {
         Err(e) => db_err(&e),
         Ok(true) => StatusCode::NO_CONTENT.into_response(),
-        Ok(false) => err_json("消息不存在", StatusCode::NOT_FOUND),
+        Ok(false) => err_status("消息不存在", StatusCode::NOT_FOUND),
     }
 }
 
-pub async fn clear(State(state): State<Arc<AppState>>, Json(body): Json<ClearBody>) -> Response {
+pub async fn clear(
+    State(state): State<Arc<AppState>>,
+    JsonBody(body): JsonBody<ClearBody>,
+) -> Response {
     let Some(sid) = body.session_id else {
-        return err_json("缺少 session_id", StatusCode::BAD_REQUEST);
+        return err_status("缺少 session_id", StatusCode::BAD_REQUEST);
     };
     if sid.trim().is_empty() {
-        return err_json("缺少 session_id", StatusCode::BAD_REQUEST);
+        return err_status("缺少 session_id", StatusCode::BAD_REQUEST);
     }
     let svc = state.sessions.clone();
     if let Err(e) = state.db_call(move || svc.clear_messages(&sid)).await {
@@ -471,12 +484,12 @@ pub async fn clear(State(state): State<Arc<AppState>>, Json(body): Json<ClearBod
 pub async fn truncate_messages(
     State(state): State<Arc<AppState>>,
     Path(session_id): Path<String>,
-    Json(body): Json<TruncateBody>,
+    JsonBody(body): JsonBody<TruncateBody>,
 ) -> Response {
     if body.anchor_id <= 0 {
         // 负/零 id 是流式临时消息标记或非法值;按 id>anchor 语义会把整段历史删光。
         // 防御任何调用方误传(重发锚点必须是落库后的真实 id)。
-        return err_json(
+        return err_status(
             "截断锚点无效:必须是落库消息的正 id",
             StatusCode::BAD_REQUEST,
         );
@@ -491,7 +504,7 @@ pub async fn truncate_messages(
         .await;
     match deleted {
         Err(e) => db_err(&e),
-        Ok(None) => err_json("会话不存在", StatusCode::NOT_FOUND),
+        Ok(None) => err_status("会话不存在", StatusCode::NOT_FOUND),
         Ok(Some(deleted)) => Json(json!({ "ok": true, "deleted": deleted })).into_response(),
     }
 }
@@ -501,10 +514,10 @@ pub async fn save_variables(
     State(state): State<Arc<AppState>>,
     Path(id): Path<i64>,
     Query(q): Query<MessageQuery>,
-    Json(body): Json<SaveVariablesBody>,
+    JsonBody(body): JsonBody<SaveVariablesBody>,
 ) -> Response {
     let Some(sid) = q.session_id else {
-        return err_json("缺少 session_id 或 id", StatusCode::BAD_REQUEST);
+        return err_status("缺少 session_id 或 id", StatusCode::BAD_REQUEST);
     };
     let mut patch = serde_json::Map::new();
     if let Some(sd) = body.stat_data {
@@ -514,7 +527,7 @@ pub async fn save_variables(
         patch.insert("display_data".into(), dd);
     }
     if patch.is_empty() {
-        return err_json("缺少变量数据", StatusCode::BAD_REQUEST);
+        return err_status("缺少变量数据", StatusCode::BAD_REQUEST);
     }
     let patch = serde_json::Value::Object(patch);
     let svc = state.sessions.clone();
@@ -524,7 +537,7 @@ pub async fn save_variables(
     {
         Err(e) => db_err(&e),
         Ok(Some(m)) => Json(m).into_response(),
-        Ok(None) => err_json("消息不存在", StatusCode::NOT_FOUND),
+        Ok(None) => err_status("消息不存在", StatusCode::NOT_FOUND),
     }
 }
 
@@ -534,7 +547,7 @@ pub async fn save_variables(
 pub async fn save_assistant_vars(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
-    Json(body): Json<SaveVariablesBody>,
+    JsonBody(body): JsonBody<SaveVariablesBody>,
 ) -> Response {
     // 会话树只存 stat_data(与引擎一致);无 stat_data 时视为空树覆写
     let tree = body
@@ -550,8 +563,8 @@ pub async fn save_assistant_vars(
         .await;
     match saved {
         Err(e) => return db_err(&e),
-        Ok(None) => return err_json("会话不存在", StatusCode::NOT_FOUND),
-        Ok(Some(Err(e))) => return err_json(e, StatusCode::INTERNAL_SERVER_ERROR),
+        Ok(None) => return err_status("会话不存在", StatusCode::NOT_FOUND),
+        Ok(Some(Err(e))) => return err_status(e, StatusCode::INTERNAL_SERVER_ERROR),
         Ok(Some(Ok(()))) => {}
     }
     Json(json!({ "ok": true })).into_response()
@@ -563,7 +576,7 @@ pub async fn init_vars(
     Query(q): Query<SessionsQuery>,
 ) -> Response {
     let Some(cid) = q.character_id else {
-        return err_json("缺少 character_id 查询参数", StatusCode::BAD_REQUEST);
+        return err_status("缺少 character_id 查询参数", StatusCode::BAD_REQUEST);
     };
     // 角色卡内嵌 character_book + 独立世界书(绑定该角色或全局),读取合并进同一阻塞任务
     let characters = state.characters.clone();
@@ -598,9 +611,4 @@ pub async fn init_vars(
         }
     }
     Json(json!({ "character_id": cid, "entries": vars })).into_response()
-}
-
-/// 本模块统一错误响应:按状态码自动附带结构化错误码(见 api/errors.rs)。
-fn err_json(msg: impl AsRef<str>, status: StatusCode) -> Response {
-    crate::api::err_with_code(crate::api::code_for_status(status), msg, status)
 }

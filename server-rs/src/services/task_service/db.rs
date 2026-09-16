@@ -103,77 +103,99 @@ fn row_to_subtask(row: &rusqlite::Row) -> rusqlite::Result<TaskSubtaskRecord> {
         error: row.get(6)?,
         created_at: row.get(7)?,
         updated_at: row.get(8)?,
+        finished_at: row.get(9)?,
     })
 }
 
 impl TaskService {
+    /// 同步落库统一让出点(2026-09-16 性能批次 P-6)。
+    ///
+    /// 任务引擎经 `tokio::spawn` 跑在 async worker 上,而这些方法做的是同步 rusqlite
+    /// 写(唯一写连接 + busy_timeout 最长 5s + fsync),直接执行会卡住整个 worker,
+    /// 连带该 worker 上排队的其他请求一起停摆。语义与判定规则见 `utils::blocking`。
+    /// 全部写方法都经此包装,是「任务侧与聊天侧落库纪律一致」的单点保证
+    /// (聊天侧同类写入早用 spawn_blocking,见 engine/run_finish.rs:94)。
+    ///
+    /// 注意:`record_self_heals` 不包——它不直接取写锁,而是委托给下方已包装的
+    /// `record_llm_call`/`record_usage`;包了只会形成多余的嵌套。
+    #[inline]
+    fn blocking<T>(f: impl FnOnce() -> T) -> T {
+        crate::utils::blocking::park_worker(f)
+    }
+
     // ===== 状态写入(内部) =====
 
     pub(super) fn reset_task(&self, id: &str) -> bool {
-        let conn = self.db.write();
-        let changed = conn
-            .execute(
-                "UPDATE tasks SET status = 'planning', plan = '[]', result = '', error = '', updated_at = ?1 WHERE id = ?2",
-                params![now_iso(), id],
-            )
-            .map(|n| n > 0)
-            .unwrap_or(false);
-        if changed {
-            // 重跑入口即进入规划态,与 set_status 同款 kind="status" 事件
-            self.emit_event(
-                "status",
-                id,
-                None,
-                Some(TaskStatus::Planning),
-                Some("任务进入规划阶段".into()),
-            );
-        }
-        changed
+        Self::blocking(|| {
+            let conn = self.db.write();
+            let changed = conn
+                .execute(
+                    "UPDATE tasks SET status = 'planning', plan = '[]', result = '', error = '', updated_at = ?1 WHERE id = ?2",
+                    params![now_iso(), id],
+                )
+                .map(|n| n > 0)
+                .unwrap_or(false);
+            if changed {
+                // 重跑入口即进入规划态,与 set_status 同款 kind="status" 事件
+                self.emit_event(
+                    TaskEventKind::Status,
+                    id,
+                    None,
+                    Some(TaskStatus::Planning),
+                    Some("任务进入规划阶段".into()),
+                );
+            }
+            changed
+        })
     }
 
     /// pub(crate):任务引擎(task_engine)solo/plan 执行器推进任务状态用。
     pub(crate) fn set_status(&self, id: &str, status: TaskStatus) -> bool {
-        let conn = self.db.write();
-        let changed = conn
-            .execute(
-                "UPDATE tasks SET status = ?1, updated_at = ?2 WHERE id = ?3",
-                params![status.as_str(), now_iso(), id],
-            )
-            .map(|n| n > 0)
-            .unwrap_or(false);
-        if changed {
-            self.emit_event(
-                "status",
-                id,
-                None,
-                Some(status),
-                Some(format!("任务状态更新为 {}", status.as_str())),
-            );
-        }
-        changed
+        Self::blocking(|| {
+            let conn = self.db.write();
+            let changed = conn
+                .execute(
+                    "UPDATE tasks SET status = ?1, updated_at = ?2 WHERE id = ?3",
+                    params![status.as_str(), now_iso(), id],
+                )
+                .map(|n| n > 0)
+                .unwrap_or(false);
+            if changed {
+                self.emit_event(
+                    TaskEventKind::Status,
+                    id,
+                    None,
+                    Some(status),
+                    Some(format!("任务状态更新为 {}", status.as_str())),
+                );
+            }
+            changed
+        })
     }
 
     /// pub(crate):任务引擎 plan 执行器落库计划用(写库成功后发射 kind=plan 事件)。
     pub(crate) fn set_plan(&self, id: &str, plan: &[TaskStep]) -> bool {
-        let json = serde_json::to_string(plan).unwrap_or_else(|_| "[]".into());
-        let conn = self.db.write();
-        let changed = conn
-            .execute(
-                "UPDATE tasks SET plan = ?1, updated_at = ?2 WHERE id = ?3",
-                params![json, now_iso(), id],
-            )
-            .map(|n| n > 0)
-            .unwrap_or(false);
-        if changed {
-            self.emit_event(
-                "plan",
-                id,
-                None,
-                None,
-                Some(format!("执行计划已更新(共 {} 步)", plan.len())),
-            );
-        }
-        changed
+        Self::blocking(|| {
+            let json = serde_json::to_string(plan).unwrap_or_else(|_| "[]".into());
+            let conn = self.db.write();
+            let changed = conn
+                .execute(
+                    "UPDATE tasks SET plan = ?1, updated_at = ?2 WHERE id = ?3",
+                    params![json, now_iso(), id],
+                )
+                .map(|n| n > 0)
+                .unwrap_or(false);
+            if changed {
+                self.emit_event(
+                    TaskEventKind::Plan,
+                    id,
+                    None,
+                    None,
+                    Some(format!("执行计划已更新(共 {} 步)", plan.len())),
+                );
+            }
+            changed
+        })
     }
 
     /// 写入最终结果并置终态:全部步骤成功为 done;含 error 步骤为 partial(部分完成)。
@@ -191,31 +213,33 @@ impl TaskService {
         status: TaskStatus,
         error: Option<&str>,
     ) -> bool {
-        let conn = self.db.write();
-        let changed = conn
-            .execute(
-                "UPDATE tasks SET result = ?1, status = ?2, error = ?3, updated_at = ?4 WHERE id = ?5",
-                params![
-                    result,
-                    status.as_str(),
-                    error.unwrap_or(""),
-                    now_iso(),
-                    id
-                ],
-            )
-            .map(|n| n > 0)
-            .unwrap_or(false);
-        drop(conn);
-        if changed {
-            self.emit_event(
-                "status",
-                id,
-                None,
-                Some(status),
-                Some("任务已产出最终结果".into()),
-            );
-        }
-        changed
+        Self::blocking(|| {
+            let conn = self.db.write();
+            let changed = conn
+                .execute(
+                    "UPDATE tasks SET result = ?1, status = ?2, error = ?3, updated_at = ?4 WHERE id = ?5",
+                    params![
+                        result,
+                        status.as_str(),
+                        error.unwrap_or(""),
+                        now_iso(),
+                        id
+                    ],
+                )
+                .map(|n| n > 0)
+                .unwrap_or(false);
+            drop(conn);
+            if changed {
+                self.emit_event(
+                    TaskEventKind::Status,
+                    id,
+                    None,
+                    Some(status),
+                    Some("任务已产出最终结果".into()),
+                );
+            }
+            changed
+        })
     }
 
     /// planned 态写入计划清单文本(批次 R1,plan 模式):只更新 result 列,不动状态
@@ -225,41 +249,51 @@ impl TaskService {
     /// 写库成功后发射既有 kind="status" 事件(detail 与终态 set_result 文案区分;
     /// 不引入新事件 kind;WP4 纪律:仅 DB 写成功后发射)。
     pub(crate) fn set_planned_result(&self, id: &str, result: &str) -> bool {
-        let conn = self.db.write();
-        let changed = conn
-            .execute(
-                "UPDATE tasks SET result = ?1, updated_at = ?2 WHERE id = ?3",
-                params![result, now_iso(), id],
-            )
-            .map(|n| n > 0)
-            .unwrap_or(false);
-        if changed {
-            self.emit_event(
-                "status",
-                id,
-                None,
-                Some(TaskStatus::Planned),
-                Some("计划清单已写入,待批准".into()),
-            );
-        }
-        changed
+        Self::blocking(|| {
+            let conn = self.db.write();
+            let changed = conn
+                .execute(
+                    "UPDATE tasks SET result = ?1, updated_at = ?2 WHERE id = ?3",
+                    params![result, now_iso(), id],
+                )
+                .map(|n| n > 0)
+                .unwrap_or(false);
+            if changed {
+                self.emit_event(
+                    TaskEventKind::Status,
+                    id,
+                    None,
+                    Some(TaskStatus::Planned),
+                    Some("计划清单已写入,待批准".into()),
+                );
+            }
+            changed
+        })
     }
 
     pub(super) fn set_error(&self, id: &str, error: &str) -> bool {
-        let conn = self.db.write();
-        let changed = conn
-            .execute(
-                "UPDATE tasks SET error = ?1, status = 'error', updated_at = ?2 WHERE id = ?3",
-                params![error, now_iso(), id],
-            )
-            .map(|n| n > 0)
-            .unwrap_or(false);
-        if changed {
-            // detail 截断防超长错误文本撑大事件帧
-            let detail: String = error.chars().take(120).collect();
-            self.emit_event("status", id, None, Some(TaskStatus::Error), Some(detail));
-        }
-        changed
+        Self::blocking(|| {
+            let conn = self.db.write();
+            let changed = conn
+                .execute(
+                    "UPDATE tasks SET error = ?1, status = 'error', updated_at = ?2 WHERE id = ?3",
+                    params![error, now_iso(), id],
+                )
+                .map(|n| n > 0)
+                .unwrap_or(false);
+            if changed {
+                // detail 截断防超长错误文本撑大事件帧
+                let detail: String = error.chars().take(120).collect();
+                self.emit_event(
+                    TaskEventKind::Status,
+                    id,
+                    None,
+                    Some(TaskStatus::Error),
+                    Some(detail),
+                );
+            }
+            changed
+        })
     }
 
     // ===== 任务 usage(WP4)=====
@@ -275,40 +309,42 @@ impl TaskService {
         step_index: Option<usize>,
         out: &TaskGenOutput,
     ) {
-        let model = self.task_settings().model;
-        let conn = self.db.write();
-        let result = conn.execute(
-            "INSERT INTO task_usage (id, task_id, phase, step_index, model, prompt_tokens, completion_tokens, reasoning_tokens, created_at)              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-            params![
-                Uuid::new_v4().to_string(),
-                task_id,
-                phase,
-                step_index.map(|i| i as i64),
-                model,
-                out.prompt_tokens,
-                out.completion_tokens,
-                out.reasoning_tokens,
-                now_iso(),
-            ],
-        );
-        if let Err(e) = result {
-            tracing::warn!(
-                op = "task_usage insert",
-                error = e.to_string(),
-                "任务 usage 落库失败"
+        Self::blocking(|| {
+            let model = self.task_settings().model;
+            let conn = self.db.write();
+            let result = conn.execute(
+                "INSERT INTO task_usage (id, task_id, phase, step_index, model, prompt_tokens, completion_tokens, reasoning_tokens, created_at)              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![
+                    Uuid::new_v4().to_string(),
+                    task_id,
+                    phase,
+                    step_index.map(|i| i as i64),
+                    model,
+                    out.prompt_tokens,
+                    out.completion_tokens,
+                    out.reasoning_tokens,
+                    now_iso(),
+                ],
             );
-        } else {
-            self.emit_event(
-                "usage",
-                task_id,
-                None,
-                None,
-                Some(format!(
-                    "已记录 {phase} 阶段 token 用量(prompt {} / completion {})",
-                    out.prompt_tokens, out.completion_tokens
-                )),
-            );
-        }
+            if let Err(e) = result {
+                tracing::warn!(
+                    op = "task_usage insert",
+                    error = e.to_string(),
+                    "任务 usage 落库失败"
+                );
+            } else {
+                self.emit_event(
+                    TaskEventKind::Usage,
+                    task_id,
+                    None,
+                    None,
+                    Some(format!(
+                        "已记录 {phase} 阶段 token 用量(prompt {} / completion {})",
+                        out.prompt_tokens, out.completion_tokens
+                    )),
+                );
+            }
+        })
     }
 
     // ===== 任务 LLM 调用追踪(批次 3)=====
@@ -333,59 +369,108 @@ impl TaskService {
         elapsed: Duration,
         status: &str,
     ) {
-        let mut prompt_summary = String::new();
-        for m in messages {
-            if !prompt_summary.is_empty() {
-                prompt_summary.push('\n');
+        Self::blocking(|| {
+            let mut prompt_summary = String::new();
+            for m in messages {
+                if !prompt_summary.is_empty() {
+                    prompt_summary.push('\n');
+                }
+                prompt_summary.push_str(&m.role);
+                prompt_summary.push_str(": ");
+                prompt_summary.push_str(&truncate_chars(&m.content, 800));
             }
-            prompt_summary.push_str(&m.role);
-            prompt_summary.push_str(": ");
-            prompt_summary.push_str(&truncate_chars(&m.content, 800));
-        }
-        let (p, c, r) = out
-            .map(|o| (o.prompt_tokens, o.completion_tokens, o.reasoning_tokens))
-            .unwrap_or((0, 0, 0));
-        // finish_reason:None(失败/工具循环旧路径/上游未下发)与 Some(空串)统一落 ''
-        let finish_reason = out.and_then(|o| o.finish_reason.as_deref()).unwrap_or("");
-        let conn = self.db.write();
-        let result = conn.execute(
-            "INSERT INTO task_llm_calls (id, task_id, phase, step_index, model, prompt_summary, response_summary, prompt_tokens, completion_tokens, reasoning_tokens, elapsed_ms, status, created_at, finish_reason) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
-            params![
-                Uuid::new_v4().to_string(),
-                task_id,
-                phase,
-                step_index.map(|i| i as i64),
-                model,
-                truncate_chars(&prompt_summary, 4000),
-                truncate_chars(response, 2000),
-                p,
-                c,
-                r,
-                elapsed.as_millis() as i64,
-                status,
-                now_iso(),
-                finish_reason,
-            ],
-        );
-        if let Err(e) = result {
-            tracing::warn!(
-                op = "task_llm_calls insert",
-                error = e.to_string(),
-                "任务 LLM 调用追踪落库失败"
+            let (p, c, r) = out
+                .map(|o| (o.prompt_tokens, o.completion_tokens, o.reasoning_tokens))
+                .unwrap_or((0, 0, 0));
+            // finish_reason:None(失败/工具循环旧路径/上游未下发)与 Some(空串)统一落 ''
+            let finish_reason = out.and_then(|o| o.finish_reason.as_deref()).unwrap_or("");
+            let conn = self.db.write();
+            let result = conn.execute(
+                "INSERT INTO task_llm_calls (id, task_id, phase, step_index, model, prompt_summary, response_summary, prompt_tokens, completion_tokens, reasoning_tokens, elapsed_ms, status, created_at, finish_reason) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                params![
+                    Uuid::new_v4().to_string(),
+                    task_id,
+                    phase,
+                    step_index.map(|i| i as i64),
+                    model,
+                    truncate_chars(&prompt_summary, 4000),
+                    truncate_chars(response, 2000),
+                    p,
+                    c,
+                    r,
+                    elapsed.as_millis() as i64,
+                    status,
+                    now_iso(),
+                    finish_reason,
+                ],
             );
-        } else {
-            let step = step_index
-                .map(|i| format!(" #{}", i + 1))
-                .unwrap_or_default();
-            // phase/step_index 随事件透出(批次 R4):前端据此清对应流式缓冲
-            self.emit_llm_call(
+            if let Err(e) = result {
+                tracing::warn!(
+                    op = "task_llm_calls insert",
+                    error = e.to_string(),
+                    "任务 LLM 调用追踪落库失败"
+                );
+            } else {
+                let step = step_index
+                    .map(|i| format!(" #{}", i + 1))
+                    .unwrap_or_default();
+                // phase/step_index 随事件透出(批次 R4):前端据此清对应流式缓冲
+                self.emit_llm_call(
+                    task_id,
+                    phase,
+                    step_index,
+                    format!("{phase}{step} · {model} · {} tokens", p + c),
+                    Some(finish_reason.to_string()),
+                );
+            }
+        })
+    }
+
+    /// 截断自愈留痕批量落库(问题①的单一实现):solo.rs 与 custom.rs 各自复用过
+    /// 一段逐行同构的循环,现收拢于此——被截断的那次调用补落一行 status=error
+    /// (response_summary 标注触发原因与重发预算),并补落其 usage。
+    ///
+    /// 为何要补 usage:被截断那次同样消耗 token,只记最终行会让 usage_total
+    /// 少于调用明细求和(2026-09-10 实测修复口径)。
+    /// 调用情况面板据此看到完整「截断 → 提高预算重发」链路,实际调用次数可考。
+    ///
+    /// 批次 4.2:入参为 task_core 中性 DTO `TruncationHeal`(不再引用 agents 层
+    /// SelfHealRecord),转换在 task_engine 边界完成(见 task_engine::executor::to_self_heals)。
+    pub(crate) fn record_self_heals(
+        &self,
+        task_id: &str,
+        phase: &str,
+        step_index: Option<usize>,
+        model: &str,
+        messages: &[LlmMessage],
+        self_heals: &[crate::services::task_core::TruncationHeal],
+    ) {
+        for heal in self_heals {
+            let heal_out = TaskGenOutput {
+                text: String::new(),
+                finish_reason: heal.finish_reason.clone(),
+                prompt_tokens: heal.prompt_tokens,
+                completion_tokens: heal.completion_tokens,
+                reasoning_tokens: 0,
+                reasoning_chars: 0,
+                tool_calls: Vec::new(),
+            };
+            self.record_llm_call(
                 task_id,
                 phase,
                 step_index,
-                format!("{phase}{step} · {model} · {} tokens", p + c),
-                Some(finish_reason.to_string()),
+                model,
+                messages,
+                &format!(
+                    "(截断自愈){},输出上限翻倍至 {} 重发",
+                    heal.note, heal.retried_max_tokens
+                ),
+                Some(&heal_out),
+                Duration::ZERO,
+                "error",
             );
+            self.record_usage(task_id, phase, step_index, &heal_out);
         }
     }
 
@@ -438,29 +523,31 @@ impl TaskService {
         kind: &str,
         content: &str,
     ) -> Result<TaskMessageRecord, String> {
-        let record = TaskMessageRecord {
-            id: Uuid::new_v4().to_string(),
-            task_id: task_id.to_string(),
-            role: role.to_string(),
-            kind: kind.to_string(),
-            content: content.to_string(),
-            created_at: now_iso(),
-        };
-        let conn = self.db.write();
-        conn.execute(
-            "INSERT INTO task_messages (id, task_id, role, kind, content, created_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![
-                record.id,
-                record.task_id,
-                record.role,
-                record.kind,
-                record.content,
-                record.created_at
-            ],
-        )
-        .map_err(|e| format!("任务消息落库失败: {e}"))?;
-        Ok(record)
+        Self::blocking(|| {
+            let record = TaskMessageRecord {
+                id: Uuid::new_v4().to_string(),
+                task_id: task_id.to_string(),
+                role: role.to_string(),
+                kind: kind.to_string(),
+                content: content.to_string(),
+                created_at: now_iso(),
+            };
+            let conn = self.db.write();
+            conn.execute(
+                "INSERT INTO task_messages (id, task_id, role, kind, content, created_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    record.id,
+                    record.task_id,
+                    record.role,
+                    record.kind,
+                    record.content,
+                    record.created_at
+                ],
+            )
+            .map_err(|e| format!("任务消息落库失败: {e}"))?;
+            Ok(record)
+        })
     }
 
     /// 任务消息全量列表(详情响应 messages 字段),按发生顺序升序
@@ -502,81 +589,91 @@ impl TaskService {
 
     // ===== 子任务 =====
 
-    pub(super) fn create_subtask(
+    pub(crate) fn create_subtask(
         &self,
         task_id: &str,
         name: &str,
         instruction: &str,
     ) -> Result<String, String> {
-        let id = Uuid::new_v4().to_string();
-        let now = now_iso();
-        let conn = self.db.write();
-        conn.execute(
-            "INSERT INTO task_subtasks (id, task_id, name, instruction, status, result, error, created_at, updated_at) \
-             VALUES (?1, ?2, ?3, ?4, 'running', '', '', ?5, ?5)",
-            params![id, task_id, name, instruction, now],
-        )
-        .map_err(|e| format!("创建子任务失败: {e}"))?;
-        self.emit_event(
-            "subtask",
-            task_id,
-            None,
-            None,
-            Some(format!("子任务「{name}」开始执行")),
-        );
-        Ok(id)
+        Self::blocking(|| {
+            let id = Uuid::new_v4().to_string();
+            let now = now_iso();
+            let conn = self.db.write();
+            conn.execute(
+                "INSERT INTO task_subtasks (id, task_id, name, instruction, status, result, error, created_at, updated_at, finished_at) \
+                 VALUES (?1, ?2, ?3, ?4, 'running', '', '', ?5, ?5, '')",
+                params![id, task_id, name, instruction, now],
+            )
+            .map_err(|e| format!("创建子任务失败: {e}"))?;
+            self.emit_event(
+                TaskEventKind::Subtask,
+                task_id,
+                None,
+                None,
+                Some(format!("子任务「{name}」开始执行")),
+            );
+            Ok(id)
+        })
     }
 
-    pub(super) fn set_subtask_status(
+    pub(crate) fn set_subtask_status(
         &self,
         id: &str,
         status: TaskSubtaskStatus,
         result: Option<&str>,
         error: Option<&str>,
     ) -> bool {
-        let conn = self.db.write();
-        // 保持未提供字段不变:先读旧值(顺带取 task_id 供事件发射,避免额外查库)
-        let existing = conn
-            .query_row(
-                "SELECT task_id, result, error FROM task_subtasks WHERE id = ?1",
-                params![id],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                    ))
-                },
-            )
-            .optional()
-            .ok()
-            .flatten();
-        let (task_id, res, err) = existing.map(|(t, r, e)| (Some(t), r, e)).unwrap_or((
-            None,
-            String::new(),
-            String::new(),
-        ));
-        let res = result.map(|s| s.to_string()).unwrap_or(res);
-        let err = error.map(|s| s.to_string()).unwrap_or(err);
-        let changed = conn
-            .execute(
-                "UPDATE task_subtasks SET status = ?1, result = ?2, error = ?3, updated_at = ?4 WHERE id = ?5",
-                params![status.as_str(), res, err, now_iso(), id],
-            )
-            .map(|n| n > 0)
-            .unwrap_or(false);
-        if changed {
-            if let Some(tid) = task_id {
-                self.emit_event(
-                    "subtask",
-                    &tid,
-                    None,
-                    None,
-                    Some(format!("子任务状态更新为 {}", status.as_str())),
-                );
+        Self::blocking(|| {
+            let conn = self.db.write();
+            // 保持未提供字段不变:先读旧值(顺带取 task_id 供事件发射,避免额外查库)
+            // finished_at 一并读出:终态只记首次(见下),不能无条件 now_iso() 覆盖
+            let existing = conn
+                .query_row(
+                    "SELECT task_id, result, error, finished_at FROM task_subtasks WHERE id = ?1",
+                    params![id],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?,
+                        ))
+                    },
+                )
+                .optional()
+                .ok()
+                .flatten();
+            let (task_id, res, err, finished) = existing
+                .map(|(t, r, e, f)| (Some(t), r, e, f))
+                .unwrap_or((None, String::new(), String::new(), String::new()));
+            let res = result.map(|s| s.to_string()).unwrap_or(res);
+            let err = error.map(|s| s.to_string()).unwrap_or(err);
+            // 首次进入终态才记 finished_at;pending/running 保持空串,重复置终态不改写首值
+            let finished_at = if status.is_terminal() && finished.is_empty() {
+                now_iso()
+            } else {
+                finished
+            };
+            let changed = conn
+                .execute(
+                    "UPDATE task_subtasks SET status = ?1, result = ?2, error = ?3, updated_at = ?4, finished_at = ?5 WHERE id = ?6",
+                    params![status.as_str(), res, err, now_iso(), finished_at, id],
+                )
+                .map(|n| n > 0)
+                .unwrap_or(false);
+            if changed {
+                if let Some(tid) = task_id {
+                    self.emit_event(
+                        TaskEventKind::Subtask,
+                        &tid,
+                        None,
+                        None,
+                        Some(format!("子任务状态更新为 {}", status.as_str())),
+                    );
+                }
             }
-        }
-        changed
+            changed
+        })
     }
 
     /// 子任务列表(读路径合并,可观测性问题⑤):DB(task_subtasks 表,legacy
@@ -603,6 +700,7 @@ impl TaskService {
                 error: r.error,
                 created_at: r.created_at,
                 updated_at: r.updated_at,
+                finished_at: r.finished_at,
             })
             .collect();
         let overlay_ids: std::collections::HashSet<String> =
@@ -613,7 +711,7 @@ impl TaskService {
             return out;
         };
         let mut stmt = match conn.prepare_cached(
-            "SELECT id, task_id, name, instruction, status, result, error, created_at, updated_at \
+            "SELECT id, task_id, name, instruction, status, result, error, created_at, updated_at, finished_at \
                  FROM task_subtasks WHERE task_id = ?1 ORDER BY created_at ASC",
         ) {
             Ok(s) => s,
@@ -638,6 +736,7 @@ impl TaskService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::utils::test_support::TempDataDir;
 
     /// 孤儿任务启动恢复(问题④):遗留 running/planning 置 ended + error 文本
     /// 「服务重启,任务中断」;planned(待批准可续跑)/pending/终态不动;
@@ -645,7 +744,7 @@ mod tests {
     /// 再插一行 running 仍能恢复——恢复语义跨进程成立。
     #[test]
     fn recover_orphan_tasks_marks_interrupted_once() {
-        let dir = std::env::temp_dir().join(format!("kedai-task-recover-{}", Uuid::new_v4()));
+        let dir = TempDataDir::new("task-recover");
         let db_path = dir.join("kedai.db");
         {
             let db = Db::open(&db_path, &dir).expect("开库失败");
@@ -725,6 +824,5 @@ mod tests {
         assert_eq!(st, "ended", "重开后新孤儿应被终结");
         assert!(err.contains("服务重启"), "error 文本应标注中断原因: {err}");
         drop(db2);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -7,12 +7,20 @@
 //   "script": "if (args.city) { ... }",   // 白名单指令脚本
 // }
 // script 执行器为受控指令求值(算术/字符串/对象/数组/函数调用白名单),不使用 eval。
+//
+// ## 代际边界(L3 青层·活;2026-09-14 依赖倒置)
+//
+// 本模块是**纯解析器 + 白名单求值器**:它把 JSON 文件解析成工具定义、把脚本求值成字符串,
+// **不持有工具注册表**。注册动作由宿主(组合根 `api/app_state.rs` / `api/plugins.rs`)完成。
+//
+// 为什么这样切分(三结合「隔离」判据):L3 不得依赖 L2,而工具注册表是 L2 骨干设施。
+// 若本模块直接 `registry.register_external(...)`,就构成 `L3→L2` 越代依赖。
+// 倒置后本模块只依赖 L1(`models::types::ToolDefinition`),注册由组合根装配
+// ——这正是「青层能力经显式接缝注入」的标准形态(参照 `task_core::TaskBackend` 先例)。
 use crate::models::types::ToolDefinition;
-use crate::tools::registry::ToolRegistry;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
 /// 工具插件定义(从 JSON 文件加载)
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -25,6 +33,18 @@ pub struct ToolPluginConfig {
     pub script: String,
 }
 
+/// 已解析待注册的工具插件。
+///
+/// 宿主拿到它之后自行调用注册表登记(执行器由 [`plugin_executor`] 构造);
+/// 本模块不参与注册,故不依赖任何 L2 设施。
+#[derive(Debug, Clone)]
+pub struct LoadedToolPlugin {
+    /// 可直接交给工具注册表的定义(name/description/parameters)
+    pub definition: ToolDefinition,
+    /// 原始脚本正文(交给 [`plugin_executor`] 构造执行器)
+    pub script: String,
+}
+
 pub struct ToolPluginLoader {
     dir: PathBuf,
 }
@@ -34,12 +54,14 @@ impl ToolPluginLoader {
         ToolPluginLoader { dir }
     }
 
-    /// 加载目录下全部工具插件并注册;返回 (加载数, 失败列表)
-    pub fn load_all(&self, registry: &ToolRegistry) -> (usize, Vec<String>) {
-        let mut count = 0;
+    /// 解析目录下全部工具插件(**不注册**);返回 (已解析列表, 失败列表)
+    ///
+    /// 宿主负责把返回的定义逐条注册进工具注册表——注册是 L2 装配动作,不属 L3 加载器职责。
+    pub fn parse_all(&self) -> (Vec<LoadedToolPlugin>, Vec<String>) {
+        let mut loaded = Vec::new();
         let mut errors = Vec::new();
         let Ok(entries) = std::fs::read_dir(&self.dir) else {
-            return (0, errors);
+            return (loaded, errors);
         };
         let mut files: Vec<PathBuf> = entries
             .filter_map(|e| e.ok().map(|e| e.path()))
@@ -47,8 +69,8 @@ impl ToolPluginLoader {
             .collect();
         files.sort();
         for file in files {
-            match self.load_file(&file, registry) {
-                Ok(()) => count += 1,
+            match self.parse_file(&file) {
+                Ok(plugin) => loaded.push(plugin),
                 Err(e) => errors.push(format!(
                     "{}: {e}",
                     file.file_name()
@@ -57,11 +79,11 @@ impl ToolPluginLoader {
                 )),
             }
         }
-        (count, errors)
+        (loaded, errors)
     }
 
-    /// 加载单个工具插件文件并注册(供导入 API 复用)
-    pub fn load_file(&self, file: &Path, registry: &ToolRegistry) -> Result<(), String> {
+    /// 解析单个工具插件文件(**不注册**;供导入 API 复用)
+    pub fn parse_file(&self, file: &Path) -> Result<LoadedToolPlugin, String> {
         let raw = std::fs::read_to_string(file).map_err(|e| format!("读取失败: {e}"))?;
         let cfg: ToolPluginConfig =
             serde_json::from_str(&raw).map_err(|e| format!("JSON 解析失败: {e}"))?;
@@ -71,23 +93,21 @@ impl ToolPluginLoader {
         if cfg.script.trim().is_empty() {
             return Err("script 不能为空".into());
         }
-        let script = cfg.script.clone();
-        let definition = ToolDefinition {
-            name: cfg.name.clone(),
-            description: cfg.description,
-            parameters: cfg.parameters,
-        };
-        // 插件工具标记为外部来源:三档授权模式据此认定其参数不可信(可能含系统路径)
-        registry.register_external(
-            definition,
-            Arc::new(move |args: Value, _ctx| -> futures::future::BoxFuture<'static, Result<String, String>> {
-                let script = script.clone();
-                Box::pin(async move { eval_tool_script(&script, args) })
-            }),
-            None,
-            crate::tools::action_class::ToolOrigin::Plugin,
-        );
-        Ok(())
+        // 名称格式校验（2026-09-14 安全加固，见 known-limitations L19）：
+        // ① 只允许小写字母/数字/下划线，且首字符为字母——防注入怪异字符与不可见字符；
+        // ② **不得占用保留前缀** `mcp_`（MCP 工具命名空间）与 `agent` 系内置域，
+        //    否则插件可在授权裁决的「未知外部工具」语义上伪装成已知工具族。
+        //    跨命名空间的名称伪造比单纯重名更隐蔽（重名由 register_plugins 拦），
+        //    故在解析期就拒绝。
+        validate_plugin_name(&cfg.name)?;
+        Ok(LoadedToolPlugin {
+            definition: ToolDefinition {
+                name: cfg.name,
+                description: cfg.description,
+                parameters: cfg.parameters,
+            },
+            script: cfg.script,
+        })
     }
 
     /// 列出已加载工具插件文件(供 API 展示)
@@ -103,6 +123,55 @@ impl ToolPluginLoader {
         names.sort();
         names
     }
+}
+
+/// 把已解析的插件构造成可直接注册的执行器（**纯构造，无 L2 依赖**）。
+///
+/// 宿主拿到返回值后自行调 `registrar.register_external(def, exec, None, ToolOrigin::Plugin)`。
+/// 之所以把「构造」与「注册」分开，是为了让本模块（L3）不依赖工具注册表（L2）——
+/// 这正是依赖倒置的落点。
+pub fn plugin_executor(script: &str) -> crate::models::types::ToolExecutor {
+    let script = script.to_string();
+    std::sync::Arc::new(
+        move |args: Value, _ctx| -> futures::future::BoxFuture<'static, Result<String, String>> {
+            let script = script.clone();
+            Box::pin(async move { eval_tool_script(&script, args) })
+        },
+    )
+}
+
+/// 插件工具名格式校验(2026-09-14;安全加固,见 `docs/遗留.md` L19)。
+///
+/// 规则:
+/// - 非空、`^[a-z][a-z0-9_]*$`、长度 ≤ 48;
+/// - 不得以保留前缀开头:`mcp_`(MCP 命名空间)、`agent`(内置 agent 工具域)。
+///
+/// 拒绝的理由不是「不好看」,而是**命名空间伪造**:授权裁决按工具名判定风险与来源,
+/// 一个叫 `mcp_fs_read` 的插件会被误认为 MCP 工具。跨命名空间的伪造比重名更隐蔽,
+/// 故在解析期即拒(重名另有 `register_plugins` 的内置名校验兜底)。
+fn validate_plugin_name(name: &str) -> Result<(), String> {
+    const MAX_LEN: usize = 48;
+    const RESERVED_PREFIXES: &[&str] = &["mcp_", "agent"];
+    if name.len() > MAX_LEN {
+        return Err(format!("name 过长({} > {MAX_LEN})", name.len()));
+    }
+    let mut chars = name.chars();
+    let first = chars.next().ok_or("name 不能为空")?;
+    if !first.is_ascii_lowercase() {
+        return Err("name 首字符须为小写字母".into());
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+    {
+        return Err("name 只允许小写字母/数字/下划线".into());
+    }
+    for p in RESERVED_PREFIXES {
+        if name.starts_with(p) {
+            return Err(format!("name 不得使用保留前缀 `{p}`(防命名空间伪造)"));
+        }
+    }
+    Ok(())
 }
 
 /// 白名单指令求值:支持字面量、数组/对象字面量、变量、对象属性访问、算术、
@@ -298,6 +367,7 @@ fn eval_call(name: &str, args_str: &str, env: &HashMap<String, Value>) -> Result
             let v = args.first().ok_or("Number() 缺参数")?;
             match v {
                 Value::Number(n) => Ok(Value::from(n.as_f64().unwrap_or(0.0))),
+                // 有意丢弃 ParseFloatError:唯一信息是「不是数字」,原值 s 已在消息中
                 Value::String(s) => s
                     .parse::<f64>()
                     .map(Value::from)
@@ -588,5 +658,46 @@ mod tests {
         assert!(eval(script, json!({"score": 40, "pass": 60}))
             .unwrap()
             .contains("待改进"));
+    }
+
+    /// 名称格式校验(安全加固,known-limitations L19):
+    /// 合法名通过;**保留前缀/非法字符/大写/超长**一律拒绝。
+    ///
+    /// 这条约束的意义是防**命名空间伪造**:授权裁决按工具名判风险与来源,
+    /// 若插件能叫 `mcp_fs_read`,它就会被误当作 MCP 工具。
+    #[test]
+    fn plugin_name_validation_rejects_reserved_and_invalid_names() {
+        // 合法:小写字母开头 + 小写/数字/下划线
+        for ok in ["weather", "score_eval", "my_tool_2", "a"] {
+            assert!(
+                validate_plugin_name(ok).is_ok(),
+                "应接受合法名: {ok} → {:?}",
+                validate_plugin_name(ok)
+            );
+        }
+        // 保留前缀:防命名空间伪造
+        assert!(
+            validate_plugin_name("mcp_fs_read").is_err(),
+            "不得冒用 mcp_ 前缀"
+        );
+        assert!(validate_plugin_name("mcp_x").is_err());
+        assert!(
+            validate_plugin_name("agentgo").is_err(),
+            "不得冒用 agent 域前缀"
+        );
+        // 非法字符 / 大写 / 首字符非字母
+        assert!(validate_plugin_name("").is_err());
+        assert!(validate_plugin_name("Weather").is_err(), "大写应拒绝");
+        assert!(validate_plugin_name("1tool").is_err(), "数字开头应拒绝");
+        assert!(validate_plugin_name("my-tool").is_err(), "连字符应拒绝");
+        assert!(validate_plugin_name("my tool").is_err(), "空格应拒绝");
+        assert!(validate_plugin_name("工具").is_err(), "非 ASCII 应拒绝");
+        assert!(
+            validate_plugin_name("../evil").is_err(),
+            "路径穿越样式应拒绝"
+        );
+        // 超长
+        assert!(validate_plugin_name(&"a".repeat(49)).is_err(), "超长应拒绝");
+        assert!(validate_plugin_name(&"a".repeat(48)).is_ok(), "48 恰好合法");
     }
 }

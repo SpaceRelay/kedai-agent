@@ -1,6 +1,6 @@
 // 快速回复路由:/api/quick-replies(列表/新建/更新/删除)
 use crate::api::app_state::AppState;
-use crate::api::{db_err, WithStatus};
+use crate::api::{db_err, not_found, validation, WithStatus};
 use crate::services::quick_reply_service::QuickReplyRecord;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
@@ -39,9 +39,7 @@ pub async fn create(
         Ok(Ok(record)) => Json(json!({ "ok": true, "quick_reply": record }))
             .into_response()
             .with_status(StatusCode::CREATED),
-        Ok(Err(e)) => Json(json!({ "error": e }))
-            .into_response()
-            .with_status(StatusCode::BAD_REQUEST),
+        Ok(Err(e)) => validation(e),
     }
 }
 
@@ -54,9 +52,7 @@ pub async fn update(
     match state.db_call(move || svc.update(id, body)).await {
         Err(e) => db_err(&e),
         Ok(Some(record)) => Json(json!({ "ok": true, "quick_reply": record })).into_response(),
-        Ok(None) => Json(json!({ "error": "快速回复不存在" }))
-            .into_response()
-            .with_status(StatusCode::NOT_FOUND),
+        Ok(None) => not_found("快速回复不存在"),
     }
 }
 
@@ -65,8 +61,6 @@ pub async fn delete(State(state): State<Arc<AppState>>, Path(id): Path<i64>) -> 
     match state.db_call(move || svc.delete(id)).await {
         Err(e) => db_err(&e),
         Ok(true) => StatusCode::NO_CONTENT.into_response(),
-        Ok(false) => Json(json!({ "error": "快速回复不存在" }))
-            .into_response()
-            .with_status(StatusCode::NOT_FOUND),
+        Ok(false) => not_found("快速回复不存在"),
     }
 }

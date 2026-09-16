@@ -242,6 +242,11 @@ impl Drop for McpClient {
     }
 }
 
+/// 单行最大字节数:MCP 服务器(外部不可信)若输出超长行(无换行的海量数据),
+/// `read_line` 会持续增长缓冲直至耗尽内存。超限即判定协议异常并结束读循环,
+/// 由 close() 通知等待方(宁可断开也不 OOM)。
+const MAX_LINE_BYTES: usize = 8 * 1024 * 1024;
+
 /// 后台读循环:逐行读取 NDJSON,按 id 派发给等待表;
 /// 坏行/通知/未知 id 一律跳过(容错,不中断会话);EOF 或读错误即结束。
 async fn read_loop(reader: Box<BoxedReader>, shared: Arc<Shared>) {
@@ -253,6 +258,15 @@ async fn read_loop(reader: Box<BoxedReader>, shared: Arc<Shared>) {
             Ok(0) => break, // EOF:服务器关闭 stdout(进程退出)
             Ok(_) => {}
             Err(_) => break,
+        }
+        // 行长上限:read_line 读到换行才返回,超长行会撑爆内存(见 MAX_LINE_BYTES 注释)
+        if line.len() > MAX_LINE_BYTES {
+            tracing::warn!(
+                bytes = line.len(),
+                limit = MAX_LINE_BYTES,
+                "MCP 单行超出上限,判定协议异常并结束读循环"
+            );
+            break;
         }
         let trimmed = line.trim();
         if trimmed.is_empty() {

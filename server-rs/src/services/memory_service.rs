@@ -384,6 +384,37 @@ impl MemoryService {
             .unwrap_or_default()
     }
 
+    /// 批量按 id 取记忆(2026-09-16 性能批次 P-5):一条 `WHERE id IN (...)` 取回,
+    /// **按入参顺序**返回,不存在的 id 静默跳过。
+    ///
+    /// 存在意义:蒸馏后为新增条目补向量时,调用方手上只有 `new_ids`,此前逐条 `get(id)`
+    /// 是典型 N+1——N 条记忆就是 N 次往返 + N 次 prepare。批量版把往返降到 1 次。
+    /// 顺序保证是硬要求:调用方要用「返回的向量」逐个配对「id 列表」,顺序错了会张冠李戴。
+    pub fn get_many(&self, ids: &[i64]) -> Vec<MemoryEntry> {
+        if ids.is_empty() {
+            // SQL 的 `IN ()` 是语法错误,空输入必须短路
+            return Vec::new();
+        }
+        let Ok(conn) = self.db.read() else {
+            return Vec::new();
+        };
+        // 用与 id 个数等长的占位符;rusqlite 的 params_from_iter 按序绑定
+        let placeholders = vec!["?"; ids.len()].join(",");
+        let sql =
+            format!("SELECT {ENTRY_COLUMNS} FROM memory_entries WHERE id IN ({placeholders})");
+        let Ok(mut stmt) = conn.prepare(&sql) else {
+            return Vec::new();
+        };
+        let found: std::collections::HashMap<i64, MemoryEntry> =
+            match stmt.query_map(rusqlite::params_from_iter(ids.iter()), row_to_entry) {
+                Ok(rows) => rows.filter_map(|r| r.ok()).map(|e| (e.id, e)).collect(),
+                // 与同文件 list() 的错误处理惯例一致:查询失败返回空,由调用方按「无内容」处理
+                Err(_) => return Vec::new(),
+            };
+        // 按入参顺序重排(SQL 的 IN 不保证顺序),缺失项跳过
+        ids.iter().filter_map(|id| found.get(id).cloned()).collect()
+    }
+
     pub fn get(&self, id: i64) -> Option<MemoryEntry> {
         let conn = self.db.read().ok()?;
         conn.query_row(
@@ -985,6 +1016,7 @@ impl MemoryService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::utils::test_support::TempDataDir;
     use serde_json::json;
 
     fn entry(id: i64, usage: i64, last_usage: Option<&str>, selected: bool) -> MemoryEntry {
@@ -1013,13 +1045,42 @@ mod tests {
         }
     }
 
-    fn service() -> (MemoryService, SessionService, std::path::PathBuf) {
-        let dir = std::env::temp_dir().join(format!("kedai-memory-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
+    /// 返回 (守卫, 服务...):解构绑定按**逆序**析构,守卫在前才活到最后(见 test_support 模块头)
+    fn service() -> (TempDataDir, MemoryService, SessionService) {
+        let dir = TempDataDir::new("memory");
         let db = Arc::new(Db::open(&dir.join("kedai.db"), &dir).unwrap());
         let memory = MemoryService::new(db.clone());
         let sessions = SessionService::new(db);
-        (memory, sessions, dir)
+        (dir, memory, sessions)
+    }
+
+    /// 批量按 id 取记忆(2026-09-16 性能批次 P-5):蒸馏后为新增条目补向量时,
+    /// 此前逐条 `get(id)` 是 N+1 —— 同一份内容要发 N 条 SELECT。`get_many` 用
+    /// 一条 `WHERE id IN (...)` 取回,并**保持入参顺序**(调用方依赖 id 与内容对齐)。
+    #[test]
+    fn get_many_preserves_input_order_and_skips_missing() {
+        let (_dir, memory, _sessions) = service();
+        // 插 3 条,记录 id
+        let a = memory.create_manual("c1", "第一条").unwrap();
+        let b = memory.create_manual("c1", "第二条").unwrap();
+        let c = memory.create_manual("c1", "第三条").unwrap();
+        // 刻意打乱顺序 + 混入不存在的 id
+        let got = memory.get_many(&[c.id, 999_999, a.id, b.id]);
+        assert_eq!(
+            got.iter().map(|e| e.id).collect::<Vec<_>>(),
+            vec![c.id, a.id, b.id],
+            "应按入参顺序返回,并静默跳过不存在的 id"
+        );
+        assert_eq!(got[0].content, "第三条");
+        assert_eq!(got[2].content, "第二条");
+    }
+
+    /// 空入参不查库、直接返回空(SQL `IN ()` 是语法错误,顺手锁定边界)
+    #[test]
+    fn get_many_empty_input_returns_empty() {
+        let (_dir, memory, _sessions) = service();
+        let _ = memory.create_manual("c1", "有内容").unwrap();
+        assert!(memory.get_many(&[]).is_empty());
     }
 
     fn seed_session(
@@ -1058,7 +1119,7 @@ mod tests {
     /// memory_entries 表随 Db::open 自动建立(旧库启动幂等升级),列与索引齐全
     #[test]
     fn memory_table_created_on_open() {
-        let (memory, _, dir) = service();
+        let (_dir, memory, _) = service();
         let conn = memory.db.read().unwrap();
         let mut columns: Vec<String> = Vec::new();
         {
@@ -1104,7 +1165,6 @@ mod tests {
         // kind CHECK 约束:非法 kind 拒绝
         assert!(memory.insert("c1", None, "bogus", "x").is_err());
         drop(conn);
-        std::fs::remove_dir_all(dir).ok();
     }
 
     /// 精选排序:pinned 优先 → usage_count DESC → last_usage DESC(None 最后)
@@ -1166,7 +1226,7 @@ mod tests {
     /// character_id 按会话归属,source_session_id 记来源
     #[tokio::test]
     async fn distill_session_inserts_lines() {
-        let (memory, sessions, dir) = service();
+        let (dir, memory, sessions) = service();
         seed_session(&sessions, &dir, "charA", "s1");
         sessions
             .add_message("s1", "user", "我们好像在哪见过?", json!({}))
@@ -1202,13 +1262,12 @@ mod tests {
             "- 前缀应被剥除"
         );
         assert!(list.iter().all(|e| e.usage_count == 0 && e.selected));
-        std::fs::remove_dir_all(dir).ok();
     }
 
     /// 空历史不蒸馏:不调 LLM(fake 计数为 0)、inserted=0
     #[tokio::test]
     async fn distill_session_empty_history_skips() {
-        let (memory, sessions, dir) = service();
+        let (dir, memory, sessions) = service();
         seed_session(&sessions, &dir, "charB", "s2");
         let outcome = memory
             .distill_session(&sessions, "s2", |_| async {
@@ -1223,13 +1282,12 @@ mod tests {
             .distill_session(&sessions, "missing", |_| async { Ok("x".into()) })
             .await
             .is_err());
-        std::fs::remove_dir_all(dir).ok();
     }
 
     /// LLM 失败上抛;蒸馏输出全空白 → 报错不落库
     #[tokio::test]
     async fn distill_session_llm_failure_propagates() {
-        let (memory, sessions, dir) = service();
+        let (dir, memory, sessions) = service();
         seed_session(&sessions, &dir, "charC", "s3");
         sessions
             .add_message("s3", "user", "你好", json!({}))
@@ -1243,13 +1301,12 @@ mod tests {
             .await
             .is_err());
         assert!(memory.list("charC").is_empty());
-        std::fs::remove_dir_all(dir).ok();
     }
 
     /// CRUD:手动添加/编辑/删除;touch 只动计数与时间戳
     #[test]
     fn crud_and_touch_semantics() {
-        let (memory, _, dir) = service();
+        let (_dir, memory, _) = service();
         let e = memory.create_manual("c1", "  用户喜欢薄荷茶  ").unwrap();
         assert_eq!(e.content, "用户喜欢薄荷茶", "content 应 trim");
         assert_eq!(e.kind, "manual");
@@ -1282,16 +1339,17 @@ mod tests {
         assert!(memory.delete(e.id));
         assert!(!memory.delete(e.id));
         assert!(memory.get(e.id).is_none());
-        std::fs::remove_dir_all(dir).ok();
     }
 
     /// Phase 3 向量索引端到端(不调外部 API):
     /// vec0 表懒建 → 写入向量 → 读取回环 → 混合召回按向量相似度排序。
     #[test]
     fn vector_index_roundtrip_and_hybrid_recall() {
-        let (memory, _, dir) = service();
+        let (_dir, memory, _) = service();
         let a = memory.create_manual("c1", "用户喜欢薄荷茶").unwrap();
-        let b = memory.create_manual("c1", "角色承诺周末带用户看画展").unwrap();
+        let b = memory
+            .create_manual("c1", "角色承诺周末带用户看画展")
+            .unwrap();
 
         // 维度非法(0)时拒绝
         assert!(memory.ensure_vec_table(0).is_ok_and(|ok| !ok));
@@ -1344,15 +1402,13 @@ mod tests {
         let v8 = vec![0.5f32; 8];
         memory.upsert_vector(a.id, &v8).unwrap();
         assert_eq!(memory.vector_status().dim, Some(8), "新维度生效");
-
-        std::fs::remove_dir_all(dir).ok();
     }
 
     /// B1 检索:中文 FTS5 命中(trigram);<3 字符回退 LIKE;
     /// 更新/删除经 trigger 同步索引;查询短语中的双引号不炸语法
     #[test]
     fn search_hits_chinese_via_fts_and_falls_back_to_like() {
-        let (memory, _, dir) = service();
+        let (_dir, memory, _) = service();
         memory
             .insert("c1", None, "manual", "用户与角色在图书馆初识")
             .unwrap();
@@ -1405,14 +1461,13 @@ mod tests {
                 .unwrap();
         }
         assert_eq!(memory.search("c3", "共同关键词", 2).len(), 2);
-        std::fs::remove_dir_all(dir).ok();
     }
 
     /// B3 淘汰:超过 memory_max_entries 时把最低分条目置 selected=0(只归档不删除),
     /// prune 硬删除归档条目;容量 0 = 不淘汰
     #[test]
     fn evict_archives_lowest_score_and_prune_removes() {
-        let (memory, _, dir) = service();
+        let (_dir, memory, _) = service();
         // 先落 5 条(未接设置 → 默认容量 200,不淘汰),再压低容量触发淘汰
         let ids: Vec<i64> = (0..5)
             .map(|i| {
@@ -1460,7 +1515,7 @@ mod tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .memory_max_entries = 0;
-        let (memory0, _, dir0) = service();
+        let (_dir0, memory0, _) = service();
         memory0.attach_settings(settings0);
         for i in 0..6 {
             memory0
@@ -1472,15 +1527,13 @@ mod tests {
             6,
             "容量 0 应不淘汰"
         );
-        std::fs::remove_dir_all(dir).ok();
-        std::fs::remove_dir_all(dir0).ok();
     }
 
     /// B4 精确去重:同角色相同 content(trim 后)不新建,usage_count+1 并返回已有条目;
     /// 不同角色 / 不同内容照常新建
     #[test]
     fn insert_dedups_exact_content() {
-        let (memory, _, dir) = service();
+        let (_dir, memory, _) = service();
         let first = memory
             .insert("d1", None, "manual", "  用户喜欢薄荷茶  ")
             .unwrap();
@@ -1501,14 +1554,13 @@ mod tests {
         // 不同内容:新建
         memory.insert("d1", None, "manual", "用户喜欢咖啡").unwrap();
         assert_eq!(memory.list("d1").len(), 2);
-        std::fs::remove_dir_all(dir).ok();
     }
 
     /// B4 近似去重:蒸馏输出与已有记忆 Jaccard ≥ 0.8 跳过;
     /// 同一批内近义行也只落一条;不相似行照常落库
     #[tokio::test]
     async fn distill_skips_near_duplicates_by_jaccard() {
-        let (memory, sessions, dir) = service();
+        let (dir, memory, sessions) = service();
         seed_session(&sessions, &dir, "charJ", "sj");
         sessions
             .add_message("sj", "user", "聊聊记忆", json!({}))
@@ -1537,7 +1589,6 @@ mod tests {
             !contents.iter().any(|c| c.contains("初识了")),
             "近似重复不应落库: {contents:?}"
         );
-        std::fs::remove_dir_all(dir).ok();
     }
 
     /// 相似度工具:中文 bigram + ASCII 整词;Jaccard 对称、空集为 0

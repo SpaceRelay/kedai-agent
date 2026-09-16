@@ -53,8 +53,11 @@ impl PatchOp {
 ///   2. MagVarUpdate 格式:_.set('path', old, new);//原因
 pub fn parse_update_variable(text: &str) -> (String, Vec<PatchOp>) {
     let mut ops = Vec::new();
-    // 正则为写死字面量,编译必然成功
-    let re = regex::Regex::new(r"(?is)<UpdateVariable\b[^>]*>([\s\S]*?)</UpdateVariable\s*>")
+    // 正则为写死字面量,编译必然成功。
+    // `<\s*` / `</\s*`:容忍标签名与尖括号之间的空白(如 `< UpdateVariable >`)——
+    // 前端 BLOCK_RE 一直允许(其注释即「容忍属性/空白」),此前 Rust 侧不允许,
+    // 导致同一段文本两端行为不一致(由 docs/fixtures/mvu_patch_cases.json 对拍发现)。
+    let re = regex::Regex::new(r"(?is)<\s*UpdateVariable\b[^>]*>([\s\S]*?)</\s*UpdateVariable\s*>")
         .expect("UpdateVariable 块正则为常量,编译必然成功");
     for cap in re.captures_iter(text) {
         let block = &cap[1];
@@ -70,8 +73,9 @@ pub fn parse_update_variable(text: &str) -> (String, Vec<PatchOp>) {
 
 /// 提取块内 <JSONPatch> 数组并解析为操作;无该标签或解析失败返回 None
 fn extract_json_patch(block: &str) -> Option<Vec<PatchOp>> {
-    // 正则为写死字面量,编译必然成功
-    let re = regex::Regex::new(r"(?is)<JSONPatch\b[^>]*>([\s\S]*?)</JSONPatch\s*>")
+    // 正则为写死字面量,编译必然成功;
+    // `<\s*` / `</\s*` 容忍空白,与前端 JSONPatch 正则对齐(同 UpdateVariable)。
+    let re = regex::Regex::new(r"(?is)<\s*JSONPatch\b[^>]*>([\s\S]*?)</\s*JSONPatch\s*>")
         .expect("JSONPatch 块正则为常量,编译必然成功");
     let body = re.captures(block)?.get(1)?.as_str().to_string();
     let v: Value = serde_json::from_str(&body).ok()?;
@@ -541,6 +545,81 @@ mod tests {
                 assert_eq!(reason, &Some("原因".into()));
             }
             other => panic!("应为 Replace,实际: {other:?}"),
+        }
+    }
+
+    /// 跨端协议一致性(批次 F):读 `docs/fixtures/mvu_patch_cases.json`,与
+    /// 前端 `web/src/mvu/parser.contract.test.ts` 断言同一份期望。
+    ///
+    /// 这是「同一协议两份实现」的机器化对拍——此前只有注释声明「逐字对齐前端」,
+    /// 无任何机制阻止两端漂移。任一端的 `_.set` 解析行为改变,本测试或 TS 侧测试即红。
+    /// fixture 只覆盖 `_.set`(JSON Patch 路径格式两端存差异,属待评审项,见 fixture 说明)。
+    #[test]
+    fn mvu_protocol_fixture_is_consistent() {
+        const FIXTURE: &str = include_str!("../../../../docs/fixtures/mvu_patch_cases.json");
+        let root: Value = serde_json::from_str(FIXTURE).expect("fixture 应为合法 JSON");
+        let cases = root
+            .get("cases")
+            .and_then(|c| c.as_array())
+            .expect("fixture 应有 cases 数组");
+        assert!(
+            cases.len() >= 15,
+            "fixture 应至少 15 个用例,实际 {}",
+            cases.len()
+        );
+
+        for case in cases {
+            let name = case
+                .get("name")
+                .and_then(|n| n.as_str())
+                .unwrap_or("(未命名)");
+            let input = case
+                .get("input")
+                .and_then(|i| i.as_str())
+                .expect("用例应有 input");
+            let expected = case
+                .get("ops")
+                .and_then(|o| o.as_array())
+                .expect("用例应有 ops");
+
+            let (_cleaned, ops) = parse_update_variable(input);
+            let actual: Vec<Value> = ops.iter().map(normalize_op).collect();
+
+            assert_eq!(
+                &actual, expected,
+                "用例「{name}」两端解析不一致\n  输入: {input:?}\n  Rust: {actual:?}\n  期望: {expected:?}"
+            );
+        }
+    }
+
+    /// 把 PatchOp 规范化为 fixture 形态(与 TS 侧 normalize 对齐):
+    /// 缺省字段不出现;reason 无则 null。JSON 中数字统一为 f64 比较(serde_json 语义)。
+    fn normalize_op(op: &PatchOp) -> Value {
+        match op {
+            PatchOp::Replace {
+                path,
+                value,
+                reason,
+            } => json!({
+                "op": "set", "path": path, "new": value,
+                "reason": reason.as_deref(),
+            }),
+            PatchOp::Delta {
+                path,
+                value,
+                reason,
+            } => json!({
+                "op": "delta", "path": path, "new": value,
+                "reason": reason.as_deref(),
+            }),
+            PatchOp::Remove { path, reason } => json!({
+                "op": "remove", "path": path, "new": Value::Null,
+                "reason": reason.as_deref(),
+            }),
+            PatchOp::Move { from, to, reason } => json!({
+                "op": "move", "path": to, "from": from, "new": Value::Null,
+                "reason": reason.as_deref(),
+            }),
         }
     }
 }

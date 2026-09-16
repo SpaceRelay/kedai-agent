@@ -37,7 +37,7 @@ pub(super) async fn reflect_with_llm(
         tool_choice: crate::models::types::ToolChoice::Auto,
         parallel_tool_calls: None,
     };
-    let connector = engine.connector.read().await;
+    let connector = engine.connector.read().await.clone();
     let chunks = connector
         .generate(&messages, params, abort.clone())
         .await
@@ -132,7 +132,7 @@ pub(super) async fn reflect_with_tools(
             tool_choice: crate::models::types::ToolChoice::Auto,
             parallel_tool_calls: None,
         };
-        let connector = engine.connector.read().await;
+        let connector = engine.connector.read().await.clone();
         let chunks = connector
             .generate(&messages, params, abort.clone())
             .await
@@ -250,7 +250,7 @@ pub(super) async fn generate_reflect_advice(
         tool_choice: crate::models::types::ToolChoice::Auto,
         parallel_tool_calls: None,
     };
-    let connector = engine.connector.read().await;
+    let connector = engine.connector.read().await.clone();
     let chunks = connector
         .generate(&messages, params, abort.clone())
         .await

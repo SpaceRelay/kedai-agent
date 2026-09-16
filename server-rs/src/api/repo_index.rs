@@ -8,12 +8,17 @@
 // 安全:只读固定相对路径(仓库根 .kedai-index/index.json),不接受任意路径参数,
 // 因此不存在目录穿越面。
 use crate::api::app_state::AppState;
+use crate::api::ErrorCode;
 use axum::extract::{Query, State};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::sync::Arc;
+
+/// 「索引不可用」的稳定文案(批次 1):读取/解析失败的**原始错误**(含盘符路径、
+/// serde 行列号)只进日志,响应里给固定文案 + 重新生成指引,保持可操作性。
+const INDEX_REBUILD_HINT: &str = "请重新运行 node .kedai-index/build.mjs --full 生成索引";
 
 #[derive(Deserialize, Default)]
 pub struct RepoIndexQuery {
@@ -65,6 +70,7 @@ pub async fn get_repo_index(
     let Some(file) = locate_index_file() else {
         return Json(json!({
             "available": false,
+            "code": ErrorCode::NotFound.as_str(),
             "reason": "未找到 .kedai-index/index.json;请先在仓库根运行 node .kedai-index/build.mjs --full"
         }))
         .into_response();
@@ -73,9 +79,11 @@ pub async fn get_repo_index(
     let raw = match tokio::fs::read_to_string(&file).await {
         Ok(t) => t,
         Err(e) => {
+            tracing::error!(error = %e, "索引文件读取失败");
             return Json(json!({
                 "available": false,
-                "reason": format!("索引文件读取失败: {e}")
+                "code": ErrorCode::Internal.as_str(),
+                "reason": format!("索引文件读取失败,{INDEX_REBUILD_HINT}")
             }))
             .into_response();
         }
@@ -83,9 +91,11 @@ pub async fn get_repo_index(
     let parsed: Value = match serde_json::from_str(&raw) {
         Ok(v) => v,
         Err(e) => {
+            tracing::error!(error = %e, "索引文件解析失败");
             return Json(json!({
                 "available": false,
-                "reason": format!("索引文件解析失败(可能构建中断): {e}")
+                "code": ErrorCode::Internal.as_str(),
+                "reason": format!("索引文件解析失败(可能构建中断),{INDEX_REBUILD_HINT}")
             }))
             .into_response();
         }

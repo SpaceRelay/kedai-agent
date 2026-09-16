@@ -20,7 +20,11 @@ pub mod utils;
 
 use std::sync::Once;
 
-/// 构建测试应用:mock 连接器 + 临时数据目录
+/// 构建测试应用:mock 连接器 + 临时数据目录。
+///
+/// 数据目录为**进程级共享**(`OnceLock` 单例 + `static INIT: Once`),其生命周期等于
+/// 测试进程而非单个用例,故**不得**套 `utils::test_support::TempDataDir`——
+/// 第一个用例结束时就会删掉后续所有用例要用的库。保持现状,由 OS 临时目录清理。
 pub fn build_test_app() -> Result<axum::Router, String> {
     static INIT: Once = Once::new();
     let mut data_dir = std::env::temp_dir();

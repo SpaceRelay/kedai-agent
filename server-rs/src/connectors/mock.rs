@@ -4,6 +4,7 @@
 // [[tool_raw:name {...}]] 模拟「max_tokens 把 tool_call 参数 JSON 切成半截」
 // (任务引擎截断自愈,问题①);has_tool_result 固定回复分支内含回复钩子守卫
 // ([[reply_if:]]/[[reply:]] 优先,规划器侦察轮后的计划 JSON 产出用,问题②)。
+use crate::models::llm_error::{LlmError, LlmErrorKind};
 use crate::models::types::{GenerationParams, LlmMessage, LlmStreamChunk, ToolCallArgs};
 use std::time::Duration;
 use tokio::sync::watch;
@@ -13,6 +14,13 @@ use tokio::sync::watch;
 /// 默认输出上限 1024 → 截断;自愈翻倍 2048 → 完整(与 RETRY 翻倍语义对齐)。
 const TOOL_RAW_MIN_BUDGET: u32 = 2048;
 
+/// [[trunc_text:]]/[[trunc_fail:]] 钩子的截断预算门限:max_tokens 低于该值视为
+/// 「输出预算不足」返回半截文本 + Finish{length};达到即视为「自愈翻倍后的重发」。
+/// 取值须落在 generate-raw 结构化下限(8192)与首轮翻倍值(16384)之间,
+/// 使首轮截断、重发充足(2026-09-13 generate-raw 自愈循环端点级测试用)。
+const TRUNC_TEXT_MIN_BUDGET: u32 = 12_000;
+
+#[derive(Clone)]
 pub struct MockConnector;
 
 impl MockConnector {
@@ -28,13 +36,13 @@ impl MockConnector {
         (true, "Mock 连接器就绪(演示模式)".to_string())
     }
 
-    /// 逐字流式输出固定回复;每字符 sleep 8ms;abort 时返回 Err("生成已中断")
+    /// 逐字流式输出固定回复;每字符 sleep 8ms;abort 时返回带分类的错误(取消由调用方按 abort 标志判定)
     pub async fn generate(
         &self,
         messages: &[LlmMessage],
         params: GenerationParams,
         abort: watch::Receiver<bool>,
-    ) -> Result<Vec<LlmStreamChunk>, String> {
+    ) -> Result<Vec<LlmStreamChunk>, LlmError> {
         let mut chunks = Vec::new();
         // 工具循环第二轮:已有 tool 结果 → 返回固定完成回复
         // (先于通用分支检查 tool_loop 多轮钩子,保证显式多轮测试钩子不被通用完成回复短路)
@@ -50,20 +58,36 @@ impl MockConnector {
         // 测试钩子:[[fail:消息]] → 模拟模型请求失败(顶层错误终态测试用;
         // 上游错误应产生 Error 事件而非「空内容 finish 伪装成功」)
         if let Some(msg) = extract_fail_marker(&last_user) {
-            return Err(msg);
+            // [[fail:文案@分类]] 允许测试显式指定分类(如 @timeout/@rate_limited/@auth);
+            // 不指定时归为上游错误(mock 无真实 HTTP 状态可映射,不可再解析文案——见
+            // models/llm_error.rs 关于删除字符串猜测路径的说明)。
+            let (msg, kind) = split_fail_kind(&msg);
+            return Err(LlmError::new(kind, msg));
         }
 
         // 测试钩子:[[tool_loop:name|N args...]] → 前 N 轮持续返回 ToolCall(工具循环轮次
         // 上限边界测试)。mock 无状态:已执行轮数 = 消息数组中 role="tool" 的消息条数
         // (每轮工具执行后回填一条 tool 结果);第 k 轮返回 id=mock-call-k;
         // tool 消息数 >= N 后返回正文,模拟模型完成。
-        if let Some((name, n, args)) = extract_tool_loop_marker(&last_user) {
+        //
+        // 2026-09-14 语义变更(配合工具循环重复调用熔断 P0-2):默认给每轮注入
+        // `"_mock_round": k` 判别字段,使各轮「工具名+参数」指纹**互不相同**——
+        // 这才是真实 agent 的形态(每次调用携带新信息,如读不同文件)。
+        // 需要模拟「模型原地打转」的病态场景时用 [[tool_loop_repeat:name|N args]],
+        // 它保持参数逐字相同(供重复调用熔断的回归测试)。
+        // 注入的判别字段会被工具忽略(read 等只读已知键),不影响工具行为。
+        if let Some((name, n, args, repeat)) = extract_tool_loop_marker(&last_user) {
             let executed = messages.iter().filter(|m| m.role == "tool").count();
             if executed < n {
+                let arguments = if repeat {
+                    args
+                } else {
+                    vary_tool_args(&args, executed + 1)
+                };
                 chunks.push(LlmStreamChunk::ToolCall(ToolCallArgs {
                     id: format!("mock-call-{}", executed + 1),
                     name,
-                    arguments: args,
+                    arguments,
                 }));
                 chunks.push(LlmStreamChunk::Usage {
                     prompt_tokens: 5,
@@ -327,7 +351,7 @@ impl MockConnector {
             let completion_tokens = reply.chars().count() as i64;
             for ch in reply.chars() {
                 if *abort.borrow() {
-                    return Err("生成已中断".into());
+                    return Err(LlmError::generation("生成已中断"));
                 }
                 chunks.push(LlmStreamChunk::Token(ch.to_string()));
             }
@@ -392,6 +416,59 @@ impl MockConnector {
             return Ok(chunks);
         }
 
+        // 测试钩子:[[trunc_text:半截|完整]] → 文本版「max_tokens 截断自愈」模拟:
+        // 预算不足返回半截 + Finish{length};预算充足(自愈翻倍重发轮)返回完整 + Finish{stop}。
+        // 与 [[tool_raw:]] 同设计(按预算区分两轮),供 generate-raw 端点级自愈测试断言
+        // 「重发后拿到完整文本、且 injected 保留」。
+        if let Some((partial, full)) = extract_marker_pair(&last_user, "[[trunc_text:") {
+            let (text, reason) = if params.max_tokens < TRUNC_TEXT_MIN_BUDGET {
+                (partial, "length")
+            } else {
+                (full, "stop")
+            };
+            let prompt_chars: usize = messages.iter().map(|m| m.content.chars().count()).sum();
+            let out_chars = text.chars().count() as i64;
+            chunks.push(LlmStreamChunk::Token(text));
+            chunks.push(LlmStreamChunk::Usage {
+                prompt_tokens: (prompt_chars as f64 / 4.0).ceil() as i64,
+                completion_tokens: out_chars,
+                total_tokens: (prompt_chars as f64 / 4.0).ceil() as i64 + out_chars,
+                prompt_cache_hit_tokens: 0,
+                prompt_cache_miss_tokens: 0,
+                reasoning_tokens: 0,
+            });
+            chunks.push(LlmStreamChunk::Finish {
+                reason: reason.into(),
+            });
+            return Ok(chunks);
+        }
+
+        // 测试钩子:[[trunc_fail:半截]] → 预算不足返回半截 + Finish{length};
+        // 预算充足(重发轮)直接返回 Err,模拟「自愈重发失败」→ generate-raw 应回退
+        // 半截文本而非整体报错(回退分支端点级测试用)。
+        if let Some(partial) = extract_marker_single(&last_user, "[[trunc_fail:") {
+            if params.max_tokens < TRUNC_TEXT_MIN_BUDGET {
+                let prompt_chars: usize = messages.iter().map(|m| m.content.chars().count()).sum();
+                let out_chars = partial.chars().count() as i64;
+                chunks.push(LlmStreamChunk::Token(partial));
+                chunks.push(LlmStreamChunk::Usage {
+                    prompt_tokens: (prompt_chars as f64 / 4.0).ceil() as i64,
+                    completion_tokens: out_chars,
+                    total_tokens: (prompt_chars as f64 / 4.0).ceil() as i64 + out_chars,
+                    prompt_cache_hit_tokens: 0,
+                    prompt_cache_miss_tokens: 0,
+                    reasoning_tokens: 0,
+                });
+                chunks.push(LlmStreamChunk::Finish {
+                    reason: "length".into(),
+                });
+                return Ok(chunks);
+            }
+            return Err(LlmError::upstream(
+                "模拟自愈重发失败(测试钩子 [[trunc_fail:]])",
+            ));
+        }
+
         // 测试钩子:[[finish:原因|内容]] → 返回 Token(内容)+ Finish{reason:原因}
         //(可观测性问题①:模拟上游 max_tokens 截断,任务模式 finish_reason 透出测试用)。
         // 「原因」如 length/stop/content_filter;「内容」可省(缺省给固定半截文本)。
@@ -424,7 +501,7 @@ impl MockConnector {
 
         for ch in reply.chars() {
             if *abort.borrow() {
-                return Err("生成已中断".into());
+                return Err(LlmError::generation("生成已中断"));
             }
             chunks.push(LlmStreamChunk::Token(ch.to_string()));
             tokio::time::sleep(Duration::from_millis(8)).await;
@@ -531,6 +608,32 @@ fn extract_finish_marker(input: &str) -> Option<(String, String)> {
     Some((reason.to_string(), content))
 }
 
+/// 提取 [[marker:左|右]] 形式的双段标记(取到首个 "]]";两段分别 trim,任一段为空视为未命中)。
+/// 供 [[trunc_text:]] 等「首轮/重发轮」双值钩子共用;约定内容不含 "]]" 与额外 "|"。
+fn extract_marker_pair(input: &str, marker: &str) -> Option<(String, String)> {
+    let start = input.find(marker)?;
+    let rest = &input[start + marker.len()..];
+    let end = rest.find("]]")?;
+    let (a, b) = rest[..end].split_once('|')?;
+    let (a, b) = (a.trim(), b.trim());
+    if a.is_empty() || b.is_empty() {
+        return None;
+    }
+    Some((a.to_string(), b.to_string()))
+}
+
+/// 提取 [[marker:内容]] 形式的单段标记(取到首个 "]]";空内容视为未命中)。
+fn extract_marker_single(input: &str, marker: &str) -> Option<String> {
+    let start = input.find(marker)?;
+    let rest = &input[start + marker.len()..];
+    let end = rest.find("]]").unwrap_or(rest.len());
+    let text = rest[..end].trim();
+    if text.is_empty() {
+        return None;
+    }
+    Some(text.to_string())
+}
+
 /// 提取 [[mvu_tool:name|args]] 标记;返回 (name, arguments_json)。
 /// args 取到首个换行或 "]]"(测试约定 args 为单行 JSON;与 [[reply:]] 截断配合时无 "]]")。
 fn extract_mvu_tool_marker(input: &str) -> Option<(String, String)> {
@@ -591,17 +694,40 @@ fn extract_tool_echo_marker(input: &str) -> Option<(String, String)> {
     Some((name.trim().to_string(), args.trim().to_string()))
 }
 
-/// 提取 [[tool_loop:name|N args...]] 标记;返回 (name, 轮数, arguments_json)。
-/// N 为工具循环持续轮数(含首轮);args 为每次调用回传的 arguments(单行 JSON)。
-fn extract_tool_loop_marker(input: &str) -> Option<(String, usize, String)> {
-    let start = input.find("[[tool_loop:")?;
-    let rest = &input[start + "[[tool_loop:".len()..];
+/// 提取 [[tool_loop:name|N args...]](参数逐轮递变)或
+/// [[tool_loop_repeat:name|N args...]](参数逐字相同,模拟死循环)标记。
+/// 返回 (name, 轮数, arguments_json, repeat)。
+/// N 为工具循环持续轮数(含首轮);args 为调用回传的 arguments(单行 JSON)。
+fn extract_tool_loop_marker(input: &str) -> Option<(String, usize, String, bool)> {
+    const MARK: &str = "[[tool_loop:";
+    const MARK_REPEAT: &str = "[[tool_loop_repeat:";
+    // 先匹配更长的 repeat 前缀,避免被 plain 前缀误吞
+    let (start, prefix_len, repeat) = if let Some(p) = input.find(MARK_REPEAT) {
+        (p, MARK_REPEAT.len(), true)
+    } else {
+        let p = input.find(MARK)?;
+        (p, MARK.len(), false)
+    };
+    let rest = &input[start + prefix_len..];
     let end = rest.find("]]")?;
     let inner = &rest[..end];
     let (name, tail) = inner.split_once('|')?;
     let (n_str, args) = tail.split_once(' ')?;
     let n: usize = n_str.trim().parse().ok()?;
-    Some((name.trim().to_string(), n, args.trim().to_string()))
+    Some((name.trim().to_string(), n, args.trim().to_string(), repeat))
+}
+
+/// 给每轮的工具参数注入判别字段 `"_mock_round": k`,使各轮指纹互不相同
+/// (模拟真实 agent 逐轮携带新信息)。参数非 JSON 对象时原样返回
+/// (此类用例不涉及重复调用熔断,保持兼容)。
+fn vary_tool_args(args: &str, round: usize) -> String {
+    match serde_json::from_str::<serde_json::Value>(args) {
+        Ok(serde_json::Value::Object(mut map)) => {
+            map.insert("_mock_round".into(), serde_json::json!(round));
+            serde_json::Value::Object(map).to_string()
+        }
+        _ => args.to_string(),
+    }
 }
 
 /// 提取 [[empty_if:子串]] 标记;子串取到首个 "]]"(空白视为未命中)。
@@ -664,6 +790,26 @@ fn extract_fail_marker(input: &str) -> Option<String> {
     } else {
         Some(msg)
     }
+}
+
+/// 拆分 [[fail:消息@分类]] 的分类后缀,返回 (消息, 分类)。
+///
+/// mock 没有真实 HTTP 交互,无法从状态码/传输错误映射出分类,故由测试**显式**声明
+/// 期望分类(如 `@timeout`),而不是让上层再对文案做子串猜测——后者正是本次要删除的
+/// 路径(见 `models/llm_error.rs`)。未声明时归为上游错误(可重试)。
+fn split_fail_kind(msg: &str) -> (String, LlmErrorKind) {
+    for (suffix, kind) in [
+        ("@timeout", LlmErrorKind::Timeout),
+        ("@rate_limited", LlmErrorKind::RateLimited),
+        ("@auth_failed", LlmErrorKind::AuthFailed),
+        ("@generation_failed", LlmErrorKind::Generation),
+        ("@upstream_error", LlmErrorKind::Upstream),
+    ] {
+        if let Some(head) = msg.strip_suffix(suffix) {
+            return (head.trim().to_string(), kind);
+        }
+    }
+    (msg.to_string(), LlmErrorKind::Upstream)
 }
 
 impl Default for MockConnector {

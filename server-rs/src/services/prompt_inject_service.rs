@@ -3,6 +3,11 @@
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+// 楼层类型(FloorPosition/FloorRole/PromptFloor/new_floor_id)已下沉 L1
+// (models/types.rs,批次 B.6):parsing 预设导入与 services 共用且与 DB 无关。
+// 此处 re-export 保持既有调用方(prompt_kit/messages::build/parsing::preset)零改动。
+pub use crate::models::types::{new_floor_id, FloorPosition, FloorRole, PromptFloor};
+
 /// 简单模式「字数要求」→ 输出预算下限(纯函数,供 chat/send 协调 max_tokens):
 /// 中文约 1 字 ≈ 1-2 token,思考模型推理先占输出预算,故按 字数×2 + 512 余量估算,
 /// 封顶 8192;请求方显式给的值更大时尊重请求值。
@@ -50,70 +55,6 @@ fn validate_config(_cfg: &PromptInjectConfig) -> Result<(), String> {
     // 枚举字段由 serde(rename_all) 反序列化时校验,非法值会直接反序列化失败;
     // 这里只做轻量兜底(如内容超长防滥用)。
     Ok(())
-}
-
-/// 楼层注入位置(与 SillyTavern Prompt Manager 语义对齐)
-///
-/// **注意**:引擎注入路径已统一归位「系统提示词内」——`Before`/`After`/`Depth`
-/// 不再参与注入(见 `agents/engine/messages/build.rs` 位置4 注释)。三个变体仅保留
-/// 解析能力,用于兼容导入的酒馆预设(`parsing/preset.rs`),新配置应一律用 `System`。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "lowercase")]
-pub enum FloorPosition {
-    /// 拼入系统提示词末尾
-    #[default]
-    System,
-    /// 对话历史最前(开场白之前)——已废弃,不参与注入
-    Before,
-    /// 对话历史最后(最新消息之后)——已废弃,不参与注入
-    After,
-    /// 深度:从历史末尾往前数第 N 条之后插入(0 = 最新消息后)——已废弃,不参与注入
-    Depth,
-}
-
-/// 楼层消息角色(自由选择)
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "lowercase")]
-pub enum FloorRole {
-    #[default]
-    System,
-    User,
-    Assistant,
-}
-
-impl FloorRole {
-    /// LLM 消息角色字符串(system/user/assistant)
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            FloorRole::System => "system",
-            FloorRole::User => "user",
-            FloorRole::Assistant => "assistant",
-        }
-    }
-}
-
-/// 单条提示词楼层
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PromptFloor {
-    pub id: String,
-    pub name: String,
-    pub content: String,
-    #[serde(default)]
-    pub role: FloorRole,
-    #[serde(default)]
-    pub position: FloorPosition,
-    /// position = depth 时的深度(0 = 最新消息后)
-    #[serde(default)]
-    pub depth: usize,
-    #[serde(default = "default_true")]
-    pub enabled: bool,
-    /// 拖拽排序序号(同级内按 order 升序)
-    #[serde(default)]
-    pub order: usize,
-}
-
-fn default_true() -> bool {
-    true
 }
 
 /// 禁词条目:输出中出现 word 时,注入自省提示词要求换表达(所有模式),
@@ -406,14 +347,10 @@ impl PromptInjectConfig {
     }
 }
 
-/// 楼层 ID 生成(uuid v4,与 skill_service 一致)
-pub fn new_floor_id() -> String {
-    uuid::Uuid::new_v4().to_string()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::utils::test_support::TempDataDir;
 
     #[test]
     fn simple_inject_text_combines_enabled_items() {
@@ -718,8 +655,7 @@ mod tests {
 
     #[test]
     fn load_save_roundtrip() {
-        let dir = std::env::temp_dir().join(format!("kedai-pi-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&dir);
+        let dir = TempDataDir::new("pi");
         let cfg = PromptInjectConfig {
             mode: InjectMode::Complex,
             floors: vec![PromptFloor {
@@ -742,28 +678,23 @@ mod tests {
         assert_eq!(loaded.floors[0].position, FloorPosition::Depth);
         assert_eq!(loaded.floors[0].depth, 2);
         assert_eq!(loaded.floors[0].content, "内容 {{char}}");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn load_missing_file_returns_default() {
-        let dir = std::env::temp_dir().join(format!("kedai-pi-missing-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&dir);
+        let dir = TempDataDir::new("pi-missing");
         let cfg = PromptInjectConfig::load(&dir);
         assert_eq!(cfg.mode, InjectMode::Simple);
         assert!(cfg.floors.is_empty());
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn load_corrupted_file_falls_back_to_default() {
-        let dir = std::env::temp_dir().join(format!("kedai-pi-bad-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&dir);
+        let dir = TempDataDir::new("pi-bad");
         std::fs::write(dir.join("prompt_floors.json"), "{{{ not json").unwrap();
         let cfg = PromptInjectConfig::load(&dir);
         assert_eq!(cfg.mode, InjectMode::Simple);
         assert!(!cfg.simple.word_count_enabled);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // ---- output_budget_for_word_count 边界 ----

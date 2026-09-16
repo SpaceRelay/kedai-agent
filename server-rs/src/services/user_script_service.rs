@@ -107,12 +107,20 @@ impl UserScriptService {
         Ok(read_tavern_helper(&raw))
     }
 
+    /// 保存脚本树:读改写经 `character_data::update_data_raw` 在**同一写锁事务**内完成
+    ///(原实现 read→改→write 两步间不持锁,并发保存会丢更新)。
+    /// 迁移旧字段在与写新值同一事务内进行,保证「旧字段已迁移」与「新值已落库」不可分割。
     fn save_character(&self, character_id: &str, trees: &Value) -> Result<(), String> {
-        let mut raw = self.read_character_raw(character_id)?;
-        // 先迁移旧字段再写新值,避免新值落库后旧字段残留
-        migrate_legacy_scripts(&mut raw);
-        write_tavern_helper(&mut raw, trees);
-        self.write_character_raw(character_id, &raw)
+        let changed =
+            crate::services::character_data::update_data_raw(&self.db, character_id, |raw| {
+                migrate_legacy_scripts(raw);
+                write_tavern_helper(raw, trees);
+                Ok(())
+            })?;
+        if !changed {
+            return Err("角色不存在".to_string());
+        }
+        Ok(())
     }
 }
 
@@ -177,7 +185,11 @@ fn migrate_legacy_scripts(raw: &mut Value) -> bool {
     if !merged.is_array() {
         merged = Value::Array(Vec::new());
     }
-    let arr = merged.as_array_mut().expect("刚设为数组");
+    let arr = match merged.as_array_mut() {
+        Some(a) => a,
+        // 上一行刚保证是数组,防御性兜底:结构异常时放弃迁移(不 panic)
+        None => return false,
+    };
     for node in legacy {
         let Some(obj) = node.as_object() else {
             continue;

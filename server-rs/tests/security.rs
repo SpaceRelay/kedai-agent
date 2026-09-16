@@ -226,3 +226,70 @@ async fn strict_client_header_gates_writes() {
         .unwrap();
     assert_ne!(allowed.status(), StatusCode::FORBIDDEN);
 }
+
+/// 批次 2(可观测性):请求关联 ID 必须落在**早退路径**上。
+///
+/// 为什么这条断言是层序的回归护栏:`api/request_id.rs::attach` 注册在 `build_router` 链尾
+/// (CORS 之后),axum 的 `.layer()` 是「后加者在外层」,故 401/403 由 `security::guard`
+/// 提前返回时,响应仍穿过 request_id 层。此后若有人把 request_id 层挪到 guard 之前
+/// (或误以为顺序无关而调整),这两个早退响应会最先失去 X-Request-Id——本测试即失败。
+#[tokio::test]
+async fn early_return_responses_carry_request_id() {
+    let app = build_secure_test_app(TOKEN).unwrap();
+
+    // 401:缺 bearer token(security::guard 早退)
+    let unauthorized = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/characters")
+                .header("host", "127.0.0.1:3001")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+    let generated = unauthorized.headers()["x-request-id"]
+        .to_str()
+        .expect("401 响应应带 X-Request-Id(层序:request_id 在 guard 之外)")
+        .to_string();
+    assert!(
+        generated.starts_with("req-"),
+        "生成 ID 应带 req- 前缀: {generated}"
+    );
+
+    // 403:Origin 不受信任(同为 guard 早退)
+    let forbidden = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/characters")
+                .header("authorization", format!("Bearer {TOKEN}"))
+                .header("host", "127.0.0.1:3001")
+                .header("origin", "https://evil.example")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
+    assert!(
+        forbidden.headers().contains_key("x-request-id"),
+        "403 响应应带 X-Request-Id"
+    );
+
+    // 客户端自带 ID 时沿用(而非另生成)——跨端排查靠它串起前后端日志
+    let echoed = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/characters")
+                .header("host", "127.0.0.1:3001")
+                .header("x-request-id", "trace-me-123")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(echoed.headers()["x-request-id"], "trace-me-123");
+}

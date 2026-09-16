@@ -58,12 +58,26 @@ pub(super) fn register_search(registry: &ToolRegistry, deps: Arc<ToolDeps>) {
                     .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Kedai/0.2")
                     .send()
                     .await
-                    .map_err(|e| format!("搜索请求失败: {e}"))?;
+                    // 连接类失败(2026-09-15 实测:同一端点两次独立调用均失败,中文长查询
+                    // 与单词查询结果一致,证明失败在端点这一侧而非查询串)给出可执行出路,
+                    // 否则模型只会反复重试同一个连不通的地址。
+                    .map_err(|e| {
+                        format!(
+                            "搜索端点不可达({endpoint}):{e}。\
+                             本次失败与查询词无关,重试同一端点大概率仍失败;\
+                             请在设置中改用可达的搜索端点(如自建 SearXNG),或改用 read(type=file) 等离线资料"
+                        )
+                    })?;
                 if resp.status().is_redirection() {
-                    return Err("搜索接口重定向已禁用".into());
+                    return Err(format!(
+                        "搜索接口重定向已禁用(端点 {endpoint} 返回重定向;该端点可能需要登录或已失效)"
+                    ));
                 }
                 if !resp.status().is_success() {
-                    return Err(format!("搜索接口返回 {}", resp.status()));
+                    return Err(format!(
+                        "搜索接口返回 {}(端点 {endpoint};请确认端点是可用搜索服务或在设置中更换)",
+                        resp.status()
+                    ));
                 }
                 let html = resp.text().await.map_err(|e| format!("读取搜索响应失败: {e}"))?;
                 let results = parse_search_html(&html, max_results);
@@ -82,7 +96,9 @@ pub(crate) struct ResolvedHttpTarget {
 /// 解析并校验公开 HTTP(S) 目标:拒绝 localhost/私网/元数据地址(SSRF 防护)。
 /// 供搜索端点与角色卡资源代理共用。
 pub(crate) async fn resolve_public_http_url(raw: &str) -> Result<ResolvedHttpTarget, String> {
-    let url = reqwest::Url::parse(raw).map_err(|_| "搜索端点 URL 无效".to_string())?;
+    // 补回 url crate 原错(如 invalid port / relative URL 等具体成因);其 Display
+    // 不回显完整 URL,无泄露风险
+    let url = reqwest::Url::parse(raw).map_err(|e| format!("搜索端点 URL 无效({e})"))?;
     if !matches!(url.scheme(), "http" | "https") {
         return Err("搜索端点仅允许 http/https".into());
     }

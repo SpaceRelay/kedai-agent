@@ -1,5 +1,5 @@
 // 应用共享状态(axum State):汇聚 DB、服务、连接器、引擎、工具
-use crate::agents::engine::AgentEngine;
+use crate::agents::engine::{AgentEngine, EngineCore, EngineExt, EnginePrompt, EngineStorage};
 use crate::config::AppConfig;
 use crate::mcp::McpManager;
 use crate::models::db::Db;
@@ -14,6 +14,7 @@ use crate::services::memory_service::MemoryService;
 use crate::services::prompt_inject_service::PromptInjectService;
 use crate::services::quick_reply_service::QuickReplyService;
 use crate::services::runtime_prompt_service::RuntimePromptService;
+use crate::services::script_authorization_service::ScriptAuthorizationService;
 use crate::services::session_service::SessionService;
 use crate::services::settings_service::RuntimeSettings;
 use crate::services::skill_service::SkillService;
@@ -29,7 +30,11 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use tokio::sync::{watch, Mutex as AsyncMutex, RwLock};
 
-pub struct AppState {
+/// 核心服务组(M4.3 归组):数据层 + 业务服务 + 引擎/工具。
+/// 这些是请求处理的主干依赖,由 `AppState` 经 `Deref` 直接透出——
+/// `state.db` / `state.sessions` / `state.engine` 等既有访问路径**零改动**,
+/// 但结构上已与下面的「运行关注点」分组分离,职责边界可见。
+pub struct CoreServices {
     pub config: AppConfig,
     pub engine: Arc<AgentEngine>,
     pub characters: Arc<CharacterService>,
@@ -54,8 +59,6 @@ pub struct AppState {
     pub model: Arc<Mutex<String>>,
     /// 运行期设置(API 连接 + 生成参数),前端可编辑并持久化到 data/settings.json
     pub settings: Arc<Mutex<RuntimeSettings>>,
-    /// 设置更新事务锁:串行化读取、校验、持久化和内存替换，避免部分更新互相覆盖。
-    pub settings_update: Arc<AsyncMutex<()>>,
     /// 提示词注入配置(简单模式 + 楼层系统),持久化到 data/prompt_floors.json
     pub prompt_inject: Arc<Mutex<PromptInjectService>>,
     /// 音频播放器状态(bgm/ambient 双通道),持久化到 data/audio.json
@@ -64,26 +67,48 @@ pub struct AppState {
     pub quick_replies: Arc<QuickReplyService>,
     /// 用户脚本(ScriptTree,阶段三):global 存 SQLite,character 存角色卡 extensions.tavern_helper
     pub user_scripts: Arc<UserScriptService>,
+    /// 角色卡脚本授权台账(2026-09-14):后端脚本执行门(fail-closed;known-limitations L12)
+    pub script_authorizations: Arc<ScriptAuthorizationService>,
     /// 跨会话记忆蒸馏(落地项 2):按角色维度共享的长期记忆条目
     pub memory: Arc<MemoryService>,
     /// 回退快照(批次 6.1「undo」):写工具逆操作快照的暂存/列表/恢复
     pub undo: Arc<UndoService>,
-    /// MCP stdio 客户端(批次 6.2,L3 隔离;默认关):mcp_enabled=true 时由
-    /// run_server 在 AppState::new 之后、serve 之前调 start_mcp 装配;
-    /// 未启用时保持空管理器(零进程、零注册)。
+    /// MCP stdio 客户端(批次 6.2,L3 隔离;默认关)
     pub mcp: Arc<McpManager>,
     /// 任务模式(task 工作台):任务主表 + 子任务 + 后台执行引擎
     pub tasks: Arc<TaskService>,
-    /// slash 命令注册表(阶段四 4a):脚本 triggerSlash 与 GET /api/slash/commands 共用
+    /// slash 命令注册表(阶段四 4a)
     pub slash: Arc<crate::slash::SlashRegistry>,
-    /// 运行时主 Agent 提示词文件服务；Engine 与 settings API 共用同一实例和 DATA_DIR 路径。
+    /// 运行时主 Agent 提示词文件服务
     pub runtime_prompt: Arc<RuntimePromptService>,
     /// 自定义 Agent 执行流程(custom 模式),持久化到 data/agent_flows.json
     pub flow: Arc<Mutex<AgentFlowService>>,
+}
+
+/// 并发与限流脚手架(M4.3 归组):只服务于「串行化 / 取消 / 防滥用」,
+/// 不承载业务语义。与 CoreServices 分组的价值在于:排查并发问题时看这一组即可。
+pub struct ConcurrencyGuards {
+    /// 设置更新事务锁:串行化读取、校验、持久化和内存替换,避免部分更新互相覆盖。
+    pub settings_update: Arc<AsyncMutex<()>>,
     /// chat/send 在进入异步引擎前的原子占位及取消标志,stop 可取消消息写入/启动前请求。
     pub pending_runs: Arc<Mutex<HashMap<String, watch::Sender<bool>>>>,
     /// bootstrap 令牌桶限频(每对端 IP 一窗口计数),防本地恶意网页/脚本高频枚举 token。
     pub bootstrap_limiter: Arc<Mutex<HashMap<String, (std::time::Instant, u32)>>>,
+}
+
+/// 应用共享状态(axum State):核心服务 + 并发脚手架。
+/// 字段访问经 `Deref` 透出到两个分组,故 `state.db` / `state.settings_update` 等
+/// 既有写法保持不变。
+pub struct AppState {
+    pub core: CoreServices,
+    pub guards: ConcurrencyGuards,
+}
+
+impl std::ops::Deref for AppState {
+    type Target = CoreServices;
+    fn deref(&self) -> &Self::Target {
+        &self.core
+    }
 }
 
 impl AppState {
@@ -117,6 +142,7 @@ impl AppState {
         let quick_replies = Arc::new(QuickReplyService::new(db.clone()));
         // 用户脚本(ScriptTree,阶段三)
         let user_scripts = Arc::new(UserScriptService::new(db.clone()));
+        let script_authorizations = Arc::new(ScriptAuthorizationService::new(db.clone()));
         // slash 命令注册表(阶段四 4a):注册内置命令;engine 与 API 共享同一实例
         let slash = crate::slash::SlashRegistry::new();
 
@@ -164,6 +190,8 @@ impl AppState {
             connector: connector.clone(),
             data_dir: config.data_dir.clone(),
             memory: memory.clone(),
+            // bash 工具审计落库用(exec_audit);与 AppState 同源同一 Arc<Db>
+            db: db.clone(),
             // engine/tasks 尚不存在(构造顺序在其后),由下方 OnceLock 注入(批次 4.3b)
             engine: std::sync::OnceLock::new(),
             tasks: std::sync::OnceLock::new(),
@@ -173,11 +201,8 @@ impl AppState {
         // 启动清理:移除指向已不存在会话的孤儿授权(会话可能在历史版本中被删除而
         // 未清理授权;失败仅告警,不影响启动)。
         {
-            let existing: std::collections::HashSet<String> = sessions
-                .list_all()
-                .iter()
-                .map(|s| s.id.clone())
-                .collect();
+            let existing: std::collections::HashSet<String> =
+                sessions.list_all().iter().map(|s| s.id.clone()).collect();
             match tool_registry
                 .permissions()
                 .prune_orphan_session_grants(&existing)
@@ -200,10 +225,17 @@ impl AppState {
         ));
         tool_registry.set_undo(undo.clone());
 
-        // 契约注册表:引擎与多步工具共享同一实例(缓存一致;改卡后写路径 invalidate)
+        // 契约注册表:引擎与多步工具共享同一实例(缓存一致;改卡后写路径 invalidate)。
+        // 批次 B.6:注册表不再依赖服务类型,注入两个取数据闭包(角色卡 data_raw / 世界书条目)。
         let contract_registry = Arc::new(crate::contracts::ContractRegistry::new(
-            characters.clone(),
-            world_books.clone(),
+            {
+                let characters = characters.clone();
+                move |id: &str| characters.get(id).and_then(|c| c.data_raw)
+            },
+            {
+                let world_books = world_books.clone();
+                move |id: &str| world_books.collect_entries_for_character(id)
+            },
         ));
         // P4:多步模式工具(get_state/apply_patch)。契约经共享 registry(与引擎同缓存);
         // 不进入 agent 正文模式的默认下发列表(chat.rs 过滤)。P6:apply_patch 契约生效时
@@ -216,11 +248,14 @@ impl AppState {
         );
 
         // 工具插件加载:data/plugins/tools/*.json(白名单脚本)
+        // 两段式:L3 plugins/ 负责解析,本层负责注册(含内置重名防护,见 api::plugins::register_plugins)。
         {
             let loader = crate::plugins::ToolPluginLoader::new(
                 config.data_dir.join("plugins").join("tools"),
             );
-            let (count, errors) = loader.load_all(&tool_registry);
+            let (loaded, mut errors) = loader.parse_all();
+            let (count, reg_errors) = crate::api::plugins::register_plugins(loaded, &tool_registry);
+            errors.extend(reg_errors);
             if !errors.is_empty() {
                 eprintln!("[工具插件] 加载部分失败: {}", errors.join("; "));
             }
@@ -248,10 +283,9 @@ impl AppState {
             });
         let runtime_prompt = Arc::new(match std::env::var_os("KEDAI_RUNTIME_PROMPT_DIR") {
             // 显式指定目录:只从该目录读,不回退内置默认(测试隔离与自定义部署)
-            Some(dir) => RuntimePromptService::with_dir(
-                std::path::PathBuf::from(dir),
-                legacy_runtime_prompt,
-            ),
+            Some(dir) => {
+                RuntimePromptService::with_dir(std::path::PathBuf::from(dir), legacy_runtime_prompt)
+            }
             // 默认:DATA_DIR;文件与旧文件都缺失时回退内置默认提示词
             None => RuntimePromptService::new(config.data_dir.clone(), legacy_runtime_prompt),
         });
@@ -270,24 +304,33 @@ impl AppState {
         // 聊天引擎:先于 TaskService 构造(engine 不依赖 tasks,无循环;
         // 批次 4.2 起 TaskService 注入 Arc<AgentEngine> 供六模式执行器复用工具循环)
         let engine = Arc::new(AgentEngine::new(
-            connector.clone(),
-            characters.clone(),
-            sessions.clone(),
-            agent_sessions.clone(),
-            world_books.clone(),
-            tool_registry.clone(),
-            settings.clone(),
-            prompt_inject.clone(),
-            quick_replies.clone(),
-            runtime_prompt.clone(),
-            db.clone(),
-            initial_model.clone(),
-            user_scripts.clone(),
-            slash.clone(),
-            contract_registry.clone(),
-            kaleido_state.clone(),
-            memory.clone(),
-            skills.clone(),
+            EngineCore {
+                connector: connector.clone(),
+                settings: settings.clone(),
+                db: db.clone(),
+                initial_model: initial_model.clone(),
+            },
+            EngineStorage {
+                characters: characters.clone(),
+                sessions: sessions.clone(),
+                agent_sessions: agent_sessions.clone(),
+                world_books: world_books.clone(),
+                contract_registry: contract_registry.clone(),
+                kaleido_state: kaleido_state.clone(),
+            },
+            EnginePrompt {
+                prompt_inject: prompt_inject.clone(),
+                quick_replies: quick_replies.clone(),
+                runtime_prompt: runtime_prompt.clone(),
+                memory: memory.clone(),
+                skills: skills.clone(),
+            },
+            EngineExt {
+                tool_registry: tool_registry.clone(),
+                user_scripts: user_scripts.clone(),
+                script_authorizations: script_authorizations.clone(),
+                slash: slash.clone(),
+            },
         ));
         let engine_model = engine.model();
         // 批次 4.3b:引擎弱引用注入 ToolDeps(子 agent 工具化经 run_tool_loop 跑
@@ -312,38 +355,43 @@ impl AppState {
         let token_service = Arc::new(Mutex::new(TokenService::new()));
 
         Ok(Arc::new(AppState {
-            config,
-            contract_registry,
-            engine,
-            characters,
-            contract_changelog,
-            kaleido_state,
-            sessions,
-            agent_sessions,
-            world_books,
-            tool_registry,
-            token_service,
-            db,
-            skills,
-            agent_subtasks,
-            model: Arc::new(Mutex::new(engine_model)),
-            settings,
-            settings_update: Arc::new(AsyncMutex::new(())),
-            prompt_inject,
-            audio,
-            quick_replies,
-            user_scripts,
-            memory,
-            undo,
-            // MCP 默认空管理器;AppState::new 是同步函数,进程装配(异步握手)
-            // 由 run_server 在 serve 之前调 start_mcp 完成(批次 6.2)
-            mcp: Arc::new(McpManager::empty()),
-            slash,
-            runtime_prompt,
-            flow,
-            tasks,
-            pending_runs: Arc::new(Mutex::new(HashMap::new())),
-            bootstrap_limiter: Arc::new(Mutex::new(HashMap::new())),
+            core: CoreServices {
+                config,
+                contract_registry,
+                engine,
+                characters,
+                contract_changelog,
+                kaleido_state,
+                sessions,
+                agent_sessions,
+                world_books,
+                tool_registry,
+                token_service,
+                db,
+                skills,
+                agent_subtasks,
+                model: Arc::new(Mutex::new(engine_model)),
+                settings,
+                prompt_inject,
+                audio,
+                quick_replies,
+                user_scripts,
+                script_authorizations,
+                memory,
+                undo,
+                // MCP 默认空管理器;AppState::new 是同步函数,进程装配(异步握手)
+                // 由 run_server 在 serve 之前调 start_mcp 完成(批次 6.2)
+                mcp: Arc::new(McpManager::empty()),
+                slash,
+                runtime_prompt,
+                flow,
+                tasks,
+            },
+            guards: ConcurrencyGuards {
+                settings_update: Arc::new(AsyncMutex::new(())),
+                pending_runs: Arc::new(Mutex::new(HashMap::new())),
+                bootstrap_limiter: Arc::new(Mutex::new(HashMap::new())),
+            },
         }))
     }
 
@@ -412,8 +460,16 @@ impl AppState {
         if !snapshot.mcp_enabled {
             return;
         }
+        // 宿主负责过滤 enabled 并传参:L3 的 mcp 模块不读 L2 的 RuntimeSettings,
+        // 只收 McpServerConfig 列表与 L1 的 &dyn ToolRegistrar(依赖倒置,见 mcp/mod.rs 头部)。
+        let servers: Vec<crate::models::tool_policy::McpServerConfig> = snapshot
+            .mcp_servers
+            .iter()
+            .filter(|s| s.enabled)
+            .cloned()
+            .collect();
         let n_before = self.tool_registry.list_definitions().len();
-        self.mcp.start(&snapshot, &self.tool_registry).await;
+        self.mcp.start(servers, &self.tool_registry).await;
         let servers = self.mcp.server_count();
         if servers > 0 {
             let added = self.tool_registry.list_definitions().len() - n_before;

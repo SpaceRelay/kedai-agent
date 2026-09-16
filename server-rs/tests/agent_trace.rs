@@ -34,7 +34,9 @@ async fn send_json(
     (status, json)
 }
 
-/// 测试库路径:与 build_test_app 同款(%TEMP%/kedai-test-{pid}/kedai.db)
+/// 测试库路径:与 build_test_app 同款(%TEMP%/kedai-test-{pid}/kedai.db)。
+/// build_test_app 的数据目录是**进程级共享**单例(OnceLock + static INIT),
+/// 其生命周期等于测试进程,不能套 RAII 守卫(会删掉后续用例要用的库)。
 fn test_db_path() -> std::path::PathBuf {
     let mut data_dir = std::env::temp_dir();
     data_dir.push(format!("kedai-test-{}", std::process::id()));

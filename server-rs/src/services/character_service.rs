@@ -1,5 +1,5 @@
 // 角色卡服务(与 Node 版 character.service.ts 对齐):上传/CRUD/文件落盘
-use super::log_query_failure;
+use super::{log_query_failure, log_read_pool_failure};
 use crate::models::db::{now_iso, Db};
 use crate::models::types::CharacterRecord;
 use crate::parsing::character_card::{parse_character_card, safe_file_name};
@@ -93,7 +93,10 @@ impl CharacterService {
 
     /// 列表不含 data_raw,按 created_at DESC
     pub fn list(&self) -> Vec<CharacterRecord> {
-        let conn = self.db.read().expect("获取只读连接失败");
+        let conn = match self.db.read() {
+            Ok(c) => c,
+            Err(e) => return log_read_pool_failure("角色列表", e),
+        };
         let mut stmt = match conn
             .prepare("SELECT id, name, chara_name, description, file_path, avatar_path, data_raw, created_at FROM characters ORDER BY created_at DESC")
         {
@@ -313,7 +316,11 @@ impl CharacterService {
         })
     }
 
-    /// 更新 chara_name / description / first_mes / alternate_greetings,同步写回 data_raw,保留其余
+    /// 更新 chara_name / description / first_mes / alternate_greetings,同步写回 data_raw,保留其余。
+    ///
+    /// 读改写收口:`SELECT(列+data_raw) → 内存改 → UPDATE` 全部在**同一写锁事务**内完成。
+    /// 原实现先经只读池 `self.get()` 取快照、再另取写锁回写,两步间不持锁——并发更新同一张卡时,
+    /// 后写者会用旧 data_raw 快照覆盖先写者写入的其它字段(世界书/脚本/契约),即丢更新。
     pub fn update(
         &self,
         id: &str,
@@ -322,64 +329,50 @@ impl CharacterService {
         first_mes: Option<&str>,
         alternate_greetings: Option<&[String]>,
     ) -> Option<CharacterRecord> {
-        let existing = self.get(id)?;
-        let mut data_raw: Value = existing
-            .data_raw
-            .unwrap_or_else(|| Value::Object(Default::default()));
-        if let Some(obj) = data_raw.as_object_mut() {
-            if let Some(n) = chara_name {
-                obj.insert("name".into(), Value::String(n.to_string()));
-            }
-            if let Some(d) = description {
-                obj.insert("description".into(), Value::String(d.to_string()));
-            }
-            if let Some(f) = first_mes {
-                // 空串表示清空开场白
-                obj.insert("first_mes".into(), Value::String(f.to_string()));
-            }
-            if let Some(list) = alternate_greetings {
-                // 空数组表示清空备用开场
-                let arr: Vec<Value> = list
-                    .iter()
-                    .filter(|s| !s.trim().is_empty())
-                    .map(|s| Value::String(s.to_string()))
-                    .collect();
-                if arr.is_empty() {
-                    obj.remove("alternate_greetings");
-                } else {
-                    obj.insert("alternate_greetings".into(), Value::Array(arr));
+        // ===== 事务内:读旧值 → 合并 → 回写(含列更新) =====
+        let (new_first_mes, new_alternate_greetings) = {
+            let mut conn = self.db.write();
+            let tx = conn.transaction().ok()?;
+            let row: Option<(String, String, String)> = tx
+                .query_row(
+                    "SELECT chara_name, description, data_raw FROM characters WHERE id = ?1",
+                    params![id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .optional()
+                .ok()?;
+            let (old_name, old_desc, old_raw) = row?;
+            let mut data_raw: Value = serde_json::from_str(&old_raw)
+                .unwrap_or_else(|_| Value::Object(Default::default()));
+            if let Some(obj) = data_raw.as_object_mut() {
+                if let Some(n) = chara_name {
+                    obj.insert("name".into(), Value::String(n.to_string()));
+                }
+                if let Some(d) = description {
+                    obj.insert("description".into(), Value::String(d.to_string()));
+                }
+                if let Some(f) = first_mes {
+                    // 空串表示清空开场白
+                    obj.insert("first_mes".into(), Value::String(f.to_string()));
+                }
+                if let Some(list) = alternate_greetings {
+                    // 空数组表示清空备用开场
+                    let arr: Vec<Value> = list
+                        .iter()
+                        .filter(|s| !s.trim().is_empty())
+                        .map(|s| Value::String(s.to_string()))
+                        .collect();
+                    if arr.is_empty() {
+                        obj.remove("alternate_greetings");
+                    } else {
+                        obj.insert("alternate_greetings".into(), Value::Array(arr));
+                    }
                 }
             }
-        }
-        let new_name = chara_name.unwrap_or(&existing.chara_name).to_string();
-        let new_desc = description.unwrap_or(&existing.description).to_string();
-        // 返回记录的开场白:有更新则用新值,否则沿用旧的
-        let new_first_mes = match first_mes {
-            Some(f) if !f.is_empty() => Some(f.to_string()),
-            Some(_) => None,
-            None => existing.first_mes.clone(),
-        };
-        // 返回记录的备用开场:有更新则用新值(去空后),否则沿用旧的
-        let new_alternate_greetings = match alternate_greetings {
-            Some(list) => {
-                let v: Vec<String> = list
-                    .iter()
-                    .filter(|s| !s.trim().is_empty())
-                    .cloned()
-                    .collect();
-                if v.is_empty() {
-                    None
-                } else {
-                    Some(v)
-                }
-            }
-            None => existing.alternate_greetings.clone(),
-        };
-        let data_raw_str = serde_json::to_string(&data_raw).unwrap_or_else(|_| "{}".into());
-        // 注意:conn(MutexGuard)必须在再次调用 self.get 之前释放,避免 Mutex 重入死锁
-        {
-            let conn = self.db.write();
-            let n = conn
+            let new_name = chara_name.unwrap_or(&old_name).to_string();
+            let new_desc = description.unwrap_or(&old_desc).to_string();
+            let data_raw_str = serde_json::to_string(&data_raw).unwrap_or_else(|_| "{}".into());
+            let n = tx
                 .execute(
                     "UPDATE characters SET chara_name = ?1, description = ?2, data_raw = ?3 WHERE id = ?4",
                     params![new_name, new_desc, data_raw_str, id],
@@ -388,7 +381,30 @@ impl CharacterService {
             if n == 0 {
                 return None;
             }
-        }
+            tx.commit().ok()?;
+            // 返回记录用的开场白/备用开场:有更新用新值,否则留给下方 self.get 从新 data_raw 提取
+            let fm = match first_mes {
+                Some(f) if !f.is_empty() => Some(f.to_string()),
+                Some(_) => None,
+                None => None,
+            };
+            let ag = match alternate_greetings {
+                Some(list) => {
+                    let v: Vec<String> = list
+                        .iter()
+                        .filter(|s| !s.trim().is_empty())
+                        .cloned()
+                        .collect();
+                    if v.is_empty() {
+                        None
+                    } else {
+                        Some(v)
+                    }
+                }
+                None => None,
+            };
+            (fm, ag)
+        };
         self.get(id).map(|mut c| {
             // get 返回的 first_mes 从新 data_raw 提取,已一致;仅兜底
             if let Some(f) = new_first_mes {
@@ -408,40 +424,33 @@ impl CharacterService {
     /// 写入/移除角色卡内嵌契约(extensions.nlkaleido),其余 data_raw 字段保留。
     /// 契约按调用方给定的 JSON 原样存储(保留作者自定义字段);
     /// 结构校验由调用方(契约 API 的 parse_contract)前置完成,此处只管落库。
+    /// 读改写经 `character_data::update_data_raw` 在同一写锁事务内完成(防丢更新)。
     pub fn set_embedded_contract(&self, id: &str, contract: Option<&Value>) -> Option<()> {
-        let existing = self.get(id)?;
-        let mut data_raw: Value = existing
-            .data_raw
-            .unwrap_or_else(|| Value::Object(Default::default()));
-        let obj = data_raw.as_object_mut()?;
-        match contract {
-            Some(c) => {
-                let ext = obj
-                    .entry("extensions")
-                    .or_insert_with(|| Value::Object(Default::default()));
-                ext.as_object_mut()?.insert("nlkaleido".into(), c.clone());
-            }
-            None => {
-                if let Some(ext) = obj.get_mut("extensions") {
-                    if let Some(ext_obj) = ext.as_object_mut() {
-                        ext_obj.remove("nlkaleido");
+        let changed = crate::services::character_data::update_data_raw(&self.db, id, |data_raw| {
+            let obj = data_raw
+                .as_object_mut()
+                .ok_or_else(|| "角色卡 data_raw 不是对象".to_string())?;
+            match contract {
+                Some(c) => {
+                    let ext = obj
+                        .entry("extensions")
+                        .or_insert_with(|| Value::Object(Default::default()));
+                    ext.as_object_mut()
+                        .ok_or_else(|| "extensions 不是对象".to_string())?
+                        .insert("nlkaleido".into(), c.clone());
+                }
+                None => {
+                    if let Some(ext) = obj.get_mut("extensions") {
+                        if let Some(ext_obj) = ext.as_object_mut() {
+                            ext_obj.remove("nlkaleido");
+                        }
                     }
                 }
             }
-        }
-        let data_raw_str = serde_json::to_string(&data_raw).unwrap_or_else(|_| "{}".into());
-        let conn = self.db.write();
-        let n = conn
-            .execute(
-                "UPDATE characters SET data_raw = ?1 WHERE id = ?2",
-                params![data_raw_str, id],
-            )
-            .ok()?;
-        if n == 0 {
-            None
-        } else {
-            Some(())
-        }
+            Ok(())
+        })
+        .ok()?;
+        changed.then_some(())
     }
 
     /// 删除:删库记录 + 删原文件与头像文件,级联删会话/消息

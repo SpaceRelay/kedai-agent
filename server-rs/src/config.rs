@@ -102,6 +102,34 @@ fn dir_has_user_data(dir: &Path) -> bool {
         || has("SELECT EXISTS(SELECT 1 FROM sessions)")
 }
 
+/// 最小 AppConfig(仅供测试:不读环境变量,避免受本机 .env 与用户数据目录影响)。
+/// 设置加载/保存类测试共用同一份字面量,避免多处复制漂移。
+#[cfg(test)]
+pub(crate) fn test_config() -> AppConfig {
+    AppConfig {
+        host: "127.0.0.1".into(),
+        port: 0,
+        data_dir: std::env::temp_dir(),
+        log_dir: std::env::temp_dir(),
+        web_dist: None,
+        connector: "mock".into(),
+        openai_base_url: "https://example.com/v1".into(),
+        openai_api_key: String::new(),
+        openai_model: "test-model".into(),
+        default_temperature: 0.8,
+        default_top_p: 0.9,
+        default_max_tokens: 1024,
+        default_max_context_tokens: 65_536,
+        log_level: "info".into(),
+        api_token: "test-token".into(),
+        auth_required: false,
+        api_token_injected: true,
+        allow_remote: false,
+        bootstrap_enabled: true,
+        strict_client_header: false,
+    }
+}
+
 impl AppConfig {
     pub fn from_env() -> Self {
         let _ = dotenvy::dotenv(); // 向上搜索 .env(默认从 cwd 开始)
@@ -141,7 +169,7 @@ impl AppConfig {
             .unwrap_or(0.9);
         let max_tokens = env_str("DEFAULT_MAX_TOKENS")
             .and_then(|v| v.parse::<u32>().ok())
-            .filter(|v| (1..=65_536).contains(v))
+            .filter(|v| (1..=131_072).contains(v))
             .unwrap_or(1024);
         let max_context = env_str("DEFAULT_MAX_CONTEXT_TOKENS")
             .and_then(|v| v.parse::<u32>().ok())

@@ -25,13 +25,45 @@ pub struct EvalOptions {
     pub timeout: Duration,
     /// quickjs 内存上限(字节);缺省 64MB
     pub memory_limit: Option<usize>,
+    /// quickjs 调用栈上限(字节);缺省 [`DEFAULT_STACK_LIMIT`]。
+    ///
+    /// **为何显式设置**(2026-09-14 安全加固,见 `docs/遗留.md` L20):
+    /// rquickjs 底层本身有 256KB 默认栈上限,但那是**库的默认值**——它不在本仓库的
+    /// 控制范围内(升级依赖可能改变),而深递归脚本导致栈溢出会崩掉宿主进程。
+    /// 与内存上限同理,把资源边界写进本仓库代码,边界才是可审计、可回归测试的。
+    pub stack_limit: Option<usize>,
 }
+
+/// quickjs 调用栈上限缺省值(字节)。
+///
+/// 取 **512KB**——实测确认的**最大安全值**。**关键结论:该上限不是「越大越安全」,
+/// 而是越大越危险**(2026-09-14 在 Windows 上单档隔离实测,递归深度 30/100/300):
+///
+/// | 栈上限 | 深度 30 | 深度 100 | 深度 300 |
+/// |---|---|---|---|
+/// | **未显式设置** | **崩进程** | **崩进程** | **崩进程** |
+/// | 256KB | JS 异常 | JS 异常 | JS 异常 |
+/// | **512KB(本值)** | **正常 ✓** | **JS 异常 ✓** | **JS 异常 ✓** |
+/// | 1MB 及以上 | 正常 | **崩进程** | **崩进程** |
+///
+/// 三点结论:
+/// 1. **未显式设置 = 无上限 = 真实漏洞**:rquickjs 不会自动施加安全默认值,
+///    深递归会以 `STATUS_STACK_OVERFLOW` 直接杀进程(实测如此),这就是本次加固的对象;
+/// 2. **512KB 是安全与可用的平衡点**:支撑约 30 层递归(够角色卡脚本用),
+///    同时保证更深递归以可捕获的 JS 异常返回;
+/// 3. **放大到 1MB+ 反而更危险**:QuickJS 以原生栈指针为基线记账,上限越大允许的
+///    JS 帧越多,原生栈越可能在检查触发前先溢出——那时进程已被杀,没有 JS 异常可捕。
+///
+/// (rquickjs 硬限 16MiB:超过被视为「禁用检查」,见其 `raw.rs` 注释——更不能碰。)
+/// **教训**:资源上限的正确取值靠实测确定边界,不能凭「留宽裕些更好」的直觉放大。
+pub const DEFAULT_STACK_LIMIT: usize = 512 * 1024;
 
 impl Default for EvalOptions {
     fn default() -> Self {
         EvalOptions {
             timeout: Duration::from_secs(1),
             memory_limit: Some(64 * 1024 * 1024),
+            stack_limit: Some(DEFAULT_STACK_LIMIT),
         }
     }
 }
@@ -53,6 +85,11 @@ pub fn eval_js(source: &str, opts: &EvalOptions) -> EvalOutcome {
     if let Some(limit) = opts.memory_limit {
         // 内存上限:超限执行抛 JS 异常
         rt.set_memory_limit(limit);
+    }
+    if let Some(limit) = opts.stack_limit {
+        // 栈上限(2026-09-14 加固):深递归脚本以 JS 异常中止,而非溢出崩宿主。
+        // 超过 16MiB 会被 rquickjs 当作「禁用检查」,故本仓库取值远低于该硬限。
+        rt.set_max_stack_size(limit);
     }
     let st = state.clone();
     rt.set_interrupt_handler(Some(Box::new(move || {
@@ -93,6 +130,10 @@ pub fn eval_with_bridge(
     if let Some(limit) = opts.memory_limit {
         rt.set_memory_limit(limit);
     }
+    if let Some(limit) = opts.stack_limit {
+        // 栈上限:与 eval_js 同口径(见 EvalOptions::stack_limit 说明)。
+        rt.set_max_stack_size(limit);
+    }
     let st = state.clone();
     rt.set_interrupt_handler(Some(Box::new(move || {
         if st.interrupted.load(Ordering::SeqCst) {
@@ -117,8 +158,10 @@ pub fn eval_with_bridge(
         let write_fn = Function::new(
             ctx.clone(),
             move |scope: String, json: String| -> Result<(), rquickjs::Error> {
+                // 保留原错误消息:此前丢弃后脚本侧只看到 "Unknown",变量写回失败
+                // (作用域名非法/JSON 非法)完全无从定位
                 b.write_scope(&scope, &json)
-                    .map_err(|_| rquickjs::Error::Unknown)
+                    .map_err(|e| rquickjs::Error::new_from_js_message("Rust", "JavaScript", e))
             },
         );
         // slash 闭包:脚本调 TavernHelper.triggerSlash → Rust 处理
@@ -133,8 +176,9 @@ pub fn eval_with_bridge(
         let generate_fn = Function::new(
             ctx.clone(),
             move |config_json: String| -> Result<String, rquickjs::Error> {
+                // 保留原错误消息(生成失败原因),不再退化为 "Unknown"
                 b.generate_from_config(&config_json)
-                    .map_err(|_| rquickjs::Error::Unknown)
+                    .map_err(|e| rquickjs::Error::new_from_js_message("Rust", "JavaScript", e))
             },
         );
         // 导入闭包(阶段六 6g-2):脚本调 TavernHelper.importRaw* → Rust 各 service。
@@ -146,8 +190,9 @@ pub fn eval_with_bridge(
                   content: String,
                   session_id: String|
                   -> Result<String, rquickjs::Error> {
+                // 保留原错误消息(导入失败原因),不再退化为 "Unknown"
                 b.import_raw(&kind, &filename, &content, &session_id)
-                    .map_err(|_| rquickjs::Error::Unknown)
+                    .map_err(|e| rquickjs::Error::new_from_js_message("Rust", "JavaScript", e))
             },
         );
         let globals = ctx.globals();
@@ -261,9 +306,68 @@ mod tests {
             &EvalOptions {
                 timeout: Duration::from_millis(200),
                 memory_limit: None,
+                stack_limit: None,
             },
         );
         let interrupted = matches!(&outcome, EvalOutcome::Error(msg) if msg.contains("interrupt") || msg.contains("超时"));
         assert!(interrupted, "死循环应被超时中断,实际 {outcome:?}");
+    }
+
+    /// 栈上限(2026-09-14 加固,known-limitations L20):
+    /// 深递归必须以 **JS 异常**中止,而不是溢出崩掉宿主进程。
+    ///
+    /// 这是「不可信输入不崩宿主」的最小断言——脚本来自角色卡,属不可信输入。
+    /// 若此测试变成进程崩溃(而非返回 Error),说明栈上限失效。
+    #[test]
+    fn deep_recursion_errors_instead_of_crashing_host() {
+        let outcome = eval_js(
+            "function f(n){ return f(n+1); } f(0);",
+            &EvalOptions::default(),
+        );
+        assert!(
+            matches!(outcome, EvalOutcome::Error(_)),
+            "深递归应返回 Error(而非崩进程),实际 {outcome:?}"
+        );
+    }
+
+    /// 默认栈上限下,常规深度的递归应能正常完成(防上限过紧伤正常脚本)。
+    ///
+    /// 实测边界(见 `DEFAULT_STACK_LIMIT` 文档表):256KB 支撑约 30 层递归,
+    /// 足以覆盖角色卡脚本的实际用法(小规模状态操作,极少 >20 层)。
+    #[test]
+    fn default_stack_limit_allows_normal_recursion() {
+        let outcome = eval_js(
+            "function f(n){ return n<=0 ? 0 : 1+f(n-1); } f(20);",
+            &EvalOptions::default(),
+        );
+        assert!(
+            matches!(outcome, EvalOutcome::Ok(_)),
+            "20 层递归应在上限内完成,实际 {outcome:?}"
+        );
+    }
+
+    /// 显式设置栈上限必须**真正生效**:显式 256KB 与「不设置」都可拦住深递归。
+    ///
+    /// 本测试锁定「显式设置这条路径被走到」——若将来有人删掉 `set_max_stack_size`
+    /// 调用,`stack_limit: Some(..)` 将不再产生效果;而**不设置时的行为实测不可靠**
+    /// (见 `DEFAULT_STACK_LIMIT` 文档表:未显式设置会崩进程),故此处只断言
+    /// 「显式设置能稳定得到 JS 异常」,并以此确立「必须显式设置」的产品约束。
+    ///
+    /// **注意**:本测试刻意不构造 1MB 以上的上限——那会崩掉测试进程(原生栈溢出),
+    /// 属实测确认的危险区,不宜写进回归测试。
+    #[test]
+    fn explicit_stack_limit_catches_deep_recursion() {
+        let outcome = eval_js(
+            "function f(n){ return f(n+1); } f(0);",
+            &EvalOptions {
+                timeout: Duration::from_secs(2),
+                memory_limit: None,
+                stack_limit: Some(DEFAULT_STACK_LIMIT),
+            },
+        );
+        assert!(
+            matches!(outcome, EvalOutcome::Error(_)),
+            "无限递归在显式 256KB 上限下应返回 Error,实际 {outcome:?}"
+        );
     }
 }

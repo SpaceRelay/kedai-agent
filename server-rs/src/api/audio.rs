@@ -1,9 +1,8 @@
 // 音频路由:/api/audio(读取全量)/ PUT settings / PUT playlist
 use crate::api::app_state::AppState;
-use crate::api::WithStatus;
+use crate::api::{internal, validation};
 use crate::services::audio_service::{AudioChannel, AudioTrack, ChannelSettingsPatch};
 use axum::extract::State;
-use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::Deserialize;
@@ -29,9 +28,7 @@ pub async fn update_settings(
     Json(body): Json<SettingsBody>,
 ) -> Response {
     let Some(channel) = AudioChannel::parse(&body.r#type) else {
-        return Json(json!({ "error": "无效的音频通道" }))
-            .into_response()
-            .with_status(StatusCode::BAD_REQUEST);
+        return validation("无效的音频通道");
     };
     // B-1:update_settings 内含同步 JSON 落盘,持锁 + 写文件整体挪阻塞线程池
     let audio = state.audio.clone();
@@ -44,12 +41,8 @@ pub async fn update_settings(
         .await;
     match result {
         Ok(Ok(state)) => Json(json!({ "ok": true, "audio": state })).into_response(),
-        Ok(Err(e)) => Json(json!({ "error": e }))
-            .into_response()
-            .with_status(StatusCode::BAD_REQUEST),
-        Err(e) => Json(json!({ "error": e }))
-            .into_response()
-            .with_status(StatusCode::INTERNAL_SERVER_ERROR),
+        Ok(Err(e)) => validation(e),
+        Err(e) => internal(e),
     }
 }
 
@@ -66,9 +59,7 @@ pub async fn update_playlist(
     Json(body): Json<PlaylistBody>,
 ) -> Response {
     let Some(channel) = AudioChannel::parse(&body.r#type) else {
-        return Json(json!({ "error": "无效的音频通道" }))
-            .into_response()
-            .with_status(StatusCode::BAD_REQUEST);
+        return validation("无效的音频通道");
     };
     // B-1:update_playlist 内含同步 JSON 落盘,持锁 + 写文件整体挪阻塞线程池
     let audio = state.audio.clone();
@@ -81,11 +72,7 @@ pub async fn update_playlist(
         .await;
     match result {
         Ok(Ok(state)) => Json(json!({ "ok": true, "audio": state })).into_response(),
-        Ok(Err(e)) => Json(json!({ "error": e }))
-            .into_response()
-            .with_status(StatusCode::BAD_REQUEST),
-        Err(e) => Json(json!({ "error": e }))
-            .into_response()
-            .with_status(StatusCode::INTERNAL_SERVER_ERROR),
+        Ok(Err(e)) => validation(e),
+        Err(e) => internal(e),
     }
 }

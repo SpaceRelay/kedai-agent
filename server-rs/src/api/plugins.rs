@@ -1,6 +1,10 @@
 // 插件 API:/api/plugins/tools(列出已加载工具插件 + 热重载 + 导入)
+//
+// 代际位置:本层是**组合根的一部分**(L2 · 暴露面)。插件解析在 L3(`plugins/`),
+// 但**注册是装配动作**,按三结合纪律由宿主(本层)执行——L3 不得依赖 L2 的工具注册表。
+// 故下方统一走「解析(L3) → 宿主注册(L2)」两段式:`parse_all`/`parse_file` + `register_plugin`。
 use crate::api::app_state::AppState;
-use crate::api::WithStatus;
+use crate::api::{err_status, internal, validation, ErrorCode, WithStatus};
 use crate::plugins::ToolPluginLoader;
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -8,6 +12,41 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde_json::json;
 use std::sync::Arc;
+
+/// 把一批已解析插件注册进工具表（宿主侧装配动作）。
+///
+/// **命名冲突防护（已知限制 L19）**：注册前校验是否与内置工具重名——插件不得**劫持**
+/// 内置工具（`bash`/`write` 等）。冲突时跳过并计入 errors，**不覆盖**。
+/// 这是「注册表即隔离边界」的不变量：注册动作必须先证明「不抢占已有名字」。
+///
+/// `pub(crate)`：`api::app_state` 的启动装配复用同一入口，保证
+/// 「启动加载」与「热重载」走完全一致的冲突校验口径。
+pub(crate) fn register_plugins(
+    loaded: Vec<crate::plugins::LoadedToolPlugin>,
+    registry: &crate::tools::registry::ToolRegistry,
+) -> (usize, Vec<String>) {
+    let mut count = 0;
+    let mut errors = Vec::new();
+    for plugin in loaded {
+        let name = plugin.definition.name.clone();
+        // 内置名与已注册名都不可被插件覆盖:前者会劫持内置工具执行体,
+        // 后者会让「插件 A 静默替换插件 B」成为可能,两者都属越权。
+        if registry.is_builtin(&name) {
+            errors.push(format!(
+                "{name}: 与内置工具重名，已拒绝注册（插件不得劫持内置工具）"
+            ));
+            continue;
+        }
+        registry.register_external(
+            plugin.definition,
+            crate::plugins::plugin_executor(&plugin.script),
+            None,
+            crate::models::tool_policy::ToolOrigin::Plugin,
+        );
+        count += 1;
+    }
+    (count, errors)
+}
 
 /// GET /api/plugins/tools:列出已注册工具 + 磁盘插件文件 + 加载错误
 pub async fn list_tools(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
@@ -27,19 +66,39 @@ pub async fn list_tools(State(state): State<Arc<AppState>>) -> Json<serde_json::
 pub async fn reload_tools(State(state): State<Arc<AppState>>) -> Response {
     let dir = state.config.data_dir.join("plugins").join("tools");
     let registry = state.tool_registry.clone();
-    // load_all 是同步目录遍历 + 逐文件解析注册,挪阻塞线程池(B-1)
-    let (count, errors) =
-        tokio::task::spawn_blocking(move || ToolPluginLoader::new(dir).load_all(&registry))
+    // parse_all 是同步目录遍历 + 逐文件解析,挪阻塞线程池(B-1);
+    // 注册在 spawn_blocking 之外由本层执行(注册表是同步锁操作,无需阻塞池)。
+    let (loaded, mut errors) =
+        tokio::task::spawn_blocking(move || ToolPluginLoader::new(dir).parse_all())
             .await
-            .unwrap_or_else(|e| (0, vec![format!("插件重载任务失败: {e}")]));
+            .unwrap_or_else(|e| {
+                // 泄露封堵(批次 1):JoinError 原文(线程池内部细节)只进日志,
+                // 面向用户的错误项换成固定文案。
+                tracing::error!(error = %e, "插件重载任务失败");
+                (
+                    Vec::new(),
+                    vec!["插件重载任务失败,详情见服务端日志".to_string()],
+                )
+            });
+    let (count, reg_errors) = register_plugins(loaded, &registry);
+    errors.extend(reg_errors);
     if errors.is_empty() {
         Json(json!({ "ok": true, "loaded": count }))
             .into_response()
             .with_status(StatusCode::OK)
     } else {
-        Json(json!({ "ok": false, "loaded": count, "errors": errors }))
-            .into_response()
-            .with_status(StatusCode::BAD_REQUEST)
+        // 形状(批次 1):`loaded`(已注册数)与 `errors`(逐项失败原因)是**业务数据**,
+        // 必须保留;仅补 `code` 供前端统一分支。errors 原文由解析器产生(面向插件的
+        // 文件名/语法错误,不含密钥/路径绝对化),属用户排障必需信息,保留透出。
+        Json(json!({
+            "ok": false,
+            "code": ErrorCode::Validation.as_str(),
+            "error": "部分插件加载失败",
+            "loaded": count,
+            "errors": errors,
+        }))
+        .into_response()
+        .with_status(StatusCode::BAD_REQUEST)
     }
 }
 
@@ -71,15 +130,15 @@ pub async fn upload_tool(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
     let Some(boundary) = crate::api::characters::parse_boundary(content_type) else {
-        return err_json("缺少文件字段(file)", StatusCode::BAD_REQUEST);
+        return err_status("缺少文件字段(file)", StatusCode::BAD_REQUEST);
     };
     let parts = crate::api::characters::parse_multipart(&body, &boundary);
     let Some(file) = parts.into_iter().find(|p| p.filename.is_some()) else {
-        return err_json("缺少文件字段(file)", StatusCode::BAD_REQUEST);
+        return err_status("缺少文件字段(file)", StatusCode::BAD_REQUEST);
     };
     let file_name = file.filename.unwrap_or_else(|| "plugin.json".to_string());
     if !file_name.to_lowercase().ends_with(".json") {
-        return err_json("插件文件须为 .json 格式", StatusCode::BAD_REQUEST);
+        return err_status("插件文件须为 .json 格式", StatusCode::BAD_REQUEST);
     }
     let file_bytes = file.content;
     // 校验 JSON 结构(至少含 name / script)
@@ -87,39 +146,45 @@ pub async fn upload_tool(
     match cfg {
         Ok(c) => {
             if c.name.trim().is_empty() || c.script.trim().is_empty() {
-                return err_json("插件须包含 name 与 script 字段", StatusCode::BAD_REQUEST);
+                return err_status("插件须包含 name 与 script 字段", StatusCode::BAD_REQUEST);
             }
             // 文件名净化(与删除入口统一策略):净化结果不等于原始名 → 拒绝
             let Some(safe) = sanitize_plugin_filename(&file_name) else {
-                return err_json("文件名含非法字符", StatusCode::BAD_REQUEST);
+                return err_status("文件名含非法字符", StatusCode::BAD_REQUEST);
             };
             let dir = state.config.data_dir.join("plugins").join("tools");
             // B-1:文件 IO 走 tokio::fs / 阻塞线程池,不在 tokio worker 上同步读写
             tokio::fs::create_dir_all(&dir).await.ok();
             let path = dir.join(&safe);
             if let Err(e) = tokio::fs::write(&path, &file_bytes).await {
-                return err_json(
-                    &format!("写文件失败: {e}"),
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                );
+                // 500:入参含 io 错误原文(可能带盘符路径),按泄露策略只进日志
+                return internal(format!("写文件失败: {e}"));
             }
-            // 注册该插件(load_file 同步读文件,挪阻塞线程池)
+            // 解析该插件(parse_file 同步读文件,挪阻塞线程池),注册由本层执行
             let registry = state.tool_registry.clone();
             let load_path = path.clone();
-            let load_result = tokio::task::spawn_blocking(move || {
-                ToolPluginLoader::new(dir).load_file(&load_path, &registry)
+            let parse_result = tokio::task::spawn_blocking(move || {
+                ToolPluginLoader::new(dir).parse_file(&load_path)
             })
             .await
             .map_err(|e| e.to_string())
             .and_then(|r| r);
-            if let Err(e) = load_result {
-                return err_json(&format!("插件注册失败: {e}"), StatusCode::BAD_REQUEST);
+            match parse_result {
+                Ok(plugin) => {
+                    let (_, reg_errors) = register_plugins(vec![plugin], &registry);
+                    if let Some(e) = reg_errors.first() {
+                        return validation(format!("插件注册失败: {e}"));
+                    }
+                }
+                Err(e) => {
+                    return validation(format!("插件注册失败: {e}"));
+                }
             }
             Json(json!({ "ok": true, "name": c.name, "file": safe }))
                 .into_response()
                 .with_status(StatusCode::CREATED)
         }
-        Err(e) => err_json(&format!("插件 JSON 解析失败: {e}"), StatusCode::BAD_REQUEST),
+        Err(e) => validation(format!("插件 JSON 解析失败: {e}")),
     }
 }
 
@@ -130,10 +195,10 @@ pub async fn delete_tool(
 ) -> Response {
     // 文件名净化(与上传入口统一策略):净化结果不等于原始名 → 拒绝
     let Some(safe) = sanitize_plugin_filename(&name) else {
-        return err_json("非法文件名", StatusCode::BAD_REQUEST);
+        return err_status("非法文件名", StatusCode::BAD_REQUEST);
     };
     if !safe.to_lowercase().ends_with(".json") {
-        return err_json("非法文件名", StatusCode::BAD_REQUEST);
+        return err_status("非法文件名", StatusCode::BAD_REQUEST);
     }
     let dir = state.config.data_dir.join("plugins").join("tools");
     let path = dir.join(&safe);
@@ -147,20 +212,13 @@ pub async fn delete_tool(
         }
         let _ = tokio::fs::remove_file(&path).await;
     }
-    // 重载剩余插件文件(与 reload 语义一致)
+    // 重载剩余插件文件(与 reload 语义一致):解析在阻塞池,注册在本层
     let registry = state.tool_registry.clone();
-    let (count, _) =
-        tokio::task::spawn_blocking(move || ToolPluginLoader::new(dir).load_all(&registry))
-            .await
-            .unwrap_or_default();
+    let (loaded, _) = tokio::task::spawn_blocking(move || ToolPluginLoader::new(dir).parse_all())
+        .await
+        .unwrap_or_default();
+    let (count, _) = register_plugins(loaded, &registry);
     Json(json!({ "ok": true, "removed": name, "reloaded": count })).into_response()
-}
-
-/// 运行时错误响应(复用 WithStatus)
-fn err_json(msg: &str, code: StatusCode) -> Response {
-    Json(json!({ "error": msg }))
-        .into_response()
-        .with_status(code)
 }
 
 #[cfg(test)]

@@ -27,8 +27,6 @@ use super::agent_tools_agent::{
 };
 use super::agent_tools_read::register_read;
 use super::agent_tools_search::register_search;
-#[cfg(test)]
-use super::agent_tools_shared::random_u64;
 use super::agent_tools_shared::register_role;
 use super::agent_tools_write::{register_create, register_replace, register_write};
 
@@ -59,6 +57,8 @@ pub struct ToolDeps {
     /// 故用 OnceLock + Weak 由 app_state 在引擎构造后注入,防循环引用;
     /// 未注入(单测等)时子任务回退纯生成路径。
     pub engine: std::sync::OnceLock<std::sync::Weak<crate::agents::engine::AgentEngine>>,
+    /// SQLite 句柄:bash 工具的审计落库(exec_audit)用。与 AppState 同源同一 Arc。
+    pub db: Arc<crate::models::db::Db>,
     /// 任务服务(批次 4.3b:task: 前缀虚拟 session 的子 agent 进度经任务事件桥
     /// 发 agent_status,并落 task_llm_calls/task_usage;Weak 防循环,缺省 = 非任务模式)
     pub tasks: std::sync::OnceLock<std::sync::Weak<crate::services::task_service::TaskService>>,
@@ -75,23 +75,20 @@ impl ToolDeps {
             .clone()
     }
 
-    /// 测试用空依赖(临时目录 + mock 连接器)
+    /// 测试用空依赖(临时目录 + mock 连接器)。
+    /// 返回 (守卫, 依赖):守卫不能存进 ToolDeps(其 data_dir 是 PathBuf),
+    /// 由调用方持有并须活到 deps 之后(解构绑定按逆序析构,守卫在前即最后析构)
     #[cfg(test)]
-    fn dummy_for_test() -> Self {
-        let dir = std::env::temp_dir().join(format!(
-            "kedai-tool-test-{}-{}",
-            std::process::id(),
-            random_u64()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        let _ = std::fs::create_dir_all(&dir);
+    fn dummy_for_test() -> (crate::utils::test_support::TempDataDir, Self) {
+        let dir = crate::utils::test_support::TempDataDir::new("tool-test");
         let db = Arc::new(crate::models::db::Db::open(&dir.join("t.db"), &dir).unwrap());
-        ToolDeps {
+        let deps = ToolDeps {
             sessions: Arc::new(SessionService::new(db.clone())),
-            characters: Arc::new(CharacterService::new(db.clone(), dir.clone())),
+            characters: Arc::new(CharacterService::new(db.clone(), dir.path().to_path_buf())),
             world_books: Arc::new(WorldBookService::new(db.clone())),
             agent_sessions: Arc::new(AgentSessionService::new(db.clone())),
             subtasks: Arc::new(AgentSubtaskService::new(db.clone())),
+            db: db.clone(),
             skills: Arc::new(SkillService::new(db.clone())),
             settings: Arc::new(Mutex::new(RuntimeSettings::from_config(
                 &crate::config::AppConfig::from_env(),
@@ -99,12 +96,13 @@ impl ToolDeps {
             connector: Arc::new(RwLock::new(Connector::Mock(
                 crate::connectors::mock::MockConnector::new(),
             ))),
-            data_dir: dir,
+            data_dir: dir.path().to_path_buf(),
             memory: Arc::new(crate::services::memory_service::MemoryService::new(db)),
             // 测试缺省不注入引擎/任务服务:子任务走纯生成回退路径
             engine: std::sync::OnceLock::new(),
             tasks: std::sync::OnceLock::new(),
-        }
+        };
+        (dir, deps)
     }
 }
 
@@ -223,7 +221,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_role_tool() {
-        let deps = Arc::new(ToolDeps::dummy_for_test());
+        let (_dir, deps) = ToolDeps::dummy_for_test();
+        let deps = Arc::new(deps);
         let reg = ToolRegistry::new();
         register_role(&reg, deps);
         let out = reg
@@ -269,7 +268,8 @@ mod tests {
     /// write 文件 / create 目录与文件 / read 读回 / 重复创建报错 / 目录穿越被拒
     #[tokio::test]
     async fn test_write_create_read_files() {
-        let deps = Arc::new(ToolDeps::dummy_for_test());
+        let (_dir, deps) = ToolDeps::dummy_for_test();
+        let deps = Arc::new(deps);
         let reg = ToolRegistry::new();
         register_write(&reg, deps.clone());
         register_read(&reg, deps.clone());
@@ -359,7 +359,8 @@ mod tests {
     /// write 气泡 → replace 同步多次操作(append/prepend/replace/delete)
     #[tokio::test]
     async fn test_write_and_replace_bubble() {
-        let deps = Arc::new(ToolDeps::dummy_for_test());
+        let (_dir, deps) = ToolDeps::dummy_for_test();
+        let deps = Arc::new(deps);
         let reg = ToolRegistry::new();
         register_write(&reg, deps.clone());
         register_replace(&reg, deps.clone());
@@ -448,7 +449,8 @@ mod tests {
     /// replace 文件多次操作 + 最终内容验证
     #[tokio::test]
     async fn test_replace_file_ops() {
-        let deps = Arc::new(ToolDeps::dummy_for_test());
+        let (_dir, deps) = ToolDeps::dummy_for_test();
+        let deps = Arc::new(deps);
         let reg = ToolRegistry::new();
         register_write(&reg, deps.clone());
         register_replace(&reg, deps.clone());
@@ -534,7 +536,8 @@ mod tests {
     /// 删除不存在的文件报错而非静默成功;bubble 不支持 remove。
     #[tokio::test]
     async fn test_replace_remove_file_ops() {
-        let deps = Arc::new(ToolDeps::dummy_for_test());
+        let (_dir, deps) = ToolDeps::dummy_for_test();
+        let deps = Arc::new(deps);
         let reg = ToolRegistry::new();
         register_write(&reg, deps.clone());
         register_replace(&reg, deps.clone());
@@ -627,7 +630,8 @@ mod tests {
     /// 深度守卫:agent_depth 达到上限时拒绝派发,提示主智能体直接处理
     #[tokio::test]
     async fn agentgo_rejects_when_depth_exceeds_limit() {
-        let deps = Arc::new(ToolDeps::dummy_for_test());
+        let (_dir, deps) = ToolDeps::dummy_for_test();
+        let deps = Arc::new(deps);
         // 默认 subagent_max_depth = 2;模拟深度 2 的嵌套上下文
         {
             let mut s = deps.settings.lock().unwrap_or_else(|e| e.into_inner());
@@ -680,7 +684,8 @@ mod tests {
     /// 并发守卫:会话内 running 子任务数加本次派发超过上限时拒绝,不创建新任务
     #[tokio::test]
     async fn agentgo_rejects_when_concurrency_exhausted() {
-        let deps = Arc::new(ToolDeps::dummy_for_test());
+        let (_dir, deps) = ToolDeps::dummy_for_test();
+        let deps = Arc::new(deps);
         {
             let mut s = deps.settings.lock().unwrap_or_else(|e| e.into_inner());
             s.subagent_max_concurrency = 2;
@@ -725,7 +730,8 @@ mod tests {
     #[tokio::test]
     async fn subtask_result_truncates_with_marker() {
         use crate::tools::agent_tools_agent::truncate_subtask_result_for_test;
-        let deps = Arc::new(ToolDeps::dummy_for_test());
+        let (_dir, deps) = ToolDeps::dummy_for_test();
+        let deps = Arc::new(deps);
         {
             let mut s = deps.settings.lock().unwrap_or_else(|e| e.into_inner());
             s.subagent_result_max_chars = 10;
@@ -776,7 +782,8 @@ mod tests {
     /// 审计 A1/A2:混合批(1 合法 + 1 空 instruction)→ Ok,合法项被创建,非法项进 rejected
     #[tokio::test]
     async fn agentgo_mixed_batch_dispatches_valid_and_rejects_invalid() {
-        let deps = Arc::new(ToolDeps::dummy_for_test());
+        let (_dir, deps) = ToolDeps::dummy_for_test();
+        let deps = Arc::new(deps);
         let reg = ToolRegistry::new();
         register_agentgo(&reg, deps.clone());
         let ctx = mk_authorized_session(&deps, &reg, &["agentgo"]);
@@ -812,7 +819,8 @@ mod tests {
     /// 审计 A2:纯空白 instruction(" ")按 trim 语义被拒,不再当合法任务
     #[tokio::test]
     async fn agentgo_blank_whitespace_instruction_is_rejected() {
-        let deps = Arc::new(ToolDeps::dummy_for_test());
+        let (_dir, deps) = ToolDeps::dummy_for_test();
+        let deps = Arc::new(deps);
         let reg = ToolRegistry::new();
         register_agentgo(&reg, deps.clone());
         let ctx = mk_authorized_session(&deps, &reg, &["agentgo"]);
@@ -836,7 +844,8 @@ mod tests {
     /// 审计 A:全废批 → Err,错误文案含逐项原因(便于模型自纠)
     #[tokio::test]
     async fn agentgo_all_invalid_returns_error_with_per_item_reasons() {
-        let deps = Arc::new(ToolDeps::dummy_for_test());
+        let (_dir, deps) = ToolDeps::dummy_for_test();
+        let deps = Arc::new(deps);
         let reg = ToolRegistry::new();
         register_agentgo(&reg, deps.clone());
         let ctx = mk_authorized_session(&deps, &reg, &["agentgo"]);
@@ -865,7 +874,8 @@ mod tests {
     /// 审计 C:read(type=subtask) 三键命中(id / 精确 name / 子串)+ 无命中和多命中语义
     #[tokio::test]
     async fn read_subtask_matches_by_id_name_and_substring() {
-        let deps = Arc::new(ToolDeps::dummy_for_test());
+        let (_dir, deps) = ToolDeps::dummy_for_test();
+        let deps = Arc::new(deps);
         deps.characters.seed_default_character();
         let session = deps
             .sessions
@@ -888,6 +898,7 @@ mod tests {
             agent_depth: 0,
         };
 
+        // 结果项统一结构化:命中 ok=true + content;未命中 ok=false + error + candidates
         let call = |name: String| {
             let reg = &reg;
             let ctx = ctx.clone();
@@ -895,52 +906,220 @@ mod tests {
                 let args = serde_json::json!({ "queries": [{ "type": "subtask", "name": name }] });
                 let raw = reg.execute("read", &args.to_string(), ctx).await.unwrap();
                 let v: Value = serde_json::from_str(&raw).unwrap();
-                v["results"][0]["content"].as_str().unwrap().to_string()
+                v["results"][0].clone()
             }
         };
 
         // 1) 按 id:matched_by=id,且同时含 id 与 name(双向别名)
         let by_id = call(a.id.clone()).await;
-        let v: Value = serde_json::from_str(&by_id).expect("按 id 命中应返回 JSON");
-        assert_eq!(v["matched_by"], "id");
-        assert_eq!(v["id"].as_str(), Some(a.id.as_str()));
-        assert_eq!(v["name"], "alpha-task");
+        assert_eq!(by_id["ok"], true, "命中应为 ok=true: {by_id}");
+        let hit: Value =
+            serde_json::from_str(by_id["content"].as_str().expect("命中应有 content")).unwrap();
+        assert_eq!(hit["matched_by"], "id");
+        assert_eq!(hit["id"].as_str(), Some(a.id.as_str()));
+        assert_eq!(hit["name"], "alpha-task");
+        // 批次 4:命中体带 finished_at(尚未进终态 → 空串),调用方据它判完成时刻
+        assert_eq!(
+            hit["finished_at"], "",
+            "pending 子任务 finished_at 应为空串: {hit}"
+        );
 
         // 2) 按精确 name:matched_by=name
         let by_name = call("beta-task".into()).await;
-        let v: Value = serde_json::from_str(&by_name).unwrap();
-        assert_eq!(v["matched_by"], "name");
-        assert_eq!(v["id"].as_str(), Some(b.id.as_str()));
+        let hit: Value = serde_json::from_str(by_name["content"].as_str().unwrap()).unwrap();
+        assert_eq!(hit["matched_by"], "name");
+        assert_eq!(hit["id"].as_str(), Some(b.id.as_str()));
 
         // 3) 按子串(大小写不敏感):matched_by=name_like
         let by_like = call("ALPHA".into()).await;
-        let v: Value = serde_json::from_str(&by_like).unwrap();
-        assert_eq!(v["matched_by"], "name_like");
-        assert_eq!(v["id"].as_str(), Some(a.id.as_str()));
+        let hit: Value = serde_json::from_str(by_like["content"].as_str().unwrap()).unwrap();
+        assert_eq!(hit["matched_by"], "name_like");
+        assert_eq!(hit["id"].as_str(), Some(a.id.as_str()));
 
-        // 4) 无命中:报错列出可用候选 id 与 name
+        // 4) 无命中:结构化失败 + 候选清单(不再是与正常结果同构的 content 字符串)
         let miss = call("不存在的东西".into()).await;
-        assert!(miss.contains("未命中"), "应报无命中: {miss}");
+        assert_eq!(miss["ok"], false, "未命中应为 ok=false: {miss}");
         assert!(
-            miss.contains(&a.id) && miss.contains("beta-task"),
-            "应列候选: {miss}"
+            miss["error"].as_str().unwrap().contains("未命中"),
+            "应报无命中: {miss}"
+        );
+        let cands = miss["candidates"].as_array().expect("未命中应带候选");
+        assert!(
+            cands.iter().any(|c| c["id"] == a.id.as_str())
+                && cands.iter().any(|c| c["name"] == "beta-task"),
+            "候选应含两条子任务: {miss}"
         );
 
-        // 5) 多命中:返回候选清单,不随便挑一条
+        // 5) 多命中:同样结构化失败 + 候选,不随便挑一条
         let many = call("task".into()).await;
-        let v: Value = serde_json::from_str(&many).expect("多命中应返回候选清单");
-        assert_eq!(v["matched_by"], "ambiguous");
-        assert_eq!(
-            v["candidates"].as_array().unwrap().len(),
-            2,
-            "应列 2 条候选: {v}"
+        assert_eq!(many["ok"], false, "多命中应为 ok=false: {many}");
+        assert!(
+            many["error"].as_str().unwrap().contains("2 条"),
+            "应说明匹配到几条: {many}"
         );
+        assert_eq!(
+            many["candidates"].as_array().unwrap().len(),
+            2,
+            "应列 2 条候选: {many}"
+        );
+    }
+
+    /// 审计 #5(2026-09-15):候选清单默认排除 ended 并截断 top-3,
+    /// 避免长会话里每次误查都倾泻全量候选(实测一次回带 15 条)。
+    #[tokio::test]
+    async fn read_subtask_candidates_exclude_ended_and_cap_at_three() {
+        let (_dir, deps) = ToolDeps::dummy_for_test();
+        let deps = Arc::new(deps);
+        deps.characters.seed_default_character();
+        let session = deps
+            .sessions
+            .create(crate::services::character_service::BUILTIN_SYSTEM_ID, None)
+            .unwrap();
+        let sid = session.id.as_str();
+        // 5 条活跃 + 1 条已 ended,全部命中子串 "probe"
+        let mut active_ids = Vec::new();
+        for i in 0..5 {
+            let r = deps
+                .subtasks
+                .create(sid, "c", &format!("probe_{i}"), "指令")
+                .unwrap();
+            deps.subtasks.set_running(&r.id);
+            deps.subtasks.set_done(&r.id, "成果");
+            active_ids.push(r.id);
+        }
+        let ended = deps
+            .subtasks
+            .create(sid, "c", "probe_ended", "指令")
+            .unwrap();
+        deps.subtasks.end(&ended.id);
+
+        let reg = ToolRegistry::new();
+        register_read(&reg, deps.clone());
+        let ctx = ToolContext {
+            session_id: session.id.clone(),
+            character_id: "c".into(),
+            agent_depth: 0,
+        };
+        let args = serde_json::json!({
+            "queries": [{ "type": "subtask", "name": "probe" }]
+        });
+        let raw = reg.execute("read", &args.to_string(), ctx).await.unwrap();
+        let v: Value = serde_json::from_str(&raw).unwrap();
+        let item = &v["results"][0];
+        assert_eq!(item["ok"], false, "6 条都命中子串,应走歧义分支: {item}");
+        let cands = item["candidates"].as_array().unwrap();
+        assert_eq!(cands.len(), 3, "候选应截断到 top-3: {item}");
+        assert!(
+            cands.iter().all(|c| c["id"] != ended.id.as_str()),
+            "候选应排除已 ended 的记录: {item}"
+        );
+        assert!(
+            cands
+                .iter()
+                .all(|c| active_ids.iter().any(|id| c["id"] == id.as_str())),
+            "候选应全部是活跃任务: {item}"
+        );
+    }
+
+    /// 审计 #4(2026-09-15):agentend 对不存在的 id 不再静默 ok:true,
+    /// 未命中经 missing 显式列出,拼错 id 可立刻发现。
+    #[tokio::test]
+    async fn agentend_reports_missing_ids_instead_of_silent_success() {
+        let (_dir, deps) = ToolDeps::dummy_for_test();
+        let deps = Arc::new(deps);
+        let reg = ToolRegistry::new();
+        register_agentend(&reg, deps.clone());
+        // agentend 是敏感工具:先按会话授权(与既有 agentend 用例同款)
+        let ctx = mk_authorized_session(&deps, &reg, &["agentend"]);
+        // 既有任务(命中)+ 拼错的 id(未命中)
+        let t = deps
+            .subtasks
+            .create(&ctx.session_id, "c", "活任务", "指令")
+            .unwrap();
+        let real_session = ctx.session_id.clone();
+        let ghost = "00000000-0000-0000-0000-000000000000";
+        let raw = reg
+            .execute(
+                "agentend",
+                &format!(r#"{{"task_ids":["{}","{}"]}}"#, t.id, ghost),
+                ctx.clone(),
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(v["ok"], false, "存在未命中 id 时 ok 应为 false: {v}");
+        assert_eq!(
+            v["missing"].as_array().unwrap(),
+            &vec![serde_json::json!(ghost)],
+            "missing 应列出未命中的 id: {v}"
+        );
+        // 逐项明细保留(命中项 existed=true,未命中项 existed=false)
+        let results = v["results"].as_array().unwrap();
+        assert_eq!(results[0]["existed"], true);
+        assert_eq!(results[1]["existed"], false);
+        // 批次 4:outcome 显式三态,调用方不必自行组合 existed/prior_status 才能判语义
+        assert_eq!(
+            results[1]["outcome"], "missing",
+            "未命中应显式 outcome=missing: {v}"
+        );
+
+        // 全部命中时 ok 恢复为 true(保持既有调用方可依赖的成功语义)
+        let t2 = deps
+            .subtasks
+            .create(&real_session, "c", "活任务2", "指令")
+            .unwrap();
+        let raw2 = reg
+            .execute("agentend", &format!(r#"{{"task_ids":["{}"]}}"#, t2.id), ctx)
+            .await
+            .unwrap();
+        let v2: Value = serde_json::from_str(&raw2).unwrap();
+        assert_eq!(v2["ok"], true, "全部命中应 ok=true: {v2}");
+        assert!(v2["missing"].as_array().unwrap().is_empty());
+    }
+
+    /// 审计 #1/#7(2026-09-15):agentgo 回显 resolved_max_tokens,
+    /// 低于下限的入参不拒绝但进 low_budget 清单——消除「静默抬升」。
+    #[tokio::test]
+    async fn agentgo_echoes_resolved_budget_and_flags_low_input() {
+        let (_dir, deps) = ToolDeps::dummy_for_test();
+        let deps = Arc::new(deps);
+        let reg = ToolRegistry::new();
+        register_agentgo(&reg, deps.clone());
+        // agentgo 是敏感工具:先按会话授权(与既有 agentgo 用例同款)
+        let ctx = mk_authorized_session(&deps, &reg, &["agentgo"]);
+        let args = serde_json::json!({
+            "tasks": [
+                { "name": "低预算项", "instruction": "指令一", "max_tokens": 64 },
+                { "name": "正常项", "instruction": "指令二", "max_tokens": 32768 }
+            ]
+        });
+        let raw = reg
+            .execute("agentgo", &args.to_string(), ctx)
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(v["ok"], true, "低于下限不应拒绝派发: {v}");
+        let tasks = v["tasks"].as_array().unwrap();
+        assert_eq!(tasks.len(), 2, "两项都应派出: {v}");
+        assert_eq!(
+            tasks[0]["resolved_max_tokens"], 16384,
+            "低于下限的入参应回显被抬到下限: {v}"
+        );
+        assert_eq!(
+            tasks[1]["resolved_max_tokens"], 32768,
+            "区间内的入参应原样生效: {v}"
+        );
+        let low = v["low_budget"].as_array().unwrap();
+        assert_eq!(low.len(), 1, "仅低预算项进 low_budget: {v}");
+        assert_eq!(low[0]["requested_max_tokens"], 64);
+        assert_eq!(low[0]["resolved_max_tokens"], 16384);
     }
 
     /// 审计 E:todo 在任务模式派生 session 下能看到同任务全部子任务,且显式标注 tool_calls 不可用
     #[tokio::test]
     async fn todo_in_task_mode_sees_sibling_subtasks_and_flags_tool_calls_unavailable() {
-        let deps = Arc::new(ToolDeps::dummy_for_test());
+        let (_dir, deps) = ToolDeps::dummy_for_test();
+        let deps = Arc::new(deps);
         // 子任务挂在 task:t1(走内存覆盖层);todo 从派生 session task:t1:sub:x 查询
         let _s1 = deps
             .subtasks
@@ -982,7 +1161,8 @@ mod tests {
     /// 审计 F:agentend 对活跃任务 interrupted=true;对已结束任务再调 existed=true 但 interrupted=false
     #[tokio::test]
     async fn agentend_reports_interrupted_only_for_active_task() {
-        let deps = Arc::new(ToolDeps::dummy_for_test());
+        let (_dir, deps) = ToolDeps::dummy_for_test();
+        let deps = Arc::new(deps);
         let reg = ToolRegistry::new();
         register_agentend(&reg, deps.clone());
         let ctx = mk_authorized_session(&deps, &reg, &["agentend"]);
@@ -1006,6 +1186,10 @@ mod tests {
             v["results"][0]["interrupted"], true,
             "活跃任务应记为本次中断: {v}"
         );
+        assert_eq!(
+            v["results"][0]["outcome"], "interrupted",
+            "活跃任务应显式 outcome=interrupted: {v}"
+        );
 
         // 再调一次:已 ended,本次不是真实中断
         let raw2 = reg
@@ -1022,6 +1206,53 @@ mod tests {
         assert_eq!(
             v2["results"][0]["interrupted"], false,
             "已 ended 任务不得再报本次中断: {v2}"
+        );
+        assert_eq!(
+            v2["results"][0]["outcome"], "already_finished",
+            "终态再被召回应显式 outcome=already_finished: {v2}"
+        );
+    }
+
+    /// 批次 4(实跑记录第 3 条):`done` 的子任务被 agentend 召回后**保持 done**、
+    /// result 不丢,只有真正中途召回才落 ended——修掉 `ended` 一词的二义。
+    #[tokio::test]
+    async fn agentend_keeps_done_status_and_reports_already_finished() {
+        let (_dir, deps) = ToolDeps::dummy_for_test();
+        let deps = Arc::new(deps);
+        let reg = ToolRegistry::new();
+        register_agentend(&reg, deps.clone());
+        let ctx = mk_authorized_session(&deps, &reg, &["agentend"]);
+        let t = deps
+            .subtasks
+            .create(&ctx.session_id, "c", "已完成项", "指令")
+            .unwrap();
+        deps.subtasks.set_running(&t.id);
+        deps.subtasks.set_done(&t.id, "交付物");
+
+        let raw = reg
+            .execute(
+                "agentend",
+                &format!(r#"{{"task_ids":["{}"]}}"#, t.id),
+                ctx.clone(),
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(v["ok"], true, "命中的 id 仍应 ok=true: {v}");
+        assert_eq!(v["results"][0]["prior_status"], "done");
+        assert_eq!(
+            v["results"][0]["interrupted"], false,
+            "已完成任务本次不是中断: {v}"
+        );
+        assert_eq!(v["results"][0]["outcome"], "already_finished");
+
+        // 关键断言:交付物未被 end 抹掉,状态仍为 done
+        let after = deps.subtasks.get(&t.id).unwrap();
+        assert_eq!(after.status, "done", "终态不得被 agentend 覆盖为 ended");
+        assert_eq!(after.result, "交付物", "终态结果不得被清空");
+        assert!(
+            !after.finished_at.is_empty(),
+            "finished_at 应在 done 时已写入"
         );
     }
 
@@ -1050,7 +1281,8 @@ mod tests {
     /// 审计 B(落库):set_failed 状态 error 且保留截断正文
     #[tokio::test]
     async fn set_failed_keeps_truncated_body_and_marks_error() {
-        let deps = Arc::new(ToolDeps::dummy_for_test());
+        let (_dir, deps) = ToolDeps::dummy_for_test();
+        let deps = Arc::new(deps);
         let t = deps.subtasks.create("task:t1", "c", "子", "指令").unwrap();
         let rec = deps
             .subtasks

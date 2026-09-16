@@ -1,7 +1,7 @@
 // 快速回复(Quick Replies)服务:SQLite 表 quick_replies 的 CRUD。
 // 条目可被世界书 EJS 模板经 getqr/getQuickReply(name[, label]) 读取并嵌套渲染
 // (ST-Prompt-Template / 酒馆助手生态兼容);管理 UI 在后续阶段提供。
-use super::log_query_failure;
+use super::{log_query_failure, log_read_pool_failure};
 use crate::models::db::{now_iso, Db};
 use crate::parsing::assistant::QuickReplyCtx;
 use rusqlite::{params, OptionalExtension};
@@ -86,7 +86,10 @@ impl QuickReplyService {
 
     /// 列表(启用优先,按 name/position/sort_order 排序)
     pub fn list(&self, only_enabled: bool) -> Vec<QuickReplyRecord> {
-        let conn = self.db.read().expect("获取只读连接失败");
+        let conn = match self.db.read() {
+            Ok(c) => c,
+            Err(e) => return log_read_pool_failure("快捷回复列表", e),
+        };
         let sql = if only_enabled {
             format!("SELECT {SELECT_COLS} FROM quick_replies WHERE enabled = 1 ORDER BY name, position, sort_order, id")
         } else {

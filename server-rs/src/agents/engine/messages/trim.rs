@@ -12,6 +12,30 @@ use crate::models::types::LlmMessage;
 /// 集成测试(tasks.rs 工具循环回灌用例)按「已省略」子串断言,改动需同步。
 pub(in crate::agents::engine) const TOOL_HISTORY_SUMMARY_PREFIX: &str = "(较早工具结果已省略:";
 
+/// 2026-09-14:被回收的工具参数占位前缀(后接 `"chars":N}` 构成合法 JSON 对象)。
+/// 工具参数的 token 体量可远超工具结果——模型用 write 等工具写入长内容时,单轮参数
+/// 可达数十万字符,而此前摘要只处理 tool 结果、token 计数也只数 content,
+/// 参数因此既不被看见也不被裁剪,是 plan 模式 prompt 无界膨胀(实测单任务累计 150 万
+/// token、单次调用 88 万)的主因。占位保持合法 JSON:严格后端对 arguments 做 JSON 解析,
+/// 半截或非法会直接 400。
+pub(in crate::agents::engine) const TOOL_ARGUMENTS_TRIMMED_PREFIX: &str = r#"{"_trimmed":true,"#;
+
+/// trim_tool_history 的执行结果(供调用方观测「未能收敛」并留痕)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::agents::engine) struct ToolHistoryTrimOutcome {
+    /// 本轮被摘要化的轮数(只计本次实际改动的轮)
+    pub summarized_rounds: usize,
+    /// 回收参数空间的轮数(保底轮也能回收)
+    pub reclaimed_argument_rounds: usize,
+    /// 裁剪后的估算 token 总量
+    pub total_tokens: i64,
+    /// 生效的预算(0 = 预算闸门禁用)
+    pub budget_tokens: u32,
+    /// 预算闸门是否达标;预算禁用时恒 true。
+    /// false = 已尽力压缩仍超预算(单轮体量本身过大),调用方应告警并使该状态可见。
+    pub converged: bool,
+}
+
 /// 按上下文窗口上限裁剪:始终保留 system(角色设定)与摘要槽(独立 system 消息,
 /// 缓存感知管线·改造 A),从最旧的 user/assistant 起丢弃,直到总 token 不超过预算;
 /// 极端情况下(仅剩 system 仍超)截断 system 内容,并优先保留尾部注入文本
@@ -33,15 +57,27 @@ pub(in crate::agents::engine) fn trim_to_context(
     // 从最旧消息(head 起)丢弃,直到不超预算或仅剩受保护头部;idx 保持不变(remove 后自动前移)
     let idx = head;
     while total > budget as i64 && idx < messages.len() {
-        let cost = token_service.count_tokens(&messages[idx].content, model) + 4;
+        // 与 count_message_tokens 同口径(含 tool_calls 的参数成本,2026-09-14 修复)
+        let cost = token_service.count_single_message_tokens(&messages[idx], model);
         messages.remove(idx);
         total -= cost;
     }
-    // 仍超预算(极长角色设定):按预算约 80% 截断 system,保留尾部注入块
+    // 仍超预算(极长角色设定):按预算截断 system,保留尾部注入块
     if total > budget as i64 && messages.len() == head && head > 0 {
         let sys = &mut messages[0];
         let text = sys.content.clone();
-        let n: usize = ((budget as f64 * 0.8) as usize).max(200);
+        // 字符预算估计(2026-09-13 批次 3 修正量纲混用):此前写成 `budget * 0.8` 直接把
+        // **token 数当字符数**用,对中文(约 1.5 字符/token)属过度截断。改为
+        // 「1 token ≈ 2 字符」的保守估计起步(英文约 4、中文约 1.5,取偏小侧保证不超窗),
+        // 再用真实 tokenizer 复测:仍超预算则按比例收缩一次,消除量纲混用。
+        let mut n: usize = ((budget as usize).saturating_mul(2)).max(200);
+        let probe: String = text.chars().take(n).collect();
+        let measured = token_service.count_tokens(&probe, model);
+        if measured > budget as i64 {
+            let ratio = (budget as f64 / measured as f64).clamp(0.1, 0.95);
+            n = ((n as f64 * ratio) as usize).max(200);
+        }
+        drop(probe);
         let total_chars = text.chars().count();
         let keep_tail = protected_tail.min(total_chars);
         if keep_tail > 0 {
@@ -105,9 +141,17 @@ pub(in crate::agents::engine) fn trim_tool_history(
     budget_tokens: u32,
     token_service: &mut crate::services::token_service::TokenService,
     model: &str,
-) {
+) -> ToolHistoryTrimOutcome {
+    let mut outcome = ToolHistoryTrimOutcome {
+        summarized_rounds: 0,
+        reclaimed_argument_rounds: 0,
+        total_tokens: 0,
+        budget_tokens,
+        converged: true,
+    };
     if messages.len() <= 2 {
-        return;
+        outcome.total_tokens = token_service.count_message_tokens(messages, model);
+        return outcome;
     }
     // 1) 轮分组(按出现顺序):assistant 带非空 tool_calls = 一轮起点
     let mut rounds: Vec<(usize, Vec<usize>)> = Vec::new();
@@ -121,7 +165,8 @@ pub(in crate::agents::engine) fn trim_tool_history(
         }
     }
     if rounds.is_empty() {
-        return;
+        outcome.total_tokens = token_service.count_message_tokens(messages, model);
+        return outcome;
     }
     // 2) 完整轮 = 尚有 tool 消息未带摘要前缀的轮(无 tool 消息的轮视为完整,
     //    摘要对它无意义,keep 计数时占位——实际 run_tool_loop 每轮恒有 tool 消息)
@@ -135,7 +180,8 @@ pub(in crate::agents::engine) fn trim_tool_history(
         })
         .collect();
     if full.len() <= 1 {
-        return;
+        outcome.total_tokens = token_service.count_message_tokens(messages, model);
+        return outcome;
     }
     // 3) keep-recent 闸门:从最老完整轮起摘要,直到完整轮数 <= keep_rounds
     //    (full 下标游标 cursor 指向下一轮待摘要;full 末位 = 最近完整轮,保底不摘)
@@ -146,21 +192,66 @@ pub(in crate::agents::engine) fn trim_tool_history(
         summarize_round(messages, &rounds[full[cursor]]);
         cursor += 1;
         excess -= 1;
+        outcome.summarized_rounds += 1;
     }
-    // 4) 预算闸门(0 = 禁用):超预算继续摘要更老完整轮;保底最近 1 轮完整
+    // 4) 预算闸门(0 = 禁用):超预算继续摘要更老完整轮;保底最近 1 轮完整。
+    //    (预算判定用含 tool_calls 参数的口径——见 count_message_tokens 的 2026-09-14 修复)
     if budget_tokens > 0 {
         let mut total = token_service.count_message_tokens(messages, model);
         while total > budget_tokens as i64 && cursor + 1 < full.len() {
             summarize_round(messages, &rounds[full[cursor]]);
             cursor += 1;
             total = token_service.count_message_tokens(messages, model);
+            outcome.summarized_rounds += 1;
         }
+        // 5) 参数回收兜底(2026-09-14):仍超预算说明体量集中在「保底轮」本身
+        //    (保底轮不能整轮摘要,否则模型失去最新工具结果的上下文)。
+        //    但对保底轮回收**工具参数**是安全的:参数是历史调用记录,
+        //    模型不需要凭旧参数复现调用;tool_calls[].id 保留 → 配对不破坏。
+        //    这一步是防「单轮参数即超预算导致闸门永不达标」的关键兜底。
+        if total > budget_tokens as i64 {
+            for &ri in full.iter().skip(cursor) {
+                if reclaim_round_arguments(messages, rounds[ri].0) {
+                    outcome.reclaimed_argument_rounds += 1;
+                    total = token_service.count_message_tokens(messages, model);
+                    if total <= budget_tokens as i64 {
+                        break;
+                    }
+                }
+            }
+        }
+        outcome.converged = total <= budget_tokens as i64;
+        outcome.total_tokens = total;
+    } else {
+        outcome.total_tokens = token_service.count_message_tokens(messages, model);
     }
+    outcome
+}
+
+/// 回收一轮的工具参数空间(2026-09-14):把该轮 assistant 的 `tool_calls[].arguments`
+/// 替换为合法 JSON 占位,保留 `id`/`name` → OpenAI 的 assistant(tool_calls)↔tool
+/// 配对不破坏,严格后端不会 400。
+/// 返回是否实际发生改动(已回收过则 false,保证幂等)。
+fn reclaim_round_arguments(messages: &mut [LlmMessage], a_idx: usize) -> bool {
+    let Some(calls) = messages[a_idx].tool_calls.as_mut() else {
+        return false;
+    };
+    let mut changed = false;
+    for c in calls.iter_mut() {
+        if c.arguments.starts_with(TOOL_ARGUMENTS_TRIMMED_PREFIX) {
+            continue;
+        }
+        let chars = c.arguments.chars().count();
+        c.arguments = format!("{TOOL_ARGUMENTS_TRIMMED_PREFIX}\"chars\":{chars}}}");
+        changed = true;
+    }
+    changed
 }
 
 /// 摘要一轮:该轮每条未摘要的 tool 消息内容替换为短摘要(含工具名与原输出长度),
-/// 该轮 assistant 的 reasoning_content 清空(推理对后续轮无用且占预算);
-/// tool_calls/tool_call_id 不动(配对完整)。已摘要消息跳过(幂等)。
+/// 该轮 assistant 的 reasoning_content 清空(推理对后续轮无用且占预算),
+/// **并回收该轮工具参数空间**(2026-09-14:参数体量常远超工具结果);
+/// tool_calls 的 id/name 与 tool_call_id 不动(配对完整)。已摘要消息跳过(幂等)。
 fn summarize_round(messages: &mut [LlmMessage], round: &(usize, Vec<usize>)) {
     let (a_idx, tool_idxs) = round;
     for &ti in tool_idxs {
@@ -183,6 +274,8 @@ fn summarize_round(messages: &mut [LlmMessage], round: &(usize, Vec<usize>)) {
             format!("{TOOL_HISTORY_SUMMARY_PREFIX}工具 \"{name}\" 原输出约 {chars} 字符)");
     }
     messages[*a_idx].reasoning_content = None;
+    // 参数与工具结果同属「历史调用记录」,模型无需凭旧参数复现调用 → 一并回收
+    reclaim_round_arguments(messages, *a_idx);
 }
 
 #[cfg(test)]
@@ -373,6 +466,16 @@ mod tests {
 
     /// 一轮工具循环消息:assistant(带 tool_calls + reasoning)+ 一条 tool 结果
     fn tool_round(name: &str, call_id: &str, output: &str) -> Vec<LlmMessage> {
+        tool_round_with_args(name, call_id, output, "{}")
+    }
+
+    /// 同上,但指定工具参数原文(用于验证参数回收)
+    fn tool_round_with_args(
+        name: &str,
+        call_id: &str,
+        output: &str,
+        arguments: &str,
+    ) -> Vec<LlmMessage> {
         vec![
             LlmMessage {
                 role: "assistant".into(),
@@ -381,7 +484,7 @@ mod tests {
                 tool_calls: Some(vec![crate::models::types::ToolCallArgs {
                     id: call_id.into(),
                     name: name.into(),
-                    arguments: "{}".into(),
+                    arguments: arguments.into(),
                 }]),
                 tool_call_id: None,
             },
@@ -538,6 +641,139 @@ mod tests {
             with_tail.last().unwrap().content,
             "正在整理最终答案",
             "非工具循环的尾部 assistant 消息不得被动"
+        );
+    }
+
+    // ===== 2026-09-14:工具参数回收(plan 模式 prompt 失控修复)=====
+
+    /// 单轮参数体量即超预算时仍能收敛(此前的核心缺陷:闸门硬编码保底最近一轮,
+    /// 单轮超预算时永远无法达标 → prompt 无界膨胀,实测 88 万 token)
+    #[test]
+    fn tool_history_single_round_oversized_args_still_converges() {
+        let mut ts = crate::services::token_service::TokenService::new();
+        let model = "gpt-4o-mini";
+        // 3 轮,每轮参数巨大(约 4000 字符),tool 输出很小
+        let mut messages = vec![
+            LlmMessage::plain("system", "系统提示"),
+            LlmMessage::plain("user", "任务目标"),
+        ];
+        for i in 0..3 {
+            messages.extend(tool_round_with_args(
+                "write",
+                &format!("call-{i}"),
+                "ok",
+                &format!("{{\"content\":\"{}\"}}", "参".repeat(4000)),
+            ));
+        }
+        // 极小预算:即便摘要掉旧轮内容,剩下的大参数也必然超标
+        let outcome = trim_tool_history(&mut messages, 4, 200, &mut ts, model);
+
+        assert!(
+            outcome.reclaimed_argument_rounds > 0,
+            "应发生参数回收: {outcome:?}"
+        );
+        // 参数已被回收为占位 → 总量应大幅下降且收敛
+        let total = ts.count_message_tokens(&messages, model);
+        assert!(
+            total <= 200,
+            "参数回收后必须收敛到预算内,total={total},outcome={outcome:?}"
+        );
+        assert!(outcome.converged, "必须报告已收敛: {outcome:?}");
+    }
+
+    /// 参数回收保持合法 JSON 与 id(严格后端会解析 arguments,非法即 400)
+    #[test]
+    fn tool_history_reclaimed_arguments_stay_valid_json_and_keep_ids() {
+        let mut ts = crate::services::token_service::TokenService::new();
+        let mut messages = vec![
+            LlmMessage::plain("system", "s"),
+            LlmMessage::plain("user", "u"),
+        ];
+        for i in 0..3 {
+            messages.extend(tool_round_with_args(
+                "write",
+                &format!("call-{i}"),
+                "ok",
+                &format!("{{\"content\":\"{}\"}}", "x".repeat(4000)),
+            ));
+        }
+        trim_tool_history(&mut messages, 4, 200, &mut ts, "gpt-4o-mini");
+
+        for m in messages.iter().filter(|m| m.role == "assistant") {
+            for c in m.tool_calls.as_ref().unwrap() {
+                // 占位必须是合法 JSON 对象
+                let parsed: serde_json::Value = serde_json::from_str(&c.arguments)
+                    .unwrap_or_else(|e| panic!("占位必须是合法 JSON: {} ({e})", c.arguments));
+                assert_eq!(parsed["_trimmed"], serde_json::json!(true));
+                // id 与 name 保留 → 配对可用
+                assert!(c.id.starts_with("call-"), "id 不得改动: {}", c.id);
+                assert_eq!(c.name, "write", "name 不得改动");
+            }
+        }
+        // 配对完整:每条 tool 消息仍能反查到 assistant
+        for m in messages.iter().filter(|m| m.role == "tool") {
+            let cid = m.tool_call_id.as_deref().unwrap();
+            assert!(
+                messages.iter().any(|a| a
+                    .tool_calls
+                    .as_ref()
+                    .is_some_and(|cs| cs.iter().any(|c| c.id == cid))),
+                "tool {cid} 配对不得破坏"
+            );
+        }
+    }
+
+    /// 参数回收幂等:二次调用不再改动
+    #[test]
+    fn tool_history_argument_reclaim_is_idempotent() {
+        let mut ts = crate::services::token_service::TokenService::new();
+        let mut messages = vec![
+            LlmMessage::plain("system", "s"),
+            LlmMessage::plain("user", "u"),
+        ];
+        for i in 0..3 {
+            messages.extend(tool_round_with_args(
+                "write",
+                &format!("call-{i}"),
+                "ok",
+                &format!("{{\"c\":\"{}\"}}", "x".repeat(3000)),
+            ));
+        }
+        trim_tool_history(&mut messages, 4, 200, &mut ts, "gpt-4o-mini");
+        let once = serde_json::to_string(&messages).unwrap();
+        trim_tool_history(&mut messages, 4, 200, &mut ts, "gpt-4o-mini");
+        assert_eq!(
+            serde_json::to_string(&messages).unwrap(),
+            once,
+            "参数回收必须幂等"
+        );
+    }
+
+    /// 预算充足时不做多余回收(不误伤)
+    #[test]
+    fn tool_history_no_reclaim_when_within_budget() {
+        let mut ts = crate::services::token_service::TokenService::new();
+        let mut messages = vec![
+            LlmMessage::plain("system", "s"),
+            LlmMessage::plain("user", "u"),
+        ];
+        for i in 0..3 {
+            messages.extend(tool_round_with_args(
+                "read",
+                &format!("call-{i}"),
+                "ok",
+                "{\"path\":\"/tmp/a\"}",
+            ));
+        }
+        let outcome = trim_tool_history(&mut messages, 4, 100_000, &mut ts, "gpt-4o-mini");
+        assert_eq!(outcome.reclaimed_argument_rounds, 0, "预算充足不得回收参数");
+        assert!(outcome.converged);
+        assert!(
+            messages.iter().any(|m| m
+                .tool_calls
+                .as_ref()
+                .is_some_and(|cs| cs.iter().any(|c| c.arguments.contains("path")))),
+            "参数原文应保留"
         );
     }
 }

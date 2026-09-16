@@ -1,4 +1,5 @@
 // 生成请求自动重试:退避计算 / 可中断等待 / 重试日志(自 openai_compatible.rs 迁入)
+use crate::models::llm_error::LlmError;
 use std::time::Duration;
 use tokio::sync::watch;
 
@@ -25,12 +26,12 @@ pub(super) fn retry_delay(attempt: usize, retry_after: Option<u64>) -> Duration 
 pub(super) async fn wait_retry(
     delay: Duration,
     abort: &mut watch::Receiver<bool>,
-) -> Result<(), String> {
+) -> Result<(), LlmError> {
     tokio::select! {
         _ = tokio::time::sleep(delay) => Ok(()),
         changed = abort.changed() => {
             if changed.is_err() || *abort.borrow() {
-                Err("生成已中断".into())
+                Err(LlmError::generation("生成已中断"))
             } else {
                 Ok(())
             }

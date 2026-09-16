@@ -1,10 +1,9 @@
 // Agent 工具授权 API：查询当前会话/角色裁决结果，授予或撤销显式权限。
 use crate::api::app_state::AppState;
-use crate::api::{db_err, WithStatus};
+use crate::api::{conflict, db_err, not_found, validation};
 use crate::models::types::ToolContext;
 use crate::tools::permissions::PendingAuthorizationDecision;
 use axum::extract::{Query, State};
-use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::Deserialize;
@@ -43,7 +42,7 @@ pub async fn list(
     let session = match state.db_call(move || svc.get(&sid)).await {
         Err(e) => return db_err(&e),
         Ok(Some(s)) => s,
-        Ok(None) => return permission_error(StatusCode::NOT_FOUND, "会话不存在"),
+        Ok(None) => return not_found("会话不存在"),
     };
     let ctx = ToolContext {
         session_id: session.id.clone(),
@@ -94,34 +93,29 @@ pub async fn resolve(
     Json(body): Json<PermissionBody>,
 ) -> Response {
     let Some(run_id) = body.run_id.as_deref() else {
-        return permission_error(StatusCode::BAD_REQUEST, "缺少 run_id");
+        return validation("缺少 run_id");
     };
     let Some(call_id) = body.call_id.as_deref() else {
-        return permission_error(StatusCode::BAD_REQUEST, "缺少 call_id");
+        return validation("缺少 call_id");
     };
     {
         let svc = state.sessions.clone();
         let sid = body.session_id.clone();
         match state.db_call(move || svc.get(&sid)).await {
             Err(e) => return db_err(&e),
-            Ok(None) => return permission_error(StatusCode::NOT_FOUND, "会话不存在"),
+            Ok(None) => return not_found("会话不存在"),
             Ok(Some(_)) => {}
         }
     }
     if state.tool_registry.get(&body.tool).is_none() {
-        return permission_error(StatusCode::BAD_REQUEST, "工具未注册");
+        return validation("工具未注册");
     }
     let decision = match body.scope.as_str() {
         "once" => PendingAuthorizationDecision::AllowOnce,
         "session" => PendingAuthorizationDecision::AllowSession,
         "role" => PendingAuthorizationDecision::AllowRole,
         "deny" => PendingAuthorizationDecision::Deny,
-        _ => {
-            return permission_error(
-                StatusCode::BAD_REQUEST,
-                "decision 仅支持 once/session/role/deny",
-            )
-        }
+        _ => return validation("decision 仅支持 once/session/role/deny"),
     };
     match state.tool_registry.permissions().resolve_wait(
         run_id,
@@ -131,7 +125,7 @@ pub async fn resolve(
         decision,
     ) {
         Ok(()) => Json(json!({ "ok": true })).into_response(),
-        Err(error) => permission_error(StatusCode::CONFLICT, &error),
+        Err(error) => conflict(&error),
     }
 }
 
@@ -141,15 +135,15 @@ async fn mutate_permission(state: &AppState, body: &PermissionBody, authorize: b
     let session = match state.db_call(move || svc.get(&sid)).await {
         Err(e) => return db_err(&e),
         Ok(Some(s)) => s,
-        Ok(None) => return permission_error(StatusCode::NOT_FOUND, "会话不存在"),
+        Ok(None) => return not_found("会话不存在"),
     };
     if state.tool_registry.get(&body.tool).is_none() {
-        return permission_error(StatusCode::BAD_REQUEST, "工具未注册");
+        return validation("工具未注册");
     }
     let scope_id = match body.scope.as_str() {
         "session" => session.id.as_str(),
         "role" => session.character_id.as_str(),
-        _ => return permission_error(StatusCode::BAD_REQUEST, "scope 仅支持 session 或 role"),
+        _ => return validation("scope 仅支持 session 或 role"),
     };
     // B-1:authorize/revoke 内含同步 JSON 原子落盘(tool_permissions.json),挪阻塞线程池
     let registry = state.tool_registry.clone();
@@ -168,12 +162,6 @@ async fn mutate_permission(state: &AppState, body: &PermissionBody, authorize: b
     match result {
         Err(e) => db_err(&e),
         Ok(Ok(())) => Json(json!({ "ok": true })).into_response(),
-        Ok(Err(error)) => permission_error(StatusCode::BAD_REQUEST, &error),
+        Ok(Err(error)) => validation(&error),
     }
-}
-
-fn permission_error(status: StatusCode, error: &str) -> Response {
-    Json(json!({ "error": error }))
-        .into_response()
-        .with_status(status)
 }

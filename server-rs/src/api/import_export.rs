@@ -1,9 +1,8 @@
 // 导入导出路由:/api/export/chat、/api/import/chat(SillyTavern 兼容)
 use crate::api::app_state::AppState;
-use crate::api::{db_err, WithStatus};
+use crate::api::{db_err, not_found, validation};
 use crate::models::types::StMessage;
 use axum::extract::{Query, State};
-use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::Deserialize;
@@ -29,14 +28,10 @@ pub async fn export_chat(
     Query(q): Query<SessionQuery>,
 ) -> Response {
     let Some(sid) = q.session_id else {
-        return Json(json!({ "error": "缺少 session_id 查询参数" }))
-            .into_response()
-            .with_status(StatusCode::BAD_REQUEST);
+        return validation("缺少 session_id 查询参数");
     };
     if sid.trim().is_empty() {
-        return Json(json!({ "error": "缺少 session_id 查询参数" }))
-            .into_response()
-            .with_status(StatusCode::BAD_REQUEST);
+        return validation("缺少 session_id 查询参数");
     }
     let svc = state.sessions.clone();
     let sid_q = sid.clone();
@@ -49,11 +44,7 @@ pub async fn export_chat(
         .await
     {
         Err(e) => return db_err(&e),
-        Ok(None) => {
-            return Json(json!({ "error": "会话不存在" }))
-                .into_response()
-                .with_status(StatusCode::NOT_FOUND)
-        }
+        Ok(None) => return not_found("会话不存在"),
         Ok(Some(m)) => m,
     };
     Json(json!({ "session_id": sid, "messages": messages })).into_response()
@@ -65,14 +56,10 @@ pub async fn import_chat(
     Json(body): Json<ImportBody>,
 ) -> Response {
     let Some(sid) = body.session_id else {
-        return Json(json!({ "error": "缺少 session_id" }))
-            .into_response()
-            .with_status(StatusCode::BAD_REQUEST);
+        return validation("缺少 session_id");
     };
     if sid.trim().is_empty() {
-        return Json(json!({ "error": "缺少 session_id" }))
-            .into_response()
-            .with_status(StatusCode::BAD_REQUEST);
+        return validation("缺少 session_id");
     }
     let svc = state.sessions.clone();
     let sid_q = sid.clone();
@@ -85,12 +72,8 @@ pub async fn import_chat(
         .await;
     match imported {
         Err(e) => db_err(&e),
-        Ok(None) => Json(json!({ "error": "会话不存在" }))
-            .into_response()
-            .with_status(StatusCode::NOT_FOUND),
+        Ok(None) => not_found("会话不存在"),
         Ok(Some(Ok(n))) => Json(json!({ "ok": true, "imported": n })).into_response(),
-        Ok(Some(Err(e))) => Json(json!({ "error": e }))
-            .into_response()
-            .with_status(StatusCode::BAD_REQUEST),
+        Ok(Some(Err(e))) => validation(e),
     }
 }

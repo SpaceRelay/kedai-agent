@@ -288,6 +288,77 @@ impl LlmMessage {
     }
 }
 
+// ---------- 提示词楼层(L1:与 DB/服务无关,parsing 预设导入与 services 注入共用) ----------
+
+/// 楼层注入位置(与 SillyTavern Prompt Manager 语义对齐)
+///
+/// **注意**:引擎注入路径已统一归位「系统提示词内」——`Before`/`After`/`Depth`
+/// 不再参与注入(见 `agents/engine/messages/build.rs` 位置4 注释)。三个变体仅保留
+/// 解析能力,用于兼容导入的酒馆预设(`parsing/preset.rs`),新配置应一律用 `System`。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum FloorPosition {
+    /// 拼入系统提示词末尾
+    #[default]
+    System,
+    /// 对话历史最前(开场白之前)——已废弃,不参与注入
+    Before,
+    /// 对话历史最后(最新消息之后)——已废弃,不参与注入
+    After,
+    /// 深度:从历史末尾往前数第 N 条之后插入(0 = 最新消息后)——已废弃,不参与注入
+    Depth,
+}
+
+/// 楼层消息角色(自由选择)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum FloorRole {
+    #[default]
+    System,
+    User,
+    Assistant,
+}
+
+impl FloorRole {
+    /// LLM 消息角色字符串(system/user/assistant)
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            FloorRole::System => "system",
+            FloorRole::User => "user",
+            FloorRole::Assistant => "assistant",
+        }
+    }
+}
+
+/// 单条提示词楼层
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PromptFloor {
+    pub id: String,
+    pub name: String,
+    pub content: String,
+    #[serde(default)]
+    pub role: FloorRole,
+    #[serde(default)]
+    pub position: FloorPosition,
+    /// position = depth 时的深度(0 = 最新消息后)
+    #[serde(default)]
+    pub depth: usize,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// 拖拽排序序号(同级内按 order 升序)
+    #[serde(default)]
+    pub order: usize,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// 楼层 ID 生成(uuid v4,与 skill_service 一致)
+pub fn new_floor_id() -> String {
+    uuid::Uuid::new_v4().to_string()
+}
+
 /// 工具选择策略(function calling):决定模型是否/如何调用工具。
 /// OpenAI 兼容语义:auto = 模型自行决定;none = 禁止调用;required = 强制调用(至少一个);
 /// function(name) = 强制调用指定工具。
@@ -351,6 +422,37 @@ pub enum LlmStreamChunk {
 }
 
 // ---------- SSE 事件 ----------
+/// 任务事件分类(`SseEvent::Task.kind`,WP4 / 批次 4 / 批次 R4)。
+/// 序列化为 snake_case,与前端手写 union `TaskEventKind`(`web/src/api/types.ts`)
+/// 逐值对齐——改此处须同步前端 union 与 `tools/check-contract.mjs` 的映射表。
+///
+/// 用枚举而非 `String`:后端拼错分类名从前只会在前端静默失效(未知 kind 不刷新),
+/// 现由编译器拦住;线格式与字符串时代逐字节一致。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskEventKind {
+    /// 任务已创建
+    Created,
+    /// 任务状态迁移
+    Status,
+    /// 执行计划更新
+    Plan,
+    /// 子任务创建 / 状态更新
+    Subtask,
+    /// token 用量落库
+    Usage,
+    /// 任务已删除
+    Deleted,
+    /// LLM 调用落库(批次 3 调用追踪)
+    LlmCall,
+    /// 主 / 子 agent 状态迁移(批次 4)
+    AgentStatus,
+    /// 计划待批准(批次 4 plan 模式)
+    ApprovalRequired,
+    /// 流式正文增量(批次 R4;暂态事件不落库)
+    Delta,
+}
+
 /// SSE 事件,serde 序列化为 {"type":"...", ...}
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -411,6 +513,13 @@ pub enum SseEvent {
     Finish {
         usage: TokenUsage,
         content: String,
+        /// 上游 finish_reason(stop / length / content_filter 等;可观测性问题①)。
+        /// "length" = 输出被 max_tokens 截断(推理模型常见:reasoning 吃光预算)。
+        /// 任务模式早已据此落库并展示「截断」徽标,聊天路径此前完全丢弃该字段——
+        /// 前端把半截回复当正常完成渲染,用户无从察觉。
+        /// None = 未下发/不适用,序列化时省略(旧客户端忽略即可,线格式向后兼容)。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        finish_reason: Option<String>,
     },
     /// 任务模式(task 工作台)事件(WP4):任务生命周期广播,由 TaskService 的
     /// broadcast 通道推送,GET /api/tasks/events 转发为 SSE,取代前端 1s REST 轮询。
@@ -423,7 +532,7 @@ pub enum SseEvent {
         ///  delta:批次 R4 流式输出,LLM 正文增量经攒批后透出,暂态事件不落库——
         ///  权威数据以 llm_call 落库行/calls 端点为准,见 events.rs emit_delta)
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        kind: Option<String>,
+        kind: Option<TaskEventKind>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         title: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -465,6 +574,77 @@ pub struct ToolContext {
     pub agent_depth: u32,
 }
 
+/// 工具执行器签名（**L1 契约**：工具注册表与各 L3 加载器共用）。
+///
+/// 2026-09-14 从 `tools/registry.rs` 下沉至此。理由：`plugins/`（L3 插件加载器）与
+/// `mcp/`（L3 客户端）都需要**构造**执行器来注册工具，若该类型留在 L2 的 `tools/`，
+/// 两者都会构成 `L3→L2` 越代依赖。类型别名是纯契约、无实现，与
+/// `ToolDefinition` / `ToolContext` 同处 L1 最合适。
+pub type ToolExecutor = std::sync::Arc<
+    dyn Fn(Value, ToolContext) -> futures::future::BoxFuture<'static, Result<String, String>>
+        + Send
+        + Sync,
+>;
+
+/// 已装载的脚本执行体（**L1 契约**）。
+///
+/// 2026-09-14 从 `scripts/loader.rs`（L3）下沉至此。理由：`services::script_authorization_service`
+/// （L2）需要用它计算脚本内容哈希（授权门），若类型留在 L3，就构成 `L2→L3` 越代依赖
+/// （规则 J 实测检出）。它是纯数据形状、无行为，与 `ToolDefinition` 同类。
+///
+/// 字段语义与 `scripts::loader::collect_enabled_scripts` 的产出保持一致。
+#[derive(Debug, Clone, PartialEq)]
+pub struct LoadedScript {
+    pub id: String,
+    pub name: String,
+    pub content: String,
+    /// script 作用域变量（data）
+    pub data: Value,
+}
+
+/// 工具注册能力的最小接口（**L1 契约**，宿主注入用）。
+///
+/// 2026-09-14 新增。理由：L3 的 `mcp/` 需要把发现的远端工具登记进工具表，
+/// 但**不能**直接依赖 `tools::registry::ToolRegistry`（L2 设施，会构成 `L3→L2`）。
+/// 故定义此窄接口，由 L2 的注册表实现、由组合根把 `&dyn ToolRegistrar` 注入给 L3。
+///
+/// **这是「青层能力经显式接缝注入」的标准形态**，与 `task_core::TaskBackend`
+/// 断开 `task_engine→task_service` 是同一手法（见 `docs/契约-架构与数据.md` §3）。
+pub trait ToolRegistrar: Send + Sync {
+    /// 注册一个**外部来源**工具（插件 / MCP）。实现方须据此把参数视为不可信。
+    fn register_external(
+        &self,
+        definition: ToolDefinition,
+        execute: ToolExecutor,
+        timeout: Option<std::time::Duration>,
+        origin: crate::models::tool_policy::ToolOrigin,
+    );
+
+    /// 注销工具（插件删除 / MCP 服务器退出时用）；不存在时静默忽略。
+    fn unregister(&self, name: &str);
+}
+
+/// 让 `Arc<T>` 可直接当 `&dyn ToolRegistrar` 使用（组合根通常持有 `Arc<ToolRegistry>`）。
+///
+/// 没有它，`self.mcp.start(servers, &self.tool_registry)` 会因
+/// `Arc<ToolRegistry>` 未实现该 trait 而无法编译——宿主不得不先 deref 或改持裸引用，
+/// 反而增加装配摩擦。转发实现保持行为零变化。
+impl<T: ToolRegistrar + ?Sized> ToolRegistrar for std::sync::Arc<T> {
+    fn register_external(
+        &self,
+        definition: ToolDefinition,
+        execute: ToolExecutor,
+        timeout: Option<std::time::Duration>,
+        origin: crate::models::tool_policy::ToolOrigin,
+    ) {
+        (**self).register_external(definition, execute, timeout, origin);
+    }
+
+    fn unregister(&self, name: &str) {
+        (**self).unregister(name);
+    }
+}
+
 // ---------- Skill 库 ----------
 /// 提示词技能(skill):read 工具按名/关键词读取,可注入上下文。
 /// 渐进披露(落地项 3):system 仅注入 name+description 紧凑清单,
@@ -500,17 +680,21 @@ pub struct AgentSubtaskRecord {
     pub error: String,
     pub created_at: String,
     pub updated_at: String,
+    /// 首次进入终态(done/error/ended)的时刻;pending/running 期间为空串。
+    /// 有了它,调用方不必再靠 `status` 反推「何时完成」,也不必用 `ended` 兼表中断与完成
+    /// (见 docs/功能-变更史.md)。
+    pub finished_at: String,
 }
 
 // ---------- 任务模式(task 工作台) ----------
 /// 任务执行模式(tasks.task_mode 列,批次 4 六模式)。序列化/落盘均为 snake_case
-/// 文本;旧行缺省 'legacy',行为与六模式引入前逐字节一致。语义见 docs/任务引擎六模式.md。
+/// 文本;旧行缺省 'legacy',行为与六模式引入前逐字节一致。语义见 docs/功能.md。
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskRunMode {
     /// 三段式:规划 → 逐步执行 → 汇总(既有行为,默认)
     Legacy,
-    /// 单主 agent 工具自循环(run_tool_loop,工具全量)
+    /// 单主 agent 工具自循环(run_tool_loop,工具集按 task_tool_policy 编译)
     Solo,
     /// solo + 子 agent 工具化(agent_depth+1 深度守卫)
     Multi,
@@ -720,6 +904,11 @@ impl TaskSubtaskStatus {
         }
     }
 
+    /// 是否终态(done/error/ended):终态不再被后续状态写入改写,首次进入时记 finished_at。
+    pub fn is_terminal(self) -> bool {
+        matches!(self, Self::Done | Self::Error | Self::Ended)
+    }
+
     /// 容错同 TaskStatus::from_str_lossy。
     pub fn from_str_lossy(s: &str) -> Self {
         match s {
@@ -824,6 +1013,8 @@ pub struct TaskSubtaskRecord {
     pub error: String,
     pub created_at: String,
     pub updated_at: String,
+    /// 首次进入终态(done/error/ended)的时刻;pending/running 期间为空串。
+    pub finished_at: String,
 }
 
 /// 任务 LLM 调用追踪行(task_llm_calls 表;批次 3「调用情况」面板时间线数据源)。
@@ -921,13 +1112,13 @@ mod tests {
         }
     }
 
-    /// serde 快照:llm_call 事件线格式(批次 3 新增 kind)。kind 为 Option<String>,
+    /// serde 快照:llm_call 事件线格式(批次 3 新增 kind)。kind 为 Option<TaskEventKind>,
     /// 本测试锁定「type=task + kind=llm_call」帧形态(None 字段省略),防线格式漂移。
     #[test]
     fn sse_task_llm_call_event_wire_format() {
         let ev = SseEvent::Task {
             task_id: "t1".into(),
-            kind: Some("llm_call".into()),
+            kind: Some(TaskEventKind::LlmCall),
             title: None,
             status: None,
             detail: Some("step #1 · mock · 5 tokens".into()),
@@ -954,7 +1145,7 @@ mod tests {
     fn sse_task_llm_call_event_with_finish_reason_wire_format() {
         let ev = SseEvent::Task {
             task_id: "t1".into(),
-            kind: Some("llm_call".into()),
+            kind: Some(TaskEventKind::LlmCall),
             title: None,
             status: None,
             detail: Some("agent · mock · 5 tokens".into()),
@@ -989,6 +1180,38 @@ mod tests {
         );
     }
 
+    /// serde 快照:聊天终态 Finish 事件携带 finish_reason(可观测性问题①,2026-09-15)。
+    /// Some 时字段出现,None 时省略——旧客户端忽略未知字段即可,线格式向后兼容。
+    /// 锁定聊天路径不再丢弃截断信息(此前 SseEvent::Finish 只有 usage/content)。
+    #[test]
+    fn sse_finish_event_carries_finish_reason_wire_format() {
+        let truncated = SseEvent::Finish {
+            usage: TokenUsage::default(),
+            content: "半截回复".into(),
+            finish_reason: Some("length".into()),
+        };
+        let v = serde_json::to_value(&truncated).unwrap();
+        assert_eq!(v["type"], serde_json::json!("finish"));
+        assert_eq!(v["finish_reason"], serde_json::json!("length"));
+
+        let normal = SseEvent::Finish {
+            usage: TokenUsage::default(),
+            content: "完整回复".into(),
+            finish_reason: Some("stop".into()),
+        };
+        let v = serde_json::to_value(&normal).unwrap();
+        assert_eq!(v["finish_reason"], serde_json::json!("stop"));
+
+        // 未下发 finish_reason 时字段省略(不污染线格式,旧客户端兼容)
+        let unknown = SseEvent::Finish {
+            usage: TokenUsage::default(),
+            content: "x".into(),
+            finish_reason: None,
+        };
+        let v = serde_json::to_value(&unknown).unwrap();
+        assert!(v.get("finish_reason").is_none(), "None 应省略字段: {v}");
+    }
+
     /// serde 快照:delta 事件线格式(批次 R4 任务模式流式输出)。kind=delta +
     /// detail 攒批文本 + phase/step_index 调用归属标识;暂态事件不落库(纪律例外,
     /// 见 events.rs emit_delta),None 字段序列化省略,旧客户端缺字段即忽略。
@@ -996,7 +1219,7 @@ mod tests {
     fn sse_task_delta_event_wire_format() {
         let ev = SseEvent::Task {
             task_id: "t1".into(),
-            kind: Some("delta".into()),
+            kind: Some(TaskEventKind::Delta),
             title: None,
             status: None,
             detail: Some("攒批后的正文增量".into()),
@@ -1025,7 +1248,7 @@ mod tests {
     fn sse_task_llm_call_event_with_phase_wire_format() {
         let ev = SseEvent::Task {
             task_id: "t1".into(),
-            kind: Some("llm_call".into()),
+            kind: Some(TaskEventKind::LlmCall),
             title: None,
             status: None,
             detail: Some("step #1 · mock · 5 tokens".into()),
@@ -1039,7 +1262,7 @@ mod tests {
 
         let ev = SseEvent::Task {
             task_id: "t1".into(),
-            kind: Some("llm_call".into()),
+            kind: Some(TaskEventKind::LlmCall),
             title: None,
             status: None,
             detail: Some("planner · mock · 5 tokens".into()),

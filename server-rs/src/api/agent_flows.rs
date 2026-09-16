@@ -2,10 +2,9 @@
 // + DELETE /api/agent-flows/{id}(全局流程库,持久化 data/agent_flows.json)。
 // 响应统一携带 library{current_flow_id, flows} 与 config(当前选中流程,兼容旧调用方)。
 use crate::api::app_state::AppState;
-use crate::api::WithStatus;
+use crate::api::{internal, validation};
 use crate::services::agent_flow_service::{AgentFlowConfig, AgentFlowLibrary};
 use axum::extract::{Path, State};
-use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::Deserialize;
@@ -54,12 +53,8 @@ pub async fn update_agent_flows(
         .await;
     match result {
         Ok(Ok(lib)) => Json(flow_payload(&lib)).into_response(),
-        Ok(Err(e)) => Json(json!({ "error": e }))
-            .into_response()
-            .with_status(StatusCode::BAD_REQUEST),
-        Err(e) => Json(json!({ "error": e }))
-            .into_response()
-            .with_status(StatusCode::INTERNAL_SERVER_ERROR),
+        Ok(Err(e)) => validation(e),
+        Err(e) => internal(e),
     }
 }
 
@@ -83,12 +78,8 @@ pub async fn select_agent_flow(
         .await;
     match result {
         Ok(Ok(lib)) => Json(flow_payload(&lib)).into_response(),
-        Ok(Err(e)) => Json(json!({ "error": e }))
-            .into_response()
-            .with_status(StatusCode::BAD_REQUEST),
-        Err(e) => Json(json!({ "error": e }))
-            .into_response()
-            .with_status(StatusCode::INTERNAL_SERVER_ERROR),
+        Ok(Err(e)) => validation(e),
+        Err(e) => internal(e),
     }
 }
 
@@ -107,11 +98,7 @@ pub async fn delete_agent_flow(
         .await;
     match result {
         Ok(Ok(lib)) => Json(flow_payload(&lib)).into_response(),
-        Ok(Err(e)) => Json(json!({ "error": e }))
-            .into_response()
-            .with_status(StatusCode::BAD_REQUEST),
-        Err(e) => Json(json!({ "error": e }))
-            .into_response()
-            .with_status(StatusCode::INTERNAL_SERVER_ERROR),
+        Ok(Err(e)) => validation(e),
+        Err(e) => internal(e),
     }
 }

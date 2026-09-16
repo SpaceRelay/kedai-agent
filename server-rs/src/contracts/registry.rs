@@ -4,28 +4,42 @@
 // SQLite,每轮生成都重新 collect 成本高;注册表首次使用时提取并缓存,后续 O(1) 命中。
 // 作者改卡/改世界书后由 API 写路径调用 invalidate/clear 失效,下次生成重新提取
 // (修复「改卡后引擎用旧契约直到重启」的脏缓存问题)。
+//
+// 依赖倒置(批次 B.6 L1 去渗透):本模块不再 import CharacterService/WorldBookService
+// 具体类型,改为接收两个「取数据」闭包(角色卡 data_raw / 绑定世界书条目),
+// 闭包由 L2(api/app_state)注入。注册表只依赖 L1 数据形态(Value / WorldEntry / Contract)。
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use super::{extract_from_character_card, extract_from_world_entries, Contract};
-use crate::services::character_service::CharacterService;
-use crate::services::world_book_service::WorldBookService;
+use crate::parsing::world_book::WorldEntry;
+use serde_json::Value;
+
+/// 角色卡契约源:character_id → 角色卡 data_raw(取不到返回 None)
+type CharacterSource = dyn Fn(&str) -> Option<Value> + Send + Sync;
+/// 世界书契约源:character_id → 绑定该角色且启用的世界书条目(可为空)
+type WorldBookSource = dyn Fn(&str) -> Vec<WorldEntry> + Send + Sync;
 
 /// 契约注册表(character_id → Contract)。
 ///
 /// 引擎与多步工具共享同一实例(经 AppState 构造注入),保证缓存一致;
 /// 提取逻辑只在注册表内实现一份(此前引擎与 multistep 各持一份会漂移)。
 pub struct ContractRegistry {
-    characters: Arc<CharacterService>,
-    world_books: Arc<WorldBookService>,
+    characters: Arc<CharacterSource>,
+    world_books: Arc<WorldBookSource>,
     cache: Mutex<HashMap<String, Contract>>,
 }
 
 impl ContractRegistry {
-    pub fn new(characters: Arc<CharacterService>, world_books: Arc<WorldBookService>) -> Self {
+    /// 以两个取数据闭包构造(批次 B.6):注册表不感知服务类型,只消费数据。
+    pub fn new<C, W>(characters: C, world_books: W) -> Self
+    where
+        C: Fn(&str) -> Option<Value> + Send + Sync + 'static,
+        W: Fn(&str) -> Vec<WorldEntry> + Send + Sync + 'static,
+    {
         ContractRegistry {
-            characters,
-            world_books,
+            characters: Arc::new(characters),
+            world_books: Arc::new(world_books),
             cache: Mutex::new(HashMap::new()),
         }
     }
@@ -52,12 +66,12 @@ impl ContractRegistry {
 
     /// 两源提取:角色卡 data_raw.extensions.nlkaleido 优先,世界书条目兜底。
     fn extract(&self, character_id: &str) -> Option<Contract> {
-        let card = self.characters.get(character_id)?;
-        let card_contract = extract_from_character_card(card.data_raw.as_ref()?);
+        let card = (self.characters)(character_id)?;
+        let card_contract = extract_from_character_card(&card);
         if card_contract.is_some() {
             return card_contract;
         }
-        let entries = self.world_books.collect_entries_for_character(character_id);
+        let entries = (self.world_books)(character_id);
         extract_from_world_entries(&entries)
     }
 
@@ -79,24 +93,39 @@ impl ContractRegistry {
 mod tests {
     use super::*;
     use crate::models::db::Db;
+    use crate::utils::test_support::TempDataDir;
+    use rusqlite::OptionalExtension;
     use serde_json::json;
-    use std::path::PathBuf;
+    use std::sync::Arc;
 
-    fn services() -> (
+    /// 首项为临时目录守卫:解构绑定按**逆序**析构,守卫在前才活到最后(见 test_support 模块头)
+    type TestLoaders = (
+        TempDataDir,
         Arc<Db>,
-        Arc<CharacterService>,
-        Arc<WorldBookService>,
-        PathBuf,
-    ) {
-        let dir = std::env::temp_dir().join(format!("kedai-reg-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
+        Box<dyn Fn(&str) -> Option<Value> + Send + Sync>,
+        Box<dyn Fn(&str) -> Vec<WorldEntry> + Send + Sync>,
+    );
+
+    /// 直接用 Db 构造两个取数据闭包:角色卡 data_raw 直查,世界书源本轮不涉及
+    /// (注册表单测只覆盖角色卡提取与缓存语义)→ 空列表。生产注入见 api/app_state.rs。
+    fn services() -> TestLoaders {
+        let dir = TempDataDir::new("reg");
         let db = Arc::new(Db::open(&dir.join("t.db"), &dir).unwrap());
-        (
-            db.clone(),
-            Arc::new(CharacterService::new(db.clone(), dir.clone())),
-            Arc::new(WorldBookService::new(db)),
-            dir,
-        )
+        let db_for_cards = db.clone();
+        let characters = move |id: &str| -> Option<Value> {
+            let conn = db_for_cards.read().ok()?;
+            conn.query_row(
+                "SELECT data_raw FROM characters WHERE id = ?1",
+                rusqlite::params![id],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()
+            .ok()
+            .flatten()
+            .and_then(|s| serde_json::from_str(&s).ok())
+        };
+        let world_books = |_id: &str| -> Vec<WorldEntry> { Vec::new() };
+        (dir, db, Box::new(characters), Box::new(world_books))
     }
 
     fn contract_json(id: &str) -> String {
@@ -126,7 +155,7 @@ mod tests {
     /// (「脏缓存」bug 的回归测试)
     #[test]
     fn load_caches_until_invalidated() {
-        let (db, characters, world_books, _dir) = services();
+        let (_dir, db, characters, world_books) = services();
         upsert_character(&db, "c1", Some(&contract_json("v1")));
         let reg = ContractRegistry::new(characters, world_books);
 
@@ -144,7 +173,7 @@ mod tests {
     /// 无契约角色 → None 且不缓存;添加契约后(无需失效)即可加载到。
     #[test]
     fn no_contract_not_cached_and_later_add_works() {
-        let (db, characters, world_books, _dir) = services();
+        let (_dir, db, characters, world_books) = services();
         upsert_character(&db, "c2", None);
         let reg = ContractRegistry::new(characters, world_books);
 
@@ -157,7 +186,7 @@ mod tests {
     /// clear 清空全部(全局世界书变更场景)。
     #[test]
     fn clear_drops_all_entries() {
-        let (db, characters, world_books, _dir) = services();
+        let (_dir, db, characters, world_books) = services();
         upsert_character(&db, "c3", Some(&contract_json("v1")));
         let reg = ContractRegistry::new(characters, world_books);
         assert!(reg.load("c3").is_some());
@@ -169,7 +198,7 @@ mod tests {
     /// 不存在的角色 → None。
     #[test]
     fn missing_character_returns_none() {
-        let (_db, characters, world_books, _dir) = services();
+        let (_dir, _db, characters, world_books) = services();
         let reg = ContractRegistry::new(characters, world_books);
         assert!(reg.load("ghost").is_none());
     }

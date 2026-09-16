@@ -14,6 +14,8 @@ pub(super) struct GenerateRequest {
     /// 回执通道:tokio oneshot 无同步等待 API,std mpsc 的 recv 阻塞等在任何
     /// 线程上都安全;调度任务终止(引擎关闭/抢占/运行时退出)时发送端随请求
     /// drop,recv 立即返回 RecvError,handler 转为明确错误而非悬挂。
+    /// 脚本桥(TavernHelper.generate)对外契约是字符串错误(JS 侧无法消费分类),
+    /// 故调度结果在此落回文案;分类信息仅用于引擎/任务侧的错误终态。
     reply: std::sync::mpsc::Sender<Result<(String, TokenUsage), String>>,
 }
 
@@ -32,8 +34,12 @@ async fn generate_dispatch_loop(
             abort,
             reply,
         } = req;
-        let conn = connector.read().await;
-        let chunks = conn.generate(&messages, params, abort).await;
+        let conn = connector.read().await.clone();
+        // 分类在此落回文案:脚本桥的对外契约是字符串错误(见 GenerateRequest.reply 注释)
+        let chunks = conn
+            .generate(&messages, params, abort)
+            .await
+            .map_err(|e| e.message().to_string());
         drop(conn);
         let result = chunks.map(|chunks| {
             let mut out = String::new();
@@ -90,6 +96,7 @@ fn generate_handler_from_tx(
         })?;
         // 阻塞等回执:std mpsc recv;调度任务终止时发送端 drop → RecvError
         // → 明确错误,不悬挂。
+        // (有意丢弃 RecvError 本身:其原因即「发送端已 drop」,文案已等价表达)
         reply_rx
             .recv()
             .map_err(|_| "generate 调度循环异常终止,未返回生成结果".to_string())?
@@ -180,23 +187,63 @@ impl AgentEngine {
     /// 依次收集「全局脚本」与「角色卡脚本」的启用脚本,串行执行;
     /// 脚本经 TavernHelper 兼容桥写回共享 scopes(global/character/script 等),
     /// 由调用方收尾 take_others 统一落库。执行失败仅记日志,不影响主流程。
+    ///
+    /// **角色卡脚本授权门(2026-09-14,补 known-limitations L12)**:角色卡脚本来自网络、
+    /// 属不可信输入,能力上可写变量/导入数据/发起生成并落库。此前后端无门槛
+    /// (前端沙箱要授权、后端自动跑,授权不对称)。现改为 **fail-closed**:
+    /// 只有台账存有「与当前脚本内容一致的哈希」才执行,否则跳过并告警。
+    /// 门禁粒度为**整张卡**:卡更新脚本 → 哈希变 → 旧授权失效,需重新授权
+    /// (有意的兼容性收紧,已登记)。
     pub(super) async fn run_character_scripts(
         &self,
         character_id: &str,
         scopes: &Arc<Mutex<crate::parsing::scopes::ScopeVars>>,
     ) {
-        // 全局脚本(scope=global,owner 恒为空)
+        // 全局脚本(scope=global,owner 恒为空):**用户自有内容,视为可信**,不走授权门。
         let mut all: Vec<crate::scripts::loader::LoadedScript> = Vec::new();
         if let Ok(g) = self.user_scripts.get_tree("global", "") {
             all.extend(crate::scripts::loader::collect_enabled_scripts(&g));
         }
-        // 角色卡脚本(含旧字段迁移;角色不存在/无脚本树 → 跳过)
-        if let Ok(t) = self.user_scripts.get_character(character_id) {
-            all.extend(crate::scripts::loader::collect_enabled_scripts(&t));
+        // 角色卡脚本(含旧字段迁移;角色不存在/无脚本树 → 跳过)——受授权门约束
+        let card_scripts = match self.user_scripts.get_character(character_id) {
+            Ok(t) => crate::scripts::loader::collect_enabled_scripts(&t),
+            Err(_) => Vec::new(),
+        };
+        if !card_scripts.is_empty() {
+            if self
+                .script_authorizations
+                .is_authorized(character_id, &card_scripts)
+            {
+                all.extend(card_scripts);
+            } else {
+                tracing::warn!(
+                    character_id = character_id,
+                    scripts = card_scripts.len(),
+                    "角色卡脚本未授权,已跳过执行(前端需重新授权;见 known-limitations L12)"
+                );
+            }
         }
         if all.is_empty() {
             return;
         }
+        // 脚本数量上限:角色卡属不可信输入,可挂载大量脚本(每个都新建 quickjs Runtime)。
+        // 超限截断并告警,避免单张卡用「脚本海」耗尽 CPU/内存(与 EJS 循环预算同属
+        // 「不可信输入的资源边界」)。
+        const MAX_SCRIPTS_PER_RUN: usize = 32;
+        if all.len() > MAX_SCRIPTS_PER_RUN {
+            tracing::warn!(
+                character_id = character_id,
+                total = all.len(),
+                limit = MAX_SCRIPTS_PER_RUN,
+                "脚本数量超上限,已截断执行"
+            );
+            all.truncate(MAX_SCRIPTS_PER_RUN);
+        }
+        // 单脚本墙钟上限:runtime 内部的协作式中断(缺省 1s)对**阻塞在 native 闭包**里
+        // 的脚本无效(如 generate 等 LLM 回执),故在调度侧再加一层硬超时。
+        // 注意:spawn_blocking 的线程无法被取消——超时只保证「调用方不再等待」,
+        // 该线程会自然结束后回收;这是 tokio 的既有约束,故同时用数量上限控制并发面。
+        const SCRIPT_WALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
         let opts = crate::scripts::runtime::EvalOptions::default();
         // 阶段六 6g:生成/导入处理器在循环外构建一次(捕获最小依赖:connector 与各
         // service 的 Arc clone),所有脚本共享同一份接线。
@@ -213,13 +260,23 @@ impl AgentEngine {
                 .with_imports(import_handler.clone());
             let source = script.content.clone();
             let opts = opts.clone();
-            let outcome = tokio::task::spawn_blocking(move || {
-                crate::scripts::runtime::eval_with_bridge(&source, &opts, &bridge)
-            })
+            // 硬超时包裹:内部协作式中断拦不住阻塞在 native 闭包的脚本,此处兜住调用方
+            // (超时后不再等待;阻塞线程自然结束后回收——见上方 SCRIPT_WALL_TIMEOUT 注释)。
+            let outcome = match tokio::time::timeout(
+                SCRIPT_WALL_TIMEOUT,
+                tokio::task::spawn_blocking(move || {
+                    crate::scripts::runtime::eval_with_bridge(&source, &opts, &bridge)
+                }),
+            )
             .await
-            .unwrap_or_else(|_| {
-                crate::scripts::runtime::EvalOutcome::Error("脚本执行任务被取消".into())
-            });
+            {
+                Ok(joined) => joined.unwrap_or_else(|_| {
+                    crate::scripts::runtime::EvalOutcome::Error("脚本执行任务被取消".into())
+                }),
+                Err(_elapsed) => crate::scripts::runtime::EvalOutcome::Error(
+                    "脚本执行超出墙钟上限(5 秒),已放弃等待".into(),
+                ),
+            };
             if let crate::scripts::runtime::EvalOutcome::Error(msg) = outcome {
                 tracing::warn!(
                     character_id = character_id.to_string(),

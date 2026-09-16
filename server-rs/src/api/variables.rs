@@ -5,10 +5,9 @@
 // - PUT:整树覆写(scope=chat 内部走 save_assistant_vars,保持既有路径)。
 // - PATCH:对指定作用域应用 JSON Patch 子集(复用 AssistantVars::apply_patches 校验)。
 use crate::api::app_state::AppState;
-use crate::api::{db_err, WithStatus};
+use crate::api::{db_err, internal, not_found, validation};
 use crate::parsing::scopes::Scope;
 use axum::extract::{Query, State};
-use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::Deserialize;
@@ -44,24 +43,6 @@ fn resolve_scope(q: &VariablesQuery) -> Option<Scope> {
     }
 }
 
-fn bad_request(msg: &str) -> Response {
-    Json(json!({ "error": msg }))
-        .into_response()
-        .with_status(StatusCode::BAD_REQUEST)
-}
-
-fn not_found(msg: &str) -> Response {
-    Json(json!({ "error": msg }))
-        .into_response()
-        .with_status(StatusCode::NOT_FOUND)
-}
-
-fn internal_error(msg: &str) -> Response {
-    Json(json!({ "error": msg }))
-        .into_response()
-        .with_status(StatusCode::INTERNAL_SERVER_ERROR)
-}
-
 /// GET /api/variables?session_id=&scope=&scope_id=:读指定作用域整树。
 /// scope 缺省 = chat(既有语义);message 回退链:scope_variables 镜像 → 消息 extra.mvu。
 pub async fn get_variables(
@@ -69,10 +50,10 @@ pub async fn get_variables(
     Query(q): Query<VariablesQuery>,
 ) -> Response {
     let Some(sid) = q.session_id.as_deref() else {
-        return bad_request("缺少 session_id 查询参数");
+        return validation("缺少 session_id 查询参数");
     };
     let Some(scope) = resolve_scope(&q) else {
-        return bad_request("scope 须为 global|chat|character|preset|message|script|extension");
+        return validation("scope 须为 global|chat|character|preset|message|script|extension");
     };
     let sid_owned = sid.to_string();
     let scope_id = q.scope_id.clone().unwrap_or_default();
@@ -123,7 +104,7 @@ pub async fn put_variables(
     let scope = match body.scope.as_deref().and_then(Scope::from_str) {
         Some(s) => s,
         None => {
-            return bad_request("scope 须为 global|chat|character|preset|message|script|extension")
+            return validation("scope 须为 global|chat|character|preset|message|script|extension")
         }
     };
     let scope_id = body.scope_id.clone().unwrap_or_default();
@@ -154,7 +135,7 @@ pub async fn put_variables(
     match written {
         Err(e) => return db_err(&e),
         Ok(None) => return not_found("会话不存在"),
-        Ok(Some(Err(e))) => return internal_error(&e),
+        Ok(Some(Err(e))) => return internal(&e),
         Ok(Some(Ok(()))) => {}
     }
     Json(json!({ "ok": true })).into_response()
@@ -171,11 +152,11 @@ pub async fn patch_variables(
     let scope = match body.scope.as_deref().and_then(Scope::from_str) {
         Some(s) => s,
         None => {
-            return bad_request("scope 须为 global|chat|character|preset|message|script|extension")
+            return validation("scope 须为 global|chat|character|preset|message|script|extension")
         }
     };
     let Some(ops) = crate::parsing::assistant::parse_patch_array(&body.data) else {
-        return bad_request("patch 须为 JSON Patch 数组(replace/set/insert/delta/remove/move)");
+        return validation("patch 须为 JSON Patch 数组(replace/set/insert/delta/remove/move)");
     };
     let scope_id = body.scope_id.clone().unwrap_or_default();
     // 存在性校验 + 读树 + 应用 patch + 写回(含 chat 镜像)合并进同一阻塞任务(DB 并发改造);
@@ -212,8 +193,8 @@ pub async fn patch_variables(
     match patched {
         Err(e) => return db_err(&e),
         Ok(None) => return not_found("会话不存在"),
-        Ok(Some(Err((true, e)))) => return bad_request(&e),
-        Ok(Some(Err((false, e)))) => return internal_error(&e),
+        Ok(Some(Err((true, e)))) => return validation(&e),
+        Ok(Some(Err((false, e)))) => return internal(&e),
         Ok(Some(Ok(()))) => {}
     }
     Json(json!({ "ok": true })).into_response()

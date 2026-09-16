@@ -3,15 +3,12 @@
 // 本模块只做纯函数提取(顶层 script + 文件夹内 script,按 enabled 过滤),便于引擎接线。
 use serde_json::Value;
 
-/// 已装载的脚本执行体(供 3b-3 引擎触发)
-#[derive(Debug, Clone, PartialEq)]
-pub struct LoadedScript {
-    pub id: String,
-    pub name: String,
-    pub content: String,
-    /// script 作用域变量(data)
-    pub data: Value,
-}
+/// 已装载的脚本执行体**已下沉到 L1**（`crate::models::types::LoadedScript`，2026-09-14）。
+///
+/// 理由：L2 的 `services::script_authorization_service` 需要它算哈希；若留在本模块（L3），
+/// 即构成 `L2→L3` 越代依赖（规则 J 实测检出）。纯数据形状、无行为，归 L1 最合适。
+/// 此处仅重导出，保持本模块与既有调用方的 `use` 路径不变。
+pub use crate::models::types::LoadedScript;
 
 /// 按 ScriptTree 提取启用脚本:顶层 script 直接计入;folder 取其 scripts 内启用 script。
 pub fn collect_enabled_scripts(trees: &Value) -> Vec<LoadedScript> {

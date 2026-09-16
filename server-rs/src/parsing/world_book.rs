@@ -5,6 +5,54 @@
 // 条目字段同时兼容 camelCase(ST 新格式:keys/uid/disable)与 snake_case(角色卡:keys/id/enabled)。
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
+
+/// 正则编译缓存(2026-09-14 性能修复)。
+///
+/// 背景:`entry_matches_texts` 的 use_regex 分支此前**每次调用都现场**
+/// `RegexBuilder::new(pat).build()`。正则编译是重量级操作,而世界书条目每轮生成
+/// 都要匹配一次——实测(release,真实角色卡 54 条条目)纯正则编译耗时 **9.293 ms/轮**,
+/// 而编译后的匹配本身仅 **0.026 ms**,即 99.7% 的时间花在重复编译上。
+///
+/// 设计取舍:不在 `WorldEntry` 上加预编译字段——该结构派生 Serialize/Deserialize/
+/// PartialEq 且有十余处构造点(含跨模块测试),加字段会牵动面过大。正则编译结果
+/// 完全由 `(pattern, case_insensitive)` 决定,故用进程级缓存即可,零结构改动、零调用点改动。
+/// 容量上限防病态增长(世界书条目是静态数据,实际条目数在数百量级)。
+const REGEX_CACHE_CAP: usize = 4096;
+
+type RegexCache = Mutex<HashMap<(String, bool), Option<Arc<regex::Regex>>>>;
+
+fn regex_cache() -> &'static RegexCache {
+    static CACHE: OnceLock<RegexCache> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// 按 (pattern, 大小写敏感) 取编译后的正则;编译失败返回 None 并缓存该结果
+/// (与既有「编译失败跳过该 pattern、不拖垮整条目」容错语义一致;失败也缓存,
+/// 避免每轮对同一坏模式重复尝试编译)。
+fn compile_regex_cached(pattern: &str, case_sensitive: bool) -> Option<Arc<regex::Regex>> {
+    let key = (pattern.to_string(), case_sensitive);
+    let cache = regex_cache();
+    if let Ok(guard) = cache.lock() {
+        if let Some(hit) = guard.get(&key) {
+            return hit.clone();
+        }
+    }
+    let compiled = regex::RegexBuilder::new(pattern)
+        .case_insensitive(!case_sensitive)
+        .build()
+        .ok()
+        .map(Arc::new);
+    if let Ok(mut guard) = cache.lock() {
+        if guard.len() >= REGEX_CACHE_CAP {
+            // 简单清空而非 LRU:条目数远超需求,清空后重建代价可忽略
+            guard.clear();
+        }
+        guard.insert(key, compiled.clone());
+    }
+    compiled
+}
 
 /// 规范化后的世界书条目(可序列化供 API 返回)
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -31,9 +79,14 @@ pub struct WorldEntry {
     pub enabled: bool,
     /// 注入位置权重(0=before_char ... 4=after_char;本项目统一并入 system,仅用于排序)
     pub position: i64,
-    /// 扫描深度(ST depth):从最新消息往前扫最近 N 条(0 = 全部历史)
+    /// 插入深度(ST `depth` / `extensions.depth`):position=atDepth 时从末尾算注入位置。
+    /// **不是关键词扫描窗口**——扫描窗口见 `scan_depth`。
     #[serde(default = "default_depth")]
     pub depth: i64,
+    /// 关键词扫描窗口(ST `scanDepth` / `extensions.scan_depth`):只扫最近 N 条
+    /// (0 = 全部历史)。None = 条目未声明,由调用方按场景给兜底(见 `scan_window_len`)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scan_depth: Option<i64>,
     /// 注入顺序(ST order / insertion_order):同 position 内的条目先后
     #[serde(default = "default_order")]
     pub order: i64,
@@ -327,11 +380,21 @@ fn normalize_entry(v: &Value) -> Option<WorldEntry> {
     let position = read_position(v);
     // 扫描深度(ST depth;数字)。角色卡导出常把 depth 放在 extensions 内
     // (与 probability 同一形态,见下方),顶层优先、extensions 兜底。
+    // 注意:这是**插入深度**(position=atDepth 用),不是关键词扫描窗口。
     let depth = v
         .get("depth")
         .or_else(|| v.get("extensions").and_then(|e| e.get("depth")))
         .and_then(|d| d.as_i64())
         .unwrap_or(default_depth());
+    // 关键词扫描窗口:ST 的 scanDepth(角色卡落在 extensions.scan_depth)。
+    // 与 depth 是**两个字段**,不可互换(2026-09-14 吸血鬼卡「丢格式」根因:
+    // 格式条目 extensions.depth=1 曾被当成扫描窗口,窗口收窄到 1 条 →
+    // 带触发词的 chat_history 永不命中 → 响应格式规范不注入)。
+    let scan_depth = v
+        .get("scan_depth")
+        .or_else(|| v.get("scanDepth"))
+        .or_else(|| v.get("extensions").and_then(|e| e.get("scan_depth")))
+        .and_then(|d| d.as_i64());
     // 注入顺序:order(ST) / insertion_order(originalData);缺省 100
     let order = v
         .get("order")
@@ -373,6 +436,7 @@ fn normalize_entry(v: &Value) -> Option<WorldEntry> {
         enabled,
         position,
         depth,
+        scan_depth,
         order,
         case_sensitive,
         sticky,
@@ -450,6 +514,25 @@ fn read_field_list(v: &Value, fields: &[&str]) -> Vec<String> {
     Vec::new()
 }
 
+/// 关键词扫描窗口长度(主引擎与 generate-raw 共用,避免两侧口径漂移)。
+///
+/// ST 语义:窗口由条目 `scanDepth`(角色卡 `extensions.scan_depth`)决定;
+/// `depth`(`extensions.depth`)是**插入深度**,只在 `position=atDepth` 时生效,
+/// 不能当扫描窗口用——混用会把窗口错误收窄(2026-09-14 吸血鬼卡「丢格式」根因:
+/// 响应格式条目 extensions.depth=1 被误当窗口 → 带 `system log` 触发词的
+/// chat_history 落在窗口外 → 格式规范不注入 → 卡片 JSON 解析失败)。
+///
+/// `texts_len` 为可扫描消息条数;条目未声明 scan_depth 时用 `fallback`
+/// (<=0 表示不限制 = 全部)。返回实际窗口长度,恒不超过 `texts_len`。
+pub fn scan_window_len(e: &WorldEntry, texts_len: usize, fallback: i64) -> usize {
+    let depth = e.scan_depth.unwrap_or(fallback);
+    if depth <= 0 {
+        texts_len
+    } else {
+        (depth as usize).min(texts_len)
+    }
+}
+
 /// 条目内容匹配判定(主引擎与 generate-raw 共用):
 /// 在扫描窗口 texts(已按条目 depth 截取)内任一文本命中即 true。
 /// - use_regex=true:独立 regex 字段优先;否则按 ST 语义把 keys/keys_secondary 当正则逐个编译,
@@ -475,12 +558,11 @@ pub fn entry_matches_texts(e: &WorldEntry, texts: &[String]) -> bool {
                 }
             }
         }
+        // 编译结果走进程级缓存(2026-09-14):此前每轮每 pattern 现场编译,
+        // 实测 9.293 ms/轮 → 缓存后 0.026 ms/轮(99.7% 的时间是重复编译)
         return patterns.iter().any(|pat| {
-            regex::RegexBuilder::new(pat)
-                .case_insensitive(!e.case_sensitive)
-                .build()
-                .map(|re| texts.iter().any(|m| re.is_match(m)))
-                .unwrap_or(false)
+            compile_regex_cached(pat, e.case_sensitive)
+                .is_some_and(|re| texts.iter().any(|m| re.is_match(m)))
         });
     }
     // (needle, 是否大小写敏感);keys + 副关键词并列命中,大小写敏感按条目设置
@@ -499,14 +581,21 @@ pub fn entry_matches_texts(e: &WorldEntry, texts: &[String]) -> bool {
     if needles.is_empty() {
         return false;
     }
+    let needs_lowered = needles.iter().any(|(_, sensitive)| !*sensitive);
+    // 大小写不敏感的消息侧只小写化**一次**(2026-09-14 修复):
+    // 此前在 needle 内层循环里对每条消息反复 to_lowercase(),
+    // 同一消息被小写化「needle 数」遍。实测 0.406 ms → 0.051 ms。
+    let lowered: Vec<String> = if needs_lowered {
+        texts.iter().map(|m| m.to_lowercase()).collect()
+    } else {
+        Vec::new()
+    };
     needles.iter().any(|(needle, sensitive)| {
-        texts.iter().any(|m| {
-            if *sensitive {
-                m.contains(needle)
-            } else {
-                m.to_lowercase().contains(needle)
-            }
-        })
+        if *sensitive {
+            texts.iter().any(|m| m.contains(needle.as_str()))
+        } else {
+            lowered.iter().any(|m| m.contains(needle.as_str()))
+        }
     })
 }
 
@@ -555,6 +644,9 @@ pub fn view_to_value(v: &crate::models::types::WorldBookEntryView) -> Value {
     m.insert("keysecondary".into(), serde_json::json!(v.keys_secondary));
     if let Some(r) = &v.regex {
         m.insert("regex".into(), serde_json::json!(r));
+    } else {
+        // 显式 null:合并时覆盖原始值,避免用户清空正则后旧值"复活"
+        m.insert("regex".into(), Value::Null);
     }
     m.insert("use_regex".into(), serde_json::json!(v.use_regex));
     m.insert("constant".into(), serde_json::json!(v.constant));
@@ -573,45 +665,89 @@ pub fn view_to_value(v: &crate::models::types::WorldBookEntryView) -> Value {
         "use_probability".into(),
         serde_json::json!(v.use_probability),
     );
+    // 角色卡惯用 secondary_keys、ST 惯用 keysecondary:两侧同写,避免原始键残留成"影子值"
+    m.insert("secondary_keys".into(), serde_json::json!(v.keys_secondary));
     if let Some(r) = &v.role {
         m.insert("role".into(), serde_json::json!(r));
+    } else {
+        m.insert("role".into(), Value::Null);
     }
     Value::Object(m)
 }
 
+/// 取条目 uid:兼容 uid / id(与 normalize_entry 同口径)
+fn value_uid(v: &Value) -> Option<i64> {
+    v.get("uid")
+        .or_else(|| v.get("id"))
+        .and_then(|x| x.as_i64())
+}
+
+/// 把视图字段叠加到原始条目对象上,**未承载的字段原样保留**(extensions、author 自定义键等)。
+///
+/// 原实现是整体替换条目对象 → 角色卡把 depth/role/scan_depth 写在 `extensions` 内时,
+/// 任何一次编辑保存都会静默抹掉这些字段(与本节注释承诺的「保留」不符);
+/// 抹掉后就退化成缺省值,世界书触发行为随之改变。
+fn overlay_view(original: Option<&Value>, view_json: Value) -> Value {
+    let mut base = original
+        .and_then(|o| o.as_object())
+        .cloned()
+        .unwrap_or_default();
+    if let Some(fields) = view_json.as_object() {
+        for (k, v) in fields {
+            base.insert(k.clone(), v.clone());
+        }
+    }
+    Value::Object(base)
+}
+
 /// 写回条目数组:entries 为对象 map 时按 uid 替换/追加并**删除已移除的条目**,
 /// 数组时整组替换(维持 id 稳定排序)。
+///
+/// 更新是**字段叠加**而非整体替换:视图未承载的原始字段(角色卡 `extensions` 里的
+/// depth/scan_depth/role、作者自定义键等)原样保留。整体替换会静默抹掉 `extensions`,
+/// 让 depth/scan_depth 退回缺省值,世界书触发行为随之改变。
 pub fn merge_entries_into(
     entries_value: &mut Value,
     views: &[crate::models::types::WorldBookEntryView],
 ) {
-    let arr: Vec<Value> = views.iter().map(view_to_value).collect();
     if let Some(map) = entries_value.as_object_mut() {
         // 视图中的 uid 集合:仅这些条目保留/更新,其余条目(已在前端删除)一律移除
-        let view_uids: std::collections::HashSet<String> = arr
-            .iter()
-            .filter_map(|v| v.get("uid").and_then(|u| u.as_i64()).map(|u| u.to_string()))
-            .collect();
+        let view_uids: std::collections::HashSet<String> =
+            views.iter().map(|v| v.id.to_string()).collect();
         let keep: serde_json::Map<String, Value> = map
             .iter()
             .filter(|(k, _)| {
                 // 非条目字段(如 name)保留;数字键仅在仍属于视图集合时保留
-                !k.parse::<i64>().is_ok() || view_uids.contains(k.as_str())
+                k.parse::<i64>().is_err() || view_uids.contains(k.as_str())
             })
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
         let mut new_map = keep;
-        for v in arr {
-            let key = v
-                .get("uid")
-                .and_then(|u| u.as_i64())
-                .map(|u| u.to_string())
-                .unwrap_or_default();
-            new_map.insert(key, v);
+        for v in views {
+            // 叠加到原始条目对象(命中原始 map 时按 uid,其次按 id 键)
+            let key = v.id.to_string();
+            let original = new_map
+                .get(&key)
+                .cloned()
+                .or_else(|| map.get(&key).cloned());
+            let merged = overlay_view(original.as_ref(), view_to_value(v));
+            new_map.insert(key, merged);
         }
         *map = new_map;
     } else {
-        *entries_value = Value::Array(arr);
+        // 数组形态:按 uid 在原数组内叠加,保留原条目的未知字段
+        let originals: Vec<Value> = entries_value
+            .as_array()
+            .map(|a| a.to_vec())
+            .unwrap_or_default();
+        let merged: Vec<Value> = views
+            .iter()
+            .map(|v| {
+                let original = originals.iter().find(|o| value_uid(o) == Some(v.id));
+                overlay_view(original, view_to_value(v))
+            })
+            .collect();
+        *entries_value = Value::Array(merged);
     }
 }
 
@@ -885,6 +1021,81 @@ mod tests {
         assert!(entry_matches_texts(e3, &["hit-me".to_string()]));
     }
 
+    /// 正则编译缓存(2026-09-14):同模式重复匹配结果稳定一致,
+    /// 且大小写敏感与不敏感是两个独立缓存键(不得互相污染)。
+    #[test]
+    fn regex_cache_preserves_semantics_across_repeats() {
+        let mut insensitive = WorldEntry {
+            id: 1,
+            comment: String::new(),
+            keys: vec!["sys(tem)?\\s+log".into()],
+            keys_secondary: Vec::new(),
+            regex: None,
+            use_regex: true,
+            content: "x".into(),
+            constant: false,
+            enabled: true,
+            position: 0,
+            depth: 4,
+            scan_depth: None,
+            order: 100,
+            case_sensitive: false,
+            sticky: 0,
+            cooldown: 0,
+            probability: 100,
+            use_probability: false,
+            role: None,
+            decorators: Vec::new(),
+        };
+        // 重复调用应稳定命中(走缓存路径后语义不变)
+        for _ in 0..5 {
+            assert!(entry_matches_texts(&insensitive, &["SYSTEM  LOG".into()]));
+            assert!(!entry_matches_texts(&insensitive, &["无关".into()]));
+        }
+        // 同模式改为大小写敏感 → 独立缓存键,大写不再命中
+        insensitive.case_sensitive = true;
+        assert!(!entry_matches_texts(&insensitive, &["SYSTEM  LOG".into()]));
+        assert!(entry_matches_texts(&insensitive, &["sys log".into()]));
+    }
+
+    /// 大小写不敏感的非正则分支:消息侧小写化外提后语义必须与逐条转换一致
+    #[test]
+    fn substring_match_case_insensitive_semantics_unchanged() {
+        let mut e = WorldEntry {
+            id: 1,
+            comment: String::new(),
+            keys: vec!["KeyWord".into()],
+            keys_secondary: vec!["Second".into()],
+            regex: None,
+            use_regex: false,
+            content: "x".into(),
+            constant: false,
+            enabled: true,
+            position: 0,
+            depth: 4,
+            scan_depth: None,
+            order: 100,
+            case_sensitive: false,
+            sticky: 0,
+            cooldown: 0,
+            probability: 100,
+            use_probability: false,
+            role: None,
+            decorators: Vec::new(),
+        };
+        // 关键词大小写与消息大小写任意组合都应命中
+        assert!(entry_matches_texts(&e, &["xx keyword yy".into()]));
+        assert!(entry_matches_texts(&e, &["xx KEYWORD yy".into()]));
+        assert!(entry_matches_texts(&e, &["有 second 后缀".into()]));
+        // 副关键词同样生效
+        assert!(entry_matches_texts(&e, &["SECOND".into()]));
+        assert!(!entry_matches_texts(&e, &["都不含".into()]));
+        // 大小写敏感时只有精确大小写命中
+        e.case_sensitive = true;
+        assert!(entry_matches_texts(&e, &["xx KeyWord yy".into()]));
+        assert!(!entry_matches_texts(&e, &["xx keyword yy".into()]));
+    }
+
     /// 顶层导出格式:depth/order/case_sensitive/sticky/cooldown/probability 全部解析
     #[test]
     fn parses_full_st_fields() {
@@ -907,8 +1118,9 @@ mod tests {
     }
 
     /// 角色卡导出格式:depth/role 常落在 extensions 内(顶层无同名字段)。
-    /// 回归:赛马娘卡 95 条条目全部把 depth 放在 extensions,旧实现一律取缺省 4,
-    /// 导致 depth=1/2 的剧情条目被放宽到 4 条窗口误命中。
+    /// 回归:赛马娘卡 95 条条目全部把 depth 放在 extensions,旧实现一律取缺省 4。
+    /// 注意 depth 是**插入深度**(position=atDepth 用),解析值仍须忠实保留;
+    /// 关键词扫描窗口另由 scan_depth 承载(见 scan_depth_parsing)。
     #[test]
     fn parses_depth_and_role_from_extensions() {
         let raw = json!({
@@ -923,9 +1135,85 @@ mod tests {
         });
         let entries = collect_entries(&raw);
         assert_eq!(entries[0].depth, 2, "extensions.depth 生效");
-        assert_eq!(entries[0].role.as_deref(), Some("user"), "extensions.role 数字 1 → user");
-        assert_eq!(entries[1].depth, 0, "extensions.depth=0(全部历史)保留");
+        assert_eq!(
+            entries[0].role.as_deref(),
+            Some("user"),
+            "extensions.role 数字 1 → user"
+        );
+        assert_eq!(entries[1].depth, 0, "extensions.depth=0 保留");
         assert_eq!(entries[2].depth, 4, "两者都缺省回退 4");
+    }
+
+    /// 扫描窗口字段 scan_depth:兼容 ST 顶层 scanDepth / 角色卡 extensions.scan_depth;
+    /// 未声明为 None(由调用方按场景给兜底),与 depth 严格分离。
+    /// 回归:2026-09-14 吸血鬼卡格式条目 extensions.depth=1 曾被误当窗口,
+    /// 导致响应格式规范永不注入(卡片报「丢格式」)。
+    #[test]
+    fn scan_depth_parsing() {
+        let raw = json!({
+            "entries": [
+                { "uid": 1, "comment": "顶层 scan_depth", "keys": ["k"], "content": "c",
+                  "constant": false, "scan_depth": 2 },
+                { "uid": 2, "comment": "camelCase", "keys": ["k"], "content": "c",
+                  "constant": false, "scanDepth": 3 },
+                { "uid": 3, "comment": "ext", "keys": ["k"], "content": "c",
+                  "constant": false, "extensions": { "scan_depth": 5, "depth": 1 } },
+                { "uid": 4, "comment": "只有深度", "keys": ["k"], "content": "c",
+                  "constant": false, "extensions": { "depth": 1 } }
+            ]
+        });
+        let entries = collect_entries(&raw);
+        assert_eq!(entries[0].scan_depth, Some(2), "顶层 scan_depth 生效");
+        assert_eq!(entries[1].scan_depth, Some(3), "scanDepth 驼峰兼容");
+        assert_eq!(
+            entries[2].scan_depth,
+            Some(5),
+            "extensions.scan_depth 生效且与 depth=1 分离"
+        );
+        assert_eq!(entries[2].depth, 1, "同条目 depth 仍独立解析");
+        assert_eq!(
+            entries[3].scan_depth, None,
+            "只声明 depth 时 scan_depth 必须为 None,不得回退成 depth"
+        );
+    }
+
+    /// 扫描窗口长度:scan_depth 优先;未声明时用 fallback;0/负值 = 不限制(全部)
+    #[test]
+    fn scan_window_len_prefers_scan_depth() {
+        let mut e = WorldEntry {
+            id: 0,
+            comment: String::new(),
+            keys: Vec::new(),
+            keys_secondary: Vec::new(),
+            regex: None,
+            use_regex: false,
+            content: String::new(),
+            constant: false,
+            enabled: true,
+            position: 0,
+            depth: 1,
+            scan_depth: None,
+            order: 100,
+            case_sensitive: false,
+            sticky: 0,
+            cooldown: 0,
+            probability: 100,
+            use_probability: false,
+            role: None,
+            decorators: Vec::new(),
+        };
+        // 未声明:用调用方兜底(此处 0 = 全部)
+        assert_eq!(scan_window_len(&e, 7, 0), 7);
+        assert_eq!(scan_window_len(&e, 7, 2), 2, "兜底为正数时按窗口收窄");
+        // 声明 scan_depth:覆盖兜底
+        e.scan_depth = Some(3);
+        assert_eq!(scan_window_len(&e, 7, 0), 3);
+        // 0 = 全部
+        e.scan_depth = Some(0);
+        assert_eq!(scan_window_len(&e, 7, 2), 7);
+        // 超过可扫描条数时按条数封顶
+        e.scan_depth = Some(99);
+        assert_eq!(scan_window_len(&e, 7, 0), 7);
     }
 
     /// 顶层字段优先于 extensions(同一份导出两种形态并存时的优先级)
@@ -940,7 +1228,11 @@ mod tests {
         });
         let entries = collect_entries(&raw);
         assert_eq!(entries[0].depth, 5, "顶层 depth 优先");
-        assert_eq!(entries[0].role.as_deref(), Some("assistant"), "顶层 role 优先");
+        assert_eq!(
+            entries[0].role.as_deref(),
+            Some("assistant"),
+            "顶层 role 优先"
+        );
     }
 
     /// role 字符串形态与无法识别值:合法字符串归一,非法值退回 None(按位置语义取缺省)
@@ -955,7 +1247,11 @@ mod tests {
             ]
         });
         let entries = collect_entries(&raw);
-        assert_eq!(entries[0].role.as_deref(), Some("assistant"), "两侧空白归一");
+        assert_eq!(
+            entries[0].role.as_deref(),
+            Some("assistant"),
+            "两侧空白归一"
+        );
         assert!(entries[1].role.is_none(), "非法数字 → None");
         assert!(entries[2].role.is_none(), "非法字符串 → None");
         assert!(entries[3].role.is_none(), "缺省 → None");
@@ -1160,6 +1456,7 @@ mod tests {
             enabled: true,
             position: 0,
             depth: 4,
+            scan_depth: None,
             order: 100,
             case_sensitive: false,
             sticky: 0,
@@ -1207,6 +1504,7 @@ mod tests {
             enabled: true,
             position: 0,
             depth: 4,
+            scan_depth: None,
             order: 100,
             case_sensitive: false,
             sticky: 0,

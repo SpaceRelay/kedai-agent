@@ -1,5 +1,12 @@
 // 建表 SQL:与 Node 版(node:sqlite)建表完全一致,兼容现有 kedai.db(自 db.rs 迁入)
 
+/// 数据库 schema 版本(落盘于 SQLite `PRAGMA user_version`,即数据库头的 4 字节整数,
+/// 不需要额外表;方案见 docs/契约-架构与数据.md §四)。
+/// 0 = 未标记的旧库(与 SQLite 默认值一致,天然区分「从未写过版本」)。
+/// 写入时机在 `Db::open` 升级链**全部成功之后**;失败不抬版本,下次启动重跑补迁。
+/// 语义:库内值 > 本值 = 库由更新版本的 Kedai 写入 → `Db::open` 拒绝启动(宁可明确报错)。
+pub const SCHEMA_VERSION: i32 = 1;
+
 /// 全量建表语句(IF NOT EXISTS 幂等;含索引、种子行与表级注释)
 pub(super) const CREATE_TABLES: &str = r#"
 CREATE TABLE IF NOT EXISTS characters (
@@ -19,6 +26,9 @@ CREATE TABLE IF NOT EXISTS sessions (
   created_at   TEXT NOT NULL,
   updated_at   TEXT NOT NULL
 );
+-- 会话按角色列表查询(list_by_character:WHERE character_id ORDER BY updated_at DESC):
+-- 此前无索引 → 全表扫描 + 排序(2026-09-13 批次 3 补;旧库经 ensure_perf_indexes 补建)
+CREATE INDEX IF NOT EXISTS idx_sessions_character ON sessions(character_id, updated_at DESC);
 CREATE TABLE IF NOT EXISTS messages (
   id         INTEGER PRIMARY KEY AUTOINCREMENT,
   session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
@@ -81,7 +91,11 @@ CREATE TABLE IF NOT EXISTS agent_subtasks (
   result       TEXT NOT NULL DEFAULT '',
   error        TEXT NOT NULL DEFAULT '',
   created_at   TEXT NOT NULL,
-  updated_at   TEXT NOT NULL
+  updated_at   TEXT NOT NULL,
+  -- 终态(done/error/ended)首次达成时刻;pending/running 期间为空串。
+  -- 旧库经 migration::ensure_agent_subtasks_finished_at_column 幂等补列;
+  -- 必须列在表尾(ALTER ADD COLUMN 只能追加,列序要与之逐位一致,否则迁移元测试会抓)
+  finished_at  TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_subtasks_session ON agent_subtasks(session_id);
 -- 任务模式(task 工作台):任务主表 + 子任务表。
@@ -101,6 +115,9 @@ CREATE TABLE IF NOT EXISTS tasks (
   task_mode    TEXT NOT NULL DEFAULT 'legacy'
 );
 CREATE INDEX IF NOT EXISTS idx_tasks_created ON tasks(created_at);
+-- 任务列表按角色 / 状态过滤(2026-09-13 批次 3 补;旧库经 ensure_perf_indexes 补建)
+CREATE INDEX IF NOT EXISTS idx_tasks_character ON tasks(character_id);
+CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
 CREATE TABLE IF NOT EXISTS task_subtasks (
   id           TEXT PRIMARY KEY,
   task_id      TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
@@ -110,7 +127,10 @@ CREATE TABLE IF NOT EXISTS task_subtasks (
   result       TEXT NOT NULL DEFAULT '',
   error        TEXT NOT NULL DEFAULT '',
   created_at   TEXT NOT NULL,
-  updated_at   TEXT NOT NULL
+  updated_at   TEXT NOT NULL,
+  -- 终态首次达成时刻(与 agent_subtasks 同口径;legacy 路径的等价表,形状必须一致)。
+  -- 旧库经 migration::ensure_task_subtasks_finished_at_column 幂等补列,列在表尾
+  finished_at  TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_task_subtasks_task ON task_subtasks(task_id);
 -- 任务模式 token 用量:每次 LLM 调用(规划/步骤/汇总)一行;任务删除随外键级联清除。
@@ -166,6 +186,26 @@ CREATE TABLE IF NOT EXISTS task_messages (
   created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_task_messages_task ON task_messages(task_id, created_at);
+
+-- 命令执行审计(阶段 B/C):每次尝试执行(含被拒绝的)落一行,root/ADB 级命令
+-- 不可逆,这是唯一回溯依据。旧库由 migration::ensure_exec_audit_table 幂等建表;
+-- 注意:列定义处不得写行内注释(同 task_llm_calls 教训,跨库合并 schema 比对会误报)。
+CREATE TABLE IF NOT EXISTS exec_audit (
+  id             INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts             TEXT NOT NULL,
+  source         TEXT NOT NULL DEFAULT 'chat',
+  task_id        TEXT,
+  session_id     TEXT,
+  command        TEXT NOT NULL,
+  shell          TEXT NOT NULL DEFAULT '',
+  tier           TEXT NOT NULL DEFAULT 'sandbox',
+  risk           TEXT NOT NULL DEFAULT 'sensitive',
+  decision       TEXT NOT NULL DEFAULT 'allowed',
+  exit_code      INTEGER,
+  stdout_summary TEXT NOT NULL DEFAULT '',
+  stderr_summary TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_exec_audit_ts ON exec_audit(ts DESC);
 CREATE TABLE IF NOT EXISTS session_vars (
   session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
   key        TEXT NOT NULL,
@@ -356,6 +396,16 @@ CREATE TABLE IF NOT EXISTS undo_snapshots (
   created_at        TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_undo_snapshots_session ON undo_snapshots(session_id, created_at);
+
+-- 角色卡脚本授权台账(2026-09-14,known-limitations L12 后端授权门)。
+-- 语义:character_id → 该卡**当前被授权执行的脚本内容哈希**。
+-- 哈希绑定脚本正文,卡更新脚本后旧授权自动失效(与前端 localStorage 台账同一模型)。
+-- 默认无行 = 未授权 = 后端不执行该卡脚本(fail-closed);global 脚本属用户自有,不受此表约束。
+CREATE TABLE IF NOT EXISTS script_authorizations (
+  character_id  TEXT PRIMARY KEY,
+  script_hash   TEXT NOT NULL,
+  authorized_at TEXT NOT NULL
+);
 "#;
 
 /// 暴露建表 SQL 供迁移一致性测试比对(旧库 ALTER 补列后应与新建表 schema normalize 一致)

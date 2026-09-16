@@ -10,7 +10,18 @@ pub(super) struct Parser<'a> {
     pos: usize,
     /// 语句级解析错误(容错收集,不影响其余语句)
     pub(super) errors: Vec<String>,
+    /// 表达式递归深度(防深嵌套输入爆栈)。递增点见 parse_assign/parse_unary/parse_primary
+    /// —— 三者覆盖「二元链 / 一元链 / 原子链」全部递归路径,子 Parser 继承深度。
+    depth: usize,
 }
+
+/// 表达式嵌套深度上限。正常角色卡表达式嵌套在 10 层以内(成员链/下标走 parse_postfix
+/// 的循环,不计深度),64 层对真实模板绰绰有余。
+///
+/// 取值依据:每层嵌套要经过 parse_assign→…→parse_primary 约 13 个递归函数,且 debug
+/// 构建的栈帧很大;Rust 测试线程默认栈仅 2MB。取值过高会导致**守卫来不及触发就已爆栈**
+/// (实测 256 层即 1664 帧仍溢出),故取 64(约 400 余帧,release/debug 均安全)。
+const MAX_PARSE_DEPTH: usize = 64;
 
 impl<'a> Parser<'a> {
     pub(super) fn new(toks: &'a [Tok]) -> Self {
@@ -18,7 +29,32 @@ impl<'a> Parser<'a> {
             toks,
             pos: 0,
             errors: Vec::new(),
+            depth: 0,
         }
+    }
+
+    /// 以指定初始深度构造(子 token 流解析时继承父深度,防止 `((((...))))`
+    /// 或模板字符串嵌套通过新建 Parser 重置计数绕过限制)。
+    fn with_depth(toks: &'a [Tok], depth: usize) -> Self {
+        Parser {
+            toks,
+            pos: 0,
+            errors: Vec::new(),
+            depth,
+        }
+    }
+
+    /// 进入一层递归:超限即报错。配对 parse_assign_inner/parse_unary_inner/parse_primary_inner。
+    fn enter_depth(&mut self) -> Result<(), String> {
+        self.depth += 1;
+        if self.depth > MAX_PARSE_DEPTH {
+            return Err(format!("表达式嵌套过深(超过 {MAX_PARSE_DEPTH} 层)"));
+        }
+        Ok(())
+    }
+
+    fn leave_depth(&mut self) {
+        self.depth = self.depth.saturating_sub(1);
     }
 
     fn peek(&self) -> &Tok {
@@ -286,7 +322,15 @@ impl<'a> Parser<'a> {
         self.parse_assign()
     }
 
+    /// 赋值表达式(守卫点 ①:二元/右结合/三元链的递归枢纽)
     fn parse_assign(&mut self) -> Result<Expr, String> {
+        self.enter_depth()?;
+        let r = self.parse_assign_inner();
+        self.leave_depth();
+        r
+    }
+
+    fn parse_assign_inner(&mut self) -> Result<Expr, String> {
         let left = self.parse_cond()?;
         let assign = match self.peek() {
             Tok::P(P::Assign) => Some(AssignOp::Set),
@@ -438,7 +482,16 @@ impl<'a> Parser<'a> {
         Ok(left)
     }
 
+    /// 一元表达式(守卫点 ②:前缀 `!`/`-`/`+`/`++`/`--` 自递归链的枢纽)。
+    /// 若只守二元链而不守此处,`!!!!…x` 这类深一元链仍会爆栈。
     fn parse_unary(&mut self) -> Result<Expr, String> {
+        self.enter_depth()?;
+        let r = self.parse_unary_inner();
+        self.leave_depth();
+        r
+    }
+
+    fn parse_unary_inner(&mut self) -> Result<Expr, String> {
         match self.peek() {
             Tok::P(P::Bang) => {
                 self.next();
@@ -549,7 +602,15 @@ impl<'a> Parser<'a> {
         Ok(expr)
     }
 
+    /// 原子表达式(守卫点 ③:括号分组/数组/对象/模板等所有嵌套最终汇聚于此)
     fn parse_primary(&mut self) -> Result<Expr, String> {
+        self.enter_depth()?;
+        let r = self.parse_primary_inner();
+        self.leave_depth();
+        r
+    }
+
+    fn parse_primary_inner(&mut self) -> Result<Expr, String> {
         match self.next() {
             Tok::Num(n) => Ok(Expr::Literal(JsValue::Num(n))),
             Tok::Str(s) => Ok(Expr::Literal(JsValue::Str(s))),
@@ -561,8 +622,8 @@ impl<'a> Parser<'a> {
                         items.push(Expr::Literal(JsValue::Str(part.clone())));
                     }
                     if i < exprs.len() {
-                        // 用子 token 列表解析表达式
-                        let mut sub = Parser::new(&exprs[i]);
+                        // 用子 token 列表解析表达式(继承当前深度,防绕开深度上限)
+                        let mut sub = Parser::with_depth(&exprs[i], self.depth);
                         let e = sub.parse_assign()?;
                         items.push(e);
                     }
@@ -609,7 +670,7 @@ impl<'a> Parser<'a> {
                 // 尝试解析为箭头函数参数列表:括号内为 [name (= expr)?] 逗号分隔
                 let mut is_arrow = false;
                 {
-                    let mut probe = Parser::new(self.toks);
+                    let mut probe = Parser::with_depth(self.toks, self.depth);
                     probe.pos = self.pos;
                     let mut ok = true;
                     loop {

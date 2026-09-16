@@ -7,7 +7,7 @@
 //     iframe src 直嵌会显示「已阻止此内容」,服务端 fetch 不受此限制)
 //   - 安全:仅 https、SSRF 防护(复用 resolve_public_http_url:拒绝 localhost/私网/
 //     元数据地址)、绑定已解析 IP 防 DNS rebinding、禁用重定向、响应大小上限
-use crate::api::WithStatus;
+use crate::api::{err_with_code, ErrorCode};
 use crate::tools::agent_tools::resolve_public_http_url;
 use axum::extract::Query;
 use axum::http::StatusCode;
@@ -73,25 +73,34 @@ fn sniff_meta_charset(bytes: &[u8]) -> Option<String> {
     }
 }
 /// GET /api/resource/proxy?url=<https URL>
-/// 返回 { ok: true, html, base_url } 或 { ok: false, error }(带状态码)。
+/// 成功 `{ ok: true, html, base_url }`;失败 `{ ok: false, error, code }` + 真实状态码
+/// (批次 1 起统一带 code,不再出现「无 code 的裸 error」)。
 pub async fn proxy(Query(q): Query<ProxyQuery>) -> Response {
     let raw = q.url.trim();
     // 仅 https(作者资源页强制加密传输;http/javascript:/data: 一律拒绝)
     let parsed = match reqwest::Url::parse(raw) {
         Ok(u) if u.scheme() == "https" && u.host_str().is_some() => u,
         _ => {
-            return Json(json!({ "ok": false, "error": "仅支持 https 资源地址" }))
-                .into_response()
-                .with_status(StatusCode::BAD_REQUEST);
+            return err_with_code(
+                ErrorCode::Validation,
+                "仅支持 https 资源地址",
+                StatusCode::BAD_REQUEST,
+            );
         }
     };
     // SSRF 防护:拒绝 localhost / 私网 / 元数据地址
     let target = match resolve_public_http_url(raw).await {
         Ok(t) => t,
         Err(e) => {
-            return Json(json!({ "ok": false, "error": e }))
-                .into_response()
-                .with_status(StatusCode::BAD_REQUEST);
+            // 泄露封堵(批次 1):该解析器为**搜索工具**编写,错误串里既有「搜索端点」
+            // 这类错域措辞,DNS 失败分支还会拼 OS 原文(os error 11001),两者都不该
+            // 出现在资源卡片的用户提示里。原文只进日志,回给用户稳定文案。
+            tracing::warn!(error = %e, url = raw, "资源地址解析被拒");
+            return err_with_code(
+                ErrorCode::Validation,
+                "资源地址不可用,请确认其为公开可访问的 https 地址",
+                StatusCode::BAD_REQUEST,
+            );
         }
     };
     // 绑定已解析 IP(防 DNS rebinding)+ 禁用重定向(防跳到本地)+ 短超时
@@ -105,28 +114,41 @@ pub async fn proxy(Query(q): Query<ProxyQuery>) -> Response {
     let client = match builder.build() {
         Ok(c) => c,
         Err(e) => {
-            return Json(json!({ "ok": false, "error": format!("构建请求客户端失败: {e}") }))
-                .into_response()
-                .with_status(StatusCode::INTERNAL_SERVER_ERROR);
+            // 泄露封堵:reqwest 构建错误原文只进日志
+            tracing::error!(error = %e, "构建资源代理请求客户端失败");
+            return err_with_code(
+                ErrorCode::Internal,
+                "构建请求客户端失败,详情见服务端日志",
+                StatusCode::INTERNAL_SERVER_ERROR,
+            );
         }
     };
     let resp = match client.get(raw).send().await {
         Ok(r) => r,
         Err(e) => {
-            return Json(json!({ "ok": false, "error": format!("请求资源页失败: {e}") }))
-                .into_response()
-                .with_status(StatusCode::BAD_GATEWAY);
+            // 泄露封堵:上游连接错误原文(含 IP/端口/证书细节)只进日志
+            tracing::error!(error = %e, url = raw, "请求资源页失败");
+            return err_with_code(
+                ErrorCode::Upstream,
+                "请求资源页失败,请稍后重试",
+                StatusCode::BAD_GATEWAY,
+            );
         }
     };
     if resp.status().is_redirection() {
-        return Json(json!({ "ok": false, "error": "资源页重定向已禁用" }))
-            .into_response()
-            .with_status(StatusCode::BAD_GATEWAY);
+        return err_with_code(
+            ErrorCode::Upstream,
+            "资源页重定向已禁用",
+            StatusCode::BAD_GATEWAY,
+        );
     }
     if !resp.status().is_success() {
-        return Json(json!({ "ok": false, "error": format!("资源页返回 {}", resp.status()) }))
-            .into_response()
-            .with_status(StatusCode::BAD_GATEWAY);
+        // 上游状态码属用户可理解信息(404/403 等),保留但不带响应正文
+        return err_with_code(
+            ErrorCode::Upstream,
+            format!("资源页返回 {}", resp.status()),
+            StatusCode::BAD_GATEWAY,
+        );
     }
     // content-type 在 bytes() 消费 resp 前取出(charset 解码用)
     let resp_content_type = resp
@@ -137,15 +159,21 @@ pub async fn proxy(Query(q): Query<ProxyQuery>) -> Response {
     let bytes = match resp.bytes().await {
         Ok(b) => b,
         Err(e) => {
-            return Json(json!({ "ok": false, "error": format!("读取资源页失败: {e}") }))
-                .into_response()
-                .with_status(StatusCode::BAD_GATEWAY);
+            // 泄露封堵:读取中断原文只进日志
+            tracing::error!(error = %e, url = raw, "读取资源页失败");
+            return err_with_code(
+                ErrorCode::Upstream,
+                "读取资源页失败,请稍后重试",
+                StatusCode::BAD_GATEWAY,
+            );
         }
     };
     if bytes.len() > MAX_RESOURCE_BYTES {
-        return Json(json!({ "ok": false, "error": "资源页过大(超过 5MB)" }))
-            .into_response()
-            .with_status(StatusCode::BAD_GATEWAY);
+        return err_with_code(
+            ErrorCode::Upstream,
+            "资源页过大(超过 5MB)",
+            StatusCode::BAD_GATEWAY,
+        );
     }
     let html = decode_resource_html(&bytes, resp_content_type.as_deref());
     // 作者域名作为 base(srcdoc 内相对 CSS/JS/图片按作者域名解析)

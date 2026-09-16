@@ -1,4 +1,5 @@
 // SSE 增量解析:事件切分 / delta 聚合 / usage 解析(自 openai_compatible.rs 迁入)
+use crate::models::llm_error::{LlmError, LlmErrorKind};
 use crate::models::types::{LlmStreamChunk, ToolCallArgs};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -21,7 +22,7 @@ impl SseParser {
         &mut self,
         bytes: &[u8],
         out: &mut Vec<LlmStreamChunk>,
-    ) -> Result<(), String> {
+    ) -> Result<(), LlmError> {
         self.buffer.extend_from_slice(bytes);
         while let Some((end, separator_len)) = find_event_end(&self.buffer) {
             let event = self.buffer.drain(..end).collect::<Vec<_>>();
@@ -31,7 +32,7 @@ impl SseParser {
         Ok(())
     }
 
-    pub(super) fn finish(&mut self, out: &mut Vec<LlmStreamChunk>) -> Result<(), String> {
+    pub(super) fn finish(&mut self, out: &mut Vec<LlmStreamChunk>) -> Result<(), LlmError> {
         if !self.buffer.is_empty() {
             let event = std::mem::take(&mut self.buffer);
             self.parse_event(&event, out)?;
@@ -43,9 +44,9 @@ impl SseParser {
         self.done
     }
 
-    fn parse_event(&mut self, event: &[u8], out: &mut Vec<LlmStreamChunk>) -> Result<(), String> {
-        let text =
-            std::str::from_utf8(event).map_err(|e| format!("SSE 响应不是有效 UTF-8: {e}"))?;
+    fn parse_event(&mut self, event: &[u8], out: &mut Vec<LlmStreamChunk>) -> Result<(), LlmError> {
+        let text = std::str::from_utf8(event)
+            .map_err(|e| LlmError::generation(format!("SSE 响应不是有效 UTF-8: {e}")))?;
         let payload = text
             .lines()
             .filter_map(|line| {
@@ -72,10 +73,10 @@ impl SseParser {
                 self.bad_json_count += 1;
                 if self.bad_json_count >= MAX_BAD_JSON_EVENTS {
                     let sample: String = payload.chars().take(200).collect();
-                    return Err(format!(
+                    return Err(LlmError::generation(format!(
                         "上游返回过多非 JSON data 事件({} 个),疑似协议损坏: {sample}",
                         self.bad_json_count
-                    ));
+                    )));
                 }
                 return Ok(());
             }
@@ -87,11 +88,15 @@ impl SseParser {
                 .and_then(Value::as_str)
                 .unwrap_or("未知上游错误");
             let err_type = err.get("type").and_then(Value::as_str).unwrap_or("");
-            return Err(if err_type.is_empty() {
+            let text = if err_type.is_empty() {
                 format!("上游返回错误: {message}")
             } else {
                 format!("上游返回错误 [{err_type}]: {message}")
-            });
+            };
+            // 流内错误对象的分类取自上游**结构化字段** type/code(协议词汇),
+            // 不解析面向人的 message——HTTP 200 的流内报错此前靠文案子串才被判为
+            // 限流/鉴权,一律归 generation_failed 会让可重试的瞬时限流变成不可重试。
+            return Err(LlmError::new(classify_upstream_error_object(err), text));
         }
         // 合法 JSON 事件到来即重置连续计数
         self.bad_json_count = 0;
@@ -187,7 +192,7 @@ impl SseParser {
         Ok(())
     }
 
-    fn flush_tool_calls(&mut self, out: &mut Vec<LlmStreamChunk>) -> Result<(), String> {
+    fn flush_tool_calls(&mut self, out: &mut Vec<LlmStreamChunk>) -> Result<(), LlmError> {
         let mut calls: Vec<_> = self.pending_calls.drain().collect();
         calls.sort_by_key(|(index, _)| *index);
         // 完整性校验:index 重复时保留后写入的 id(OpenAI 规范同一 index 只应出现一次);
@@ -196,21 +201,23 @@ impl SseParser {
         for (_, call) in &calls {
             if !call.name.is_empty() {
                 if !call.id.is_empty() && seen_ids.contains_key(&call.id) {
-                    return Err(format!(
+                    return Err(LlmError::generation(format!(
                         "上游返回重复工具调用 id:{} (名称 {})",
                         call.id, call.name
-                    ));
+                    )));
                 }
                 if !call.id.is_empty() {
                     seen_ids.insert(call.id.clone(), ());
                 }
                 if !call.arguments.trim().is_empty() {
-                    serde_json::from_str::<Value>(&call.arguments).map_err(|_| {
-                        format!(
-                            "工具 \"{}\" 的 arguments 不是合法 JSON: {}",
+                    // 保留 serde 原错(含行列位置),否则「参数不是合法 JSON」只剩半截
+                    // 原文而无法判断是截断、转义还是编码问题
+                    serde_json::from_str::<Value>(&call.arguments).map_err(|e| {
+                        LlmError::generation(format!(
+                            "工具 \"{}\" 的 arguments 不是合法 JSON({e}): {}",
                             call.name,
                             call.arguments.chars().take(200).collect::<String>()
-                        )
+                        ))
                     })?;
                 }
             }
@@ -219,6 +226,34 @@ impl SseParser {
             (!call.name.is_empty()).then_some(LlmStreamChunk::ToolCall(call))
         }));
         Ok(())
+    }
+}
+
+/// 流内错误对象 → 分类:读上游**枚举化的** `error.type`/`error.code` 字段。
+///
+/// 这是协议字段翻译(OpenAI 兼容错误对象的既定词汇),不是对自由文案的子串猜测——
+/// 判定只发生在连接器边界,分类结果随错误向上层传递,上层不再解析文案。
+/// 无匹配时按可重试的上游故障处理(与 HTTP 5xx/连接中断同语义)。
+fn classify_upstream_error_object(err: &Value) -> LlmErrorKind {
+    let hint = ["type", "code"]
+        .iter()
+        .filter_map(|k| err.get(*k).and_then(Value::as_str))
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase();
+    // 判定顺序与批次 4.3 前的文案匹配保持一致:超时 > 限流 > 鉴权 > 其他
+    if hint.contains("timeout") {
+        LlmErrorKind::Timeout
+    } else if hint.contains("rate_limit") || hint.contains("too_many_requests") {
+        LlmErrorKind::RateLimited
+    } else if hint.contains("authentication")
+        || hint.contains("permission")
+        || hint.contains("unauthorized")
+        || hint.contains("invalid_api_key")
+    {
+        LlmErrorKind::AuthFailed
+    } else {
+        LlmErrorKind::Upstream
     }
 }
 

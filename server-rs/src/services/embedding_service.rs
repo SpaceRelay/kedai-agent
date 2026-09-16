@@ -40,13 +40,46 @@ pub struct EmbeddingService {
     client: reqwest::Client,
 }
 
+/// 进程级共享的 HTTP 客户端(2026-09-16 性能批次 P-5)。
+///
+/// 为什么共享:构造点遍布热路径(引擎每轮召回、记忆工具每次写、`/api/memory/distill`
+/// 与 `/api/memory/:id` 的循环内逐条),而 `EmbeddingService` 无内部状态、每次调用都从
+/// 设置读最新配置 —— 客户端没有任何「随实例变化」的状态。此前的 `new()` 每次新建
+/// reqwest Client,等于丢掉连接池与 keepalive,让每条 embedding 请求重做 TCP(+TLS)
+/// 握手;embedding 是「一轮对话一次 + 批量蒸馏多次」的高频调用,这笔握手成本很显眼。
+///
+/// 为什么安全:reqwest::Client 内部就是 `Arc<...>`,克隆/复用本就是其设计用法;
+/// 超时等 builder 选项是客户端级配置,与凭据无关(凭据走每次请求的 header),
+/// 故共享不会串号。
+static SHARED_CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+
+/// 请求超时:embedding 多为批量短请求,60s 足够,且避免挂死
+const EMBED_TIMEOUT_SECS: u64 = 60;
+
+/// 共享客户端被真正构造的次数(仅测试用)。
+/// reqwest::Client 不暴露内部地址,无法用指针比较证明「同一个客户端」;
+/// 改为计数**初始化次数**:若每次 new() 都新建,这个值会随构造次数增长。
+#[cfg(test)]
+static CLIENT_INIT_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn shared_client() -> reqwest::Client {
+    SHARED_CLIENT
+        .get_or_init(|| {
+            #[cfg(test)]
+            CLIENT_INIT_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            reqwest::Client::builder()
+                .timeout(Duration::from_secs(EMBED_TIMEOUT_SECS))
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new())
+        })
+        .clone()
+}
+
 impl EmbeddingService {
     pub fn new() -> Self {
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(60))
-            .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
-        EmbeddingService { client }
+        EmbeddingService {
+            client: shared_client(),
+        }
     }
 
     /// 校验配置可用性;返回规范化后的 (base_url, api_key, model, dim)
@@ -291,5 +324,72 @@ mod tests {
             EmbeddingService::resolve(&s2),
             Err(EmbedError::NotConfigured(_))
         ));
+    }
+
+    /// HTTP 客户端进程级复用(2026-09-16 性能批次 P-5)。
+    ///
+    /// 此前每次 `EmbeddingService::new()` 都新建 reqwest Client —— 而 `new()` 的调用点
+    /// 遍布热路径:引擎每轮召回一次(`agents/engine/mod.rs:249`)、记忆工具每次写一次、
+    /// `/api/memory/distill` 与 `/api/memory/:id` 甚至**在循环内逐条**新建
+    /// (`api/memory.rs`)。每次新建都丢掉连接池与 keepalive,等于每条请求重做
+    /// TCP(+TLS)握手;`EmbeddingService` 本身无状态(每次调用读最新配置),
+    /// 客户端完全可以共享。
+    ///
+    /// 断言方式:reqwest::Client 不暴露内部地址,故不做指针比较,而是数**真实构造次数**。
+    ///
+    /// 关键不变量是「反复构造 N 次,底层客户端仍只被构造 1 次」——若每次 new() 都新建,
+    /// 这个计数会涨到 N。写成「50 次构造后计数恰为 1」而非「计数不增长」,是为了
+    /// 不依赖测试执行顺序(本 crate 测试并行,别处可能已先行初始化过)。
+    #[test]
+    fn http_client_is_built_only_once_process_wide() {
+        for _ in 0..50 {
+            let _ = EmbeddingService::new();
+        }
+        let _ = EmbeddingService::default();
+        let n = CLIENT_INIT_COUNT.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            n, 1,
+            "51 次构造后共享客户端仍应只构造 1 次,实际 {n}(每次新建=每条请求重做 TCP 握手)"
+        );
+    }
+
+    /// 共享客户端仍可正常使用(复用不能把配置或可用性丢掉):
+    /// 未配置时 embed 必须直接返回 NotConfigured(降级语义不变),而不是网络错误。
+    #[test]
+    fn shared_client_is_usable() {
+        let svc = EmbeddingService::new();
+        let cfg = crate::config::AppConfig {
+            host: "127.0.0.1".into(),
+            port: 0,
+            data_dir: std::env::temp_dir(),
+            log_dir: std::env::temp_dir(),
+            web_dist: None,
+            connector: "mock".into(),
+            openai_base_url: "https://example.com/v1".into(),
+            openai_api_key: String::new(),
+            openai_model: "test-model".into(),
+            default_temperature: 0.8,
+            default_top_p: 0.9,
+            default_max_tokens: 1024,
+            default_max_context_tokens: 65_536,
+            log_level: "info".into(),
+            api_token: String::new(),
+            auth_required: false,
+            api_token_injected: false,
+            allow_remote: false,
+            bootstrap_enabled: true,
+            strict_client_header: false,
+        };
+        let s = RuntimeSettings::from_config(&cfg);
+        assert!(!s.embedding_enabled, "测试前提:默认未启用向量化");
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let err = rt.block_on(svc.embed_one(&s, "x")).unwrap_err();
+        assert!(
+            matches!(err, EmbedError::NotConfigured(_)),
+            "未启用时应 NotConfigured 而非网络错误: {err:?}"
+        );
     }
 }

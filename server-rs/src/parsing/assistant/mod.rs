@@ -7,7 +7,7 @@
 // MagVarUpdate 原作者:MagicalAstrogy(github.com/MagicalAstrogy/MagVarUpdate,MIT);
 // Kedai 为独立兼容实现,不包含原版代码。
 //
-// 模块拆分(纯文件拆分,行为不变,L1 老层 · 见 docs/ARCHITECTURE-3H.md):
+// 模块拆分(纯文件拆分,行为不变,L1 老层 · 见 docs/契约-架构与数据.md):
 //   vars.rs      变量树(stat_data)维护 + 路径工具 + 格式化
 //   patch.rs     输出协议(<UpdateVariable>/<JSONPatch>/MagVarUpdate)解析
 //   initvar.rs   [InitVar] 初始变量收集(YAML/JSON/_.set)
@@ -55,6 +55,7 @@ mod tests {
             enabled: false,
             position: 0,
             depth: 4,
+            scan_depth: None,
             order: 100,
             case_sensitive: false,
             sticky: 0,

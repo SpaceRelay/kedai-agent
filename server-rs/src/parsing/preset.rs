@@ -21,7 +21,7 @@
 //               未出现在 order 中的条目按 prompts 数组序排在最后
 //
 // 不在导入范围:world_info / 角色卡 / 正则脚本(角色卡导入已有独立功能)。
-use crate::services::prompt_inject_service::{new_floor_id, FloorPosition, FloorRole, PromptFloor};
+use crate::models::types::{new_floor_id, FloorPosition, FloorRole, PromptFloor};
 use serde_json::Value;
 
 /// 解析 ST 预设 JSON → 楼层列表(按注入顺序排好 order);失败返回中文错误

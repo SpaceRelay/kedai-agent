@@ -8,17 +8,19 @@
 // 结果契约:result = 整合文本 + "\n\n## 审计结论\n" + 审计文本(前端按此拆卡);
 // 无打回时审计文本 = 首次审计结论,有打回时 = 终审结论。
 // plan 步骤名 = 「【主Agent-N】子目标名」(前端分工卡按此前缀分组)。
-// 手动拓扑(用户指定主 agent 数量/人设/分工)预留,待前端入口批次(docs/任务引擎六模式.md)。
+// 手动拓扑(用户指定主 agent 数量/人设/分工)预留,待前端入口批次(docs/功能.md)。
 use super::context::TaskRunContext;
-use super::executor::{usage_as_output, ModeExecutor, TaskOutcome};
+use super::executor::{usage_as_output, ModeExecutor};
 use super::solo::{run_agent_loop, AgentLoopCall};
 use crate::agents::engine::AgentEngine;
-use crate::models::types::{LlmMessage, TaskStatus, TaskStep, TaskStepStatus, TokenUsage};
+use crate::models::types::{
+    LlmMessage, TaskEventKind, TaskStatus, TaskStep, TaskStepStatus, TokenUsage,
+};
 use crate::services::prompt_kit::untrusted_boundary;
-use crate::services::task_service::prompt::{
+use crate::services::task_core::prompt_consts::{
     SUMMARIZER_PROMPT, TEAM_AUDIT_PROMPT, TEAM_FINAL_AUDIT_PROMPT, TEAM_PLANNER_PROMPT,
 };
-use crate::services::task_service::TaskService;
+use crate::services::task_core::{TaskBackend, TaskGenOutput, TaskTerminal};
 use futures::future::BoxFuture;
 use serde::Deserialize;
 use std::sync::Arc;
@@ -43,8 +45,13 @@ const TEAM_JSON_TEMPERATURE: f64 = 0.3;
 const TEAM_PLAN_INITIAL_MAX_TOKENS: u32 = 2048;
 /// 规划解析最大尝试次数(截断/空输出翻倍预算,同 PLAN_MAX_ATTEMPTS)
 const TEAM_PLAN_MAX_ATTEMPTS: u32 = 3;
-/// 重试预算翻倍上限(同 RETRY_MAX_TOKENS_CAP)
-const TEAM_RETRY_MAX_TOKENS_CAP: u32 = 65536;
+/// 重试预算翻倍上限(与设置页 max_tokens 上限一致)
+const TEAM_RETRY_MAX_TOKENS_CAP: u32 = 131_072;
+/// 结构化/长文本阶段(审计、终审、汇总)的初始输出预算下限。
+/// 2026-09-15 实录:审计 `max_tokens=10000` 被 reasoning 吃掉 9894、正文仅 178 字符
+/// 即被截断,自愈翻倍到 20000 重发才成功——首发即给足可省掉这一整个 50 秒左右
+/// 的空烧往返。默认 `default_max_tokens=1024` 时更小,结构化 JSON 必然腰斩。
+const TEAM_STRUCTURED_MIN_TOKENS: u32 = 16384;
 
 /// 一个主 agent 的分工:分工名 + 子目标(1~4 个)
 #[derive(Debug, Clone)]
@@ -223,7 +230,10 @@ fn parse_audit(text: &str, mains_count: usize) -> AuditVerdict {
         for item in arr {
             let main = item.get("main").and_then(|n| n.as_u64()).unwrap_or(0) as usize;
             // step 为可选的主内 1-based 子目标序号;缺省 = 整主补做(兼容旧输出)
-            let step = item.get("step").and_then(|n| n.as_u64()).map(|n| n as usize);
+            let step = item
+                .get("step")
+                .and_then(|n| n.as_u64())
+                .map(|n| n as usize);
             let instruction = item
                 .get("instruction")
                 .and_then(|s| s.as_str())
@@ -236,14 +246,8 @@ fn parse_audit(text: &str, mains_count: usize) -> AuditVerdict {
                 // 再做去重比较(否则 1-based 与已存 0-based 不一致,去重失效)
                 let step0 = step.filter(|s| *s >= 1).map(|s| s - 1);
                 // 同一定位(主 + 子目标)重复打回只保留首条(补做轮每定位一个 spawn)
-                if kickbacks
-                    .iter()
-                    .any(|k| k.main == idx && k.step == step0)
-                {
-                    tracing::warn!(
-                        main = main,
-                        "team 审计打回条目与既有条目同定位,已保留首条"
-                    );
+                if kickbacks.iter().any(|k| k.main == idx && k.step == step0) {
+                    tracing::warn!(main = main, "team 审计打回条目与既有条目同定位,已保留首条");
                     continue;
                 }
                 kickbacks.push(Kickback {
@@ -266,24 +270,62 @@ fn parse_audit(text: &str, mains_count: usize) -> AuditVerdict {
     }
 }
 
-/// 截断自愈预算决策(纯函数):仅 finish_reason=length 触发,预算翻倍并封顶。
-/// 对齐 solo/custom 逐步执行的自愈语义(2026-09-03 实测:team 审计/终审/汇总
-/// 直调 generate_text 无自愈,推理模型 reasoning 烧光 1024 预算产出腰斩 JSON)。
+/// 截断自愈预算决策(纯函数):仅 finish_reason=length 触发,预算翻倍、不低于
+/// `HEAL_BUDGET_FLOOR` 并封顶。对齐 solo/custom 逐步执行的自愈语义
+///(2026-09-03 实测:team 审计/终审/汇总直调 generate_text 无自愈,推理模型
+/// reasoning 烧光 1024 预算产出腰斩 JSON;2026-09-15 实录审计 10000 预算被
+/// reasoning 吃掉 9894、正文仅 178 字符)。
+/// 算法与触发条件收敛在 `utils::retry`(2026-09-13 批次 4.1 四路合一;
+/// 2026-09-15 引入下限);本路径单次重发。
 fn trunc_heal_budget(finish_reason: Option<&str>, max_tokens: u32) -> Option<u32> {
-    if finish_reason == Some("length") && max_tokens < TEAM_RETRY_MAX_TOKENS_CAP {
-        Some(max_tokens.saturating_mul(2).min(TEAM_RETRY_MAX_TOKENS_CAP))
-    } else {
-        None
+    if finish_reason != Some("length") {
+        return None;
     }
+    crate::utils::retry::heal_budget_with_floor(
+        max_tokens,
+        TEAM_RETRY_MAX_TOKENS_CAP,
+        crate::utils::retry::HEAL_BUDGET_FLOOR,
+    )
+}
+
+/// 审计/终审/汇总的实际输出预算:在用户设置之上保证 `TEAM_STRUCTURED_MIN_TOKENS`
+/// 下限(结构化 JSON 与长文本汇总在小预算下必被 reasoning 挤断),并受封顶约束。
+fn structured_budget(setting: u32) -> u32 {
+    // 下限与封顶都是常量,且 MIN <= CAP,故 clamp 不会 panic(见两常量定义处)
+    setting.clamp(TEAM_STRUCTURED_MIN_TOKENS, TEAM_RETRY_MAX_TOKENS_CAP)
+}
+
+/// 推理感知的截断自愈预算(纯函数,2026-09-15):在 `trunc_heal_budget` 之上,
+/// 若该轮推理已挤占预算(有 reasoning 观测),按「已消耗 + 原预算」给足,让正文有
+/// 与原预算等宽的空间,避免翻倍后仍被推理吃掉、再烧一个完整往返。
+///
+/// 只在这一形态加强:无 reasoning 观测(非思考模型)或推理未挤占时,维持既有翻倍语义。
+fn trunc_heal_budget_reasoning_aware(
+    finish_reason: Option<&str>,
+    max_tokens: u32,
+    completion_tokens: i64,
+    reasoning_tokens: i64,
+) -> Option<u32> {
+    let base = trunc_heal_budget(finish_reason, max_tokens)?;
+    // 无推理观测(0 = 非思考模型或上游未下发)时不加强,保持既有语义
+    if reasoning_tokens <= 0 || completion_tokens <= 0 {
+        return Some(base);
+    }
+    // reasoning 与正文共用 completion 预算,推理占满时正文只能腰斩;
+    // 目标 = 已消耗 + 原预算(正文至少还有与原预算等宽的空间)
+    let target = (completion_tokens.max(0) as u32)
+        .saturating_add(max_tokens)
+        .min(TEAM_RETRY_MAX_TOKENS_CAP);
+    Some(target.max(base))
 }
 
 /// 审计/终审/汇总共用的纯生成出口:先按原预算调 generate_text,finish=length
-/// 时翻倍重发一次(截断自愈)。两次调用均经 generate_text 落 task_llm_calls,
-/// 调用情况面板可见「截断 → 提高预算重发」完整链路;token 用量两次都入 total,
-/// record_usage 两次都落(与 solo 自愈留痕同口径)。
+/// 时按「翻倍(不低于下限)+ 推理感知」重发一次(截断自愈)。两次调用均经
+/// generate_text 落 task_llm_calls,调用情况面板可见「截断 → 提高预算重发」
+/// 完整链路;token 用量两次都入 total,record_usage 两次都落(与 solo 自愈留痕同口径)。
 #[allow(clippy::too_many_arguments)]
 async fn generate_text_healed(
-    svc: &TaskService,
+    svc: &Arc<dyn TaskBackend>,
     task_id: &str,
     phase: &str,
     messages: Vec<LlmMessage>,
@@ -292,7 +334,7 @@ async fn generate_text_healed(
     top_p: f64,
     cancel: &watch::Receiver<bool>,
     total: &mut TokenUsage,
-) -> Result<crate::services::task_service::TaskGenOutput, String> {
+) -> Result<TaskGenOutput, String> {
     let mut out = svc
         .generate_text(
             task_id,
@@ -310,22 +352,29 @@ async fn generate_text_healed(
     total.prompt_tokens += out.prompt_tokens;
     total.completion_tokens += out.completion_tokens;
     total.total_tokens += out.prompt_tokens + out.completion_tokens;
-    let Some(retry_budget) = trunc_heal_budget(out.finish_reason.as_deref(), max_tokens) else {
+    let Some(retry_budget) = trunc_heal_budget_reasoning_aware(
+        out.finish_reason.as_deref(),
+        max_tokens,
+        out.completion_tokens,
+        out.reasoning_tokens,
+    ) else {
         return Ok(out);
     };
     tracing::warn!(
         phase = phase,
         max_tokens = max_tokens,
+        reasoning_tokens = out.reasoning_tokens,
+        completion_tokens = out.completion_tokens,
         retry_max_tokens = retry_budget,
-        "team 纯生成调用截断,输出上限翻倍重发"
+        "team 纯生成调用截断,提高输出上限重发"
     );
     svc.emit_event(
-        "agent_status",
+        TaskEventKind::AgentStatus,
         task_id,
         None,
         None,
         Some(format!(
-            "(截断自愈){phase} 输出截断,输出上限翻倍至 {retry_budget} 重发"
+            "(截断自愈){phase} 输出截断,输出上限提高至 {retry_budget} 重发"
         )),
     );
     out = svc
@@ -348,14 +397,14 @@ async fn generate_text_healed(
     Ok(out)
 }
 
-/// team 执行器:任务服务(规划/审计/汇总纯生成出口 + 落库)+ 聊天引擎(主 agent 工具循环)。
+/// team 执行器:任务后端(规划/审计/汇总纯生成出口 + 落库)+ 聊天引擎(主 agent 工具循环)。
 pub(crate) struct TeamExecutor {
-    svc: Arc<TaskService>,
+    svc: Arc<dyn TaskBackend>,
     engine: Arc<AgentEngine>,
 }
 
 impl TeamExecutor {
-    pub(crate) fn new(svc: Arc<TaskService>, engine: Arc<AgentEngine>) -> Self {
+    pub(crate) fn new(svc: Arc<dyn TaskBackend>, engine: Arc<AgentEngine>) -> Self {
         TeamExecutor { svc, engine }
     }
 
@@ -365,7 +414,7 @@ impl TeamExecutor {
     async fn plan_team(
         &self,
         ctx: &TaskRunContext,
-    ) -> Result<(Vec<TeamMain>, crate::services::task_service::TaskGenOutput), String> {
+    ) -> Result<(Vec<TeamMain>, TaskGenOutput), String> {
         let mut sys = String::from(TEAM_PLANNER_PROMPT);
         let world = self.svc.world_context(ctx.character_id.as_deref());
         if !world.is_empty() {
@@ -412,7 +461,10 @@ impl TeamExecutor {
                 "team 规划输出解析失败,准备重试"
             );
             if reason == "length" || out.text.trim().is_empty() {
-                max_tokens = (max_tokens.saturating_mul(2)).min(TEAM_RETRY_MAX_TOKENS_CAP);
+                // 与 trunc_heal_budget 同源(批次 4.1 收敛后的补充):翻倍+封顶,达上限保持原值
+                max_tokens =
+                    crate::utils::retry::doubled_heal_budget(max_tokens, TEAM_RETRY_MAX_TOKENS_CAP)
+                        .unwrap_or(max_tokens);
             }
         }
         Err(format!(
@@ -515,7 +567,7 @@ impl TeamExecutor {
         (main_index, results)
     }
 
-    async fn run_inner(&self, ctx: TaskRunContext) -> Result<TaskOutcome, String> {
+    async fn run_inner(&self, ctx: TaskRunContext) -> Result<(TaskTerminal, TokenUsage), String> {
         let svc = &self.svc;
         let mut total = TokenUsage::default();
 
@@ -573,7 +625,7 @@ impl TeamExecutor {
             &ctx.task_id,
             "audit",
             audit_messages,
-            ctx.settings.default_max_tokens,
+            structured_budget(ctx.settings.default_max_tokens),
             TEAM_JSON_TEMPERATURE,
             ctx.settings.default_top_p,
             &ctx.cancel,
@@ -595,14 +647,11 @@ impl TeamExecutor {
         // 打回补做:仅一轮,补做完成后追加终审(只产出结论文本,不再打回)
         if !verdict.pass && !verdict.kickbacks.is_empty() {
             svc.emit_event(
-                "agent_status",
+                TaskEventKind::AgentStatus,
                 &ctx.task_id,
                 None,
                 None,
-                Some(format!(
-                    "审计打回 {} 处补做",
-                    verdict.kickbacks.len()
-                )),
+                Some(format!("审计打回 {} 处补做", verdict.kickbacks.len())),
             );
             let (new_outputs, cancelled) = self
                 .run_mains_parallel(
@@ -634,7 +683,7 @@ impl TeamExecutor {
                 &ctx.task_id,
                 "final_audit",
                 review_messages,
-                ctx.settings.default_max_tokens,
+                structured_budget(ctx.settings.default_max_tokens),
                 TEAM_JSON_TEMPERATURE,
                 ctx.settings.default_top_p,
                 &ctx.cancel,
@@ -677,7 +726,7 @@ impl TeamExecutor {
             &ctx.task_id,
             "summary",
             summary_messages.clone(),
-            ctx.settings.default_max_tokens,
+            structured_budget(ctx.settings.default_max_tokens),
             ctx.settings.default_temperature,
             ctx.settings.default_top_p,
             &ctx.cancel,
@@ -693,7 +742,7 @@ impl TeamExecutor {
                     None,
                     summary_messages,
                     Vec::new(),
-                    ctx.settings.default_max_tokens,
+                    structured_budget(ctx.settings.default_max_tokens),
                     ctx.settings.default_temperature,
                     ctx.settings.default_top_p,
                     ctx.cancel.clone(),
@@ -734,17 +783,20 @@ impl TeamExecutor {
         } else {
             None
         };
+        // 有可解释 error(失败子目标或审计/终审未通过)即 partial,否则 done
         let status = if error.is_some() {
-            Some(TaskStatus::Partial)
+            TaskStatus::Partial
         } else {
-            None
+            TaskStatus::Done
         };
-        Ok(TaskOutcome {
-            text,
-            usage: total,
-            status,
-            error,
-        })
+        Ok((
+            TaskTerminal::Complete {
+                result: text,
+                status,
+                error,
+            },
+            total,
+        ))
     }
 
     /// 并行跑一批主 agent(首轮 = 全部;补做轮 = 打回指定子集/子目标,目标文本附补做指令)。
@@ -803,8 +855,7 @@ impl TeamExecutor {
                         // 过滤越界子目标:全部越界 → 整主(不设过滤),否则只跑命中项
                         let filtered = steps.and_then(|s| {
                             let max = mains[i].goals.len();
-                            let kept: Vec<usize> =
-                                s.into_iter().filter(|x| *x < max).collect();
+                            let kept: Vec<usize> = s.into_iter().filter(|x| *x < max).collect();
                             if kept.is_empty() {
                                 None
                             } else {
@@ -832,8 +883,7 @@ impl TeamExecutor {
                     None => true,
                     Some(steps) => {
                         // filter 存的是主内子目标下标;映射回全局步骤下标比对
-                        main_goal_index(step_ranges, *i, si)
-                            .is_some_and(|k| steps.contains(&k))
+                        main_goal_index(step_ranges, *i, si).is_some_and(|k| steps.contains(&k))
                     }
                 };
                 if will_run {
@@ -853,6 +903,7 @@ impl TeamExecutor {
             };
             let ctx2 = TaskRunContext {
                 task_id: ctx.task_id.clone(),
+                token: ctx.token,
                 goal: ctx.goal.clone(),
                 settings: ctx.settings.clone(),
                 character_id: ctx.character_id.clone(),
@@ -1011,10 +1062,7 @@ fn strip_main_prefix(name: &str) -> &str {
 
 /// 全局步骤下标 → 该主内子目标下标(反查;不在该主范围内返回 None)
 fn main_goal_index(step_ranges: &[Vec<usize>], main: usize, step: usize) -> Option<usize> {
-    step_ranges
-        .get(main)?
-        .iter()
-        .position(|s| *s == step)
+    step_ranges.get(main)?.iter().position(|s| *s == step)
 }
 
 /// JoinError(panic 等)兜底:无法从 JoinError 反查是哪一主 panic(不携带业务下标),
@@ -1128,7 +1176,10 @@ fn build_final_review_input(
 }
 
 impl ModeExecutor for TeamExecutor {
-    fn run<'a>(&'a self, ctx: TaskRunContext) -> BoxFuture<'a, Result<TaskOutcome, String>> {
+    fn run<'a>(
+        &'a self,
+        ctx: TaskRunContext,
+    ) -> BoxFuture<'a, Result<(TaskTerminal, TokenUsage), String>> {
         Box::pin(async move { self.run_inner(ctx).await })
     }
 }
@@ -1271,14 +1322,53 @@ mod tests {
 
     /// 截断自愈预算决策(2026-09-03 实测:推理模型 reasoning 烧光
     /// default_max_tokens=1024,审计 finish=length 产出腰斩 JSON):
-    /// 仅 finish=length 触发翻倍,封顶 TEAM_RETRY_MAX_TOKENS_CAP
+    /// 仅 finish=length 触发;翻倍且不低于 HEAL_BUDGET_FLOOR,封顶 TEAM_RETRY_MAX_TOKENS_CAP。
+    /// (2026-09-15:小预算不再「翻倍到 2048 这种仍被推理烧光」的档位,直接抬到下限。)
     #[test]
     fn trunc_heal_budget_only_on_length() {
-        assert_eq!(trunc_heal_budget(Some("length"), 1024), Some(2048));
-        assert_eq!(trunc_heal_budget(Some("length"), 40000), Some(65536));
-        assert_eq!(trunc_heal_budget(Some("length"), 65536), None);
+        assert_eq!(
+            trunc_heal_budget(Some("length"), 1024),
+            Some(16_384),
+            "小预算应抬到下限(而非仅翻倍到 2048)"
+        );
+        assert_eq!(
+            trunc_heal_budget(Some("length"), 16_384),
+            Some(32_768),
+            "下限之上仍按翻倍"
+        );
+        assert_eq!(trunc_heal_budget(Some("length"), 40000), Some(80_000));
+        assert_eq!(trunc_heal_budget(Some("length"), 131_072), None);
         assert_eq!(trunc_heal_budget(Some("stop"), 1024), None);
         assert_eq!(trunc_heal_budget(None, 1024), None);
+    }
+
+    /// 推理感知加强(2026-09-15 实录:审计 10000 预算被 reasoning 吃掉 9894、
+    /// 正文仅 178 字符即截断,翻倍到 20000 重发才成功):
+    /// 有 reasoning 观测时按「已消耗 + 原预算」一次给足;无观测时维持既有翻倍语义。
+    #[test]
+    fn trunc_heal_budget_reasoning_aware_gives_room_for_body() {
+        // 实录形态:10000 预算,completion 10005(其中 reasoning 9894)
+        // 目标 = 10005 + 10000 = 20005,比单纯翻倍(20000)略高,足以容下正文
+        assert_eq!(
+            trunc_heal_budget_reasoning_aware(Some("length"), 10_000, 10_005, 9_894),
+            Some(20_005)
+        );
+        // 无 reasoning 观测(非思考模型):维持既有翻倍语义
+        assert_eq!(
+            trunc_heal_budget_reasoning_aware(Some("length"), 10_000, 10_000, 0),
+            Some(20_000)
+        );
+        // 非 length 不触发(加强不得绕过触发条件)
+        assert_eq!(
+            trunc_heal_budget_reasoning_aware(Some("stop"), 10_000, 10_000, 9_000),
+            None
+        );
+        // 推理感知结果同样受封顶约束
+        assert_eq!(
+            trunc_heal_budget_reasoning_aware(Some("length"), 131_072, 131_072, 130_000),
+            None,
+            "已达封顶:无增长即不重发"
+        );
     }
 
     /// 腰斩 JSON 兜底(自愈重发仍截断的末层防线):按未通过兜底,结论段
@@ -1364,7 +1454,10 @@ mod tests {
         ];
         let outputs = rebuild_outputs(&mains, &step_ranges, &plan);
         let o0 = outputs[0].as_deref().unwrap_or("");
-        assert!(o0.contains("子目标 1「子一」"), "应带主内 1-based 编号且剥离前缀: {o0}");
+        assert!(
+            o0.contains("子目标 1「子一」"),
+            "应带主内 1-based 编号且剥离前缀: {o0}"
+        );
         assert!(o0.contains("产出甲一"), "应含成功产出: {o0}");
         assert!(o0.contains("执行失败"), "失败子目标应附说明: {o0}");
         assert!(outputs[1].is_none(), "全败主产出应为 None");

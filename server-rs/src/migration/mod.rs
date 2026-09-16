@@ -1,20 +1,26 @@
 // 数据迁移模块(目录化拆分,纯代码移动,逻辑不变):
+//
+// 代际: L1(老层·稳 / Anchored Core)——兼容契约的**载体内**。
+// 判据: 决定「老层经验」能否跨版本延续(幂等 DDL 升级、双库合并、快照备份);
+//       零 `crate::` 出边,是纯基石模块。
+// 纪律: 所有升级必须**幂等**(探测后补列/补表),失败返回 Err 不 panic。
+// 详见 docs/契约-架构与数据.md §2.2。
+//
 //   backup.rs   数据库快照备份(SQLite Online Backup API,含未 checkpoint 的 WAL)
 //   merge.rs    双库合并:schema 一致性比对、按外键依赖序逐表合并、文件树/JSON 配置合并、合并后校验
 //   ddl.rs      幂等 DDL 升级:新增表 DDL 常量与 ensure_* 补列/补表函数
-//   conflict.rs 冲突处理:主键重映射、外键改写、等价行探测、文件冲突改名与值工具
-// 本文件只做公共入口与再导出,保证 `kedai_server::migration::*` 对外路径不变。
 mod backup;
 mod conflict;
 mod ddl;
 mod merge;
 
-pub use backup::snapshot_database;
+pub use backup::{snapshot_before_upgrade, snapshot_database};
 pub use ddl::{
+    ensure_agent_subtasks_finished_at_column, ensure_exec_audit_table,
     ensure_llm_requests_usage_columns, ensure_memory_entries_fts_backfill,
-    ensure_memory_entries_pinned_column, ensure_skills_progressive_columns,
+    ensure_memory_entries_pinned_column, ensure_perf_indexes, ensure_skills_progressive_columns,
     ensure_task_llm_calls_finish_reason_column, ensure_task_messages_table,
-    ensure_tasks_task_mode_column,
+    ensure_task_subtasks_finished_at_column, ensure_tasks_task_mode_column,
 };
 pub use merge::{merge_data_dirs, MergeReport, TableReport};
 
@@ -27,20 +33,16 @@ use merge::{normalize_sql, table_columns};
 #[cfg(test)]
 use rusqlite::Connection;
 #[cfg(test)]
-use std::fs;
-#[cfg(test)]
-use std::path::{Path, PathBuf};
-#[cfg(test)]
-use uuid::Uuid;
+use std::path::Path;
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::utils::test_support::TempDataDir;
 
-    fn temp_dir(tag: &str) -> PathBuf {
-        let path = std::env::temp_dir().join(format!("kedai-migration-{tag}-{}", Uuid::new_v4()));
-        fs::create_dir_all(&path).unwrap();
-        path
+    /// 隔离临时数据目录(uuid 唯一 + 作用域结束自动清理)
+    fn temp_dir(tag: &str) -> TempDataDir {
+        TempDataDir::new(&format!("migration-{tag}"))
     }
 
     /// usage 缓存列迁移:旧版 llm_requests(无 usage 列)补列成功,且幂等可重复执行。
@@ -99,7 +101,6 @@ mod tests {
             .count();
         assert_eq!(columns2, 1, "重复迁移不应产生重复列");
         drop(conn);
-        fs::remove_dir_all(dir).ok();
     }
 
     /// task_mode 列迁移(批次 4 六模式):旧版 tasks(无 task_mode 列)补列成功、
@@ -157,7 +158,6 @@ mod tests {
             .count();
         assert_eq!(dup, 1, "重复迁移不应产生重复列");
         drop(conn);
-        fs::remove_dir_all(dir).ok();
     }
 
     /// 迁移后旧表 schema 应与新版 CREATE_TABLES 建出的表 normalize 后一致
@@ -236,7 +236,6 @@ mod tests {
         );
         assert_eq!(migrated, fresh, "迁移后 skills schema 应与新建库一致");
         drop(conn);
-        fs::remove_dir_all(dir).ok();
     }
 
     /// task_messages 表迁移(批次 R2 多轮用户输入):旧库(无此表)建表成功、
@@ -320,7 +319,6 @@ mod tests {
             .unwrap();
         assert_eq!(n, 0, "删除任务应级联清消息");
         drop(conn);
-        fs::remove_dir_all(dir).ok();
     }
 
     /// finish_reason 列迁移(可观测性问题①):旧版 task_llm_calls(无 finish_reason 列)
@@ -413,7 +411,139 @@ mod tests {
             "迁移后 task_llm_calls schema 应与新建库一致"
         );
         drop(conn);
-        fs::remove_dir_all(dir).ok();
+    }
+
+    /// finished_at 列迁移(批次 4 子任务终态语义):旧版 agent_subtasks/task_subtasks
+    /// (无 finished_at 列)补列成功、旧行默认 ''(未知/该列引入前完成,不反推语义)、
+    /// 幂等可重复执行,且迁移后 schema 与新版 CREATE_TABLES normalize 后一致(合并比对依赖)。
+    /// 两表都要覆盖:只补一张会让跨库合并报「基线缺少列」。
+    #[test]
+    fn ensure_subtasks_finished_at_column_adds_and_is_idempotent() {
+        let dir = temp_dir("subtasks-finished-at");
+        let db = dir.join(DATABASE_FILE);
+        let conn = Connection::open(&db).unwrap();
+        // 旧版表结构(finished_at 引入之前):两张子任务表均无该列。
+        // sessions/tasks 一并建出以满足外键(此处只需插入成功)。
+        conn.execute_batch(
+            "CREATE TABLE sessions (
+              id TEXT PRIMARY KEY, character_id TEXT NOT NULL, title TEXT NOT NULL DEFAULT '',
+              created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+            );
+            CREATE TABLE tasks (
+              id TEXT PRIMARY KEY, title TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending',
+              plan TEXT NOT NULL DEFAULT '[]', result TEXT NOT NULL DEFAULT '',
+              error TEXT NOT NULL DEFAULT '', character_id TEXT,
+              created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+            );
+            CREATE TABLE agent_subtasks (
+              id           TEXT PRIMARY KEY,
+              session_id   TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+              character_id TEXT NOT NULL DEFAULT '',
+              name         TEXT NOT NULL DEFAULT '',
+              instruction  TEXT NOT NULL DEFAULT '',
+              status       TEXT NOT NULL DEFAULT 'pending',
+              result       TEXT NOT NULL DEFAULT '',
+              error        TEXT NOT NULL DEFAULT '',
+              created_at   TEXT NOT NULL,
+              updated_at   TEXT NOT NULL
+            );
+            CREATE TABLE task_subtasks (
+              id           TEXT PRIMARY KEY,
+              task_id      TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+              name         TEXT NOT NULL DEFAULT '',
+              instruction  TEXT NOT NULL DEFAULT '',
+              status       TEXT NOT NULL DEFAULT 'pending',
+              result       TEXT NOT NULL DEFAULT '',
+              error        TEXT NOT NULL DEFAULT '',
+              created_at   TEXT NOT NULL,
+              updated_at   TEXT NOT NULL
+            );
+            INSERT INTO sessions (id, character_id, created_at, updated_at) VALUES ('s1', 'c1', 'c', 'u');
+            INSERT INTO tasks (id, title, created_at, updated_at) VALUES ('t1', '旧任务', 'c', 'u');
+            INSERT INTO agent_subtasks (id, session_id, name, created_at, updated_at) VALUES ('a1', 's1', '旧子任务', 'c', 'u');
+            INSERT INTO task_subtasks (id, task_id, name, created_at, updated_at) VALUES ('b1', 't1', '旧任务子任务', 'c', 'u');",
+        )
+        .unwrap();
+
+        ensure_agent_subtasks_finished_at_column(&conn).unwrap();
+        ensure_task_subtasks_finished_at_column(&conn).unwrap();
+        // 旧行零迁移成本:finished_at 默认 ''(未知),不得被误读为「已完成,时刻为 epoch」
+        let agent_finished: String = conn
+            .query_row(
+                "SELECT finished_at FROM agent_subtasks WHERE id = 'a1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            agent_finished, "",
+            "旧 agent_subtasks 行 finished_at 应默认空串"
+        );
+        let task_finished: String = conn
+            .query_row(
+                "SELECT finished_at FROM task_subtasks WHERE id = 'b1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            task_finished, "",
+            "旧 task_subtasks 行 finished_at 应默认空串"
+        );
+
+        // 幂等:重复执行不报错、不产生重复列
+        ensure_agent_subtasks_finished_at_column(&conn).unwrap();
+        ensure_task_subtasks_finished_at_column(&conn).unwrap();
+        for table in ["agent_subtasks", "task_subtasks"] {
+            let dup = table_columns(&conn, "main", table)
+                .unwrap()
+                .into_iter()
+                .filter(|c| c.name == "finished_at")
+                .count();
+            assert_eq!(dup, 1, "{table} 重复迁移不应产生重复列");
+        }
+
+        // 迁移后列**名字与顺序**与新版 CREATE_TABLES 建出的表逐位一致。
+        // 不用 normalize_sql 比 SQL 原文:表定义内带说明注释(注释只存在于新建库的
+        // sqlite_schema 文本里,ALTER 追加的列没有),原文比对必然不等;
+        // 结构一致性由这里的列序比对 + tests/schema_migration_meta.rs 的逐表指纹共同把关。
+        let fresh_conn = Connection::open_in_memory().unwrap();
+        fresh_conn
+            .execute_batch(crate::models::db::create_tables_sql())
+            .unwrap();
+        for table in ["agent_subtasks", "task_subtasks"] {
+            let migrated: Vec<String> = table_columns(&conn, "main", table)
+                .unwrap()
+                .into_iter()
+                .map(|c| c.name)
+                .collect();
+            let fresh: Vec<String> = table_columns(&fresh_conn, "main", table)
+                .unwrap()
+                .into_iter()
+                .map(|c| c.name)
+                .collect();
+            assert_eq!(
+                migrated, fresh,
+                "{table} 迁移后的列名与顺序应与新建库逐位一致(ALTER 只能追加到表尾)"
+            );
+            assert_eq!(
+                migrated.last().map(String::as_str),
+                Some("finished_at"),
+                "{table} 的 finished_at 必须是最后一列(与建表语句一致)"
+            );
+        }
+        drop(conn);
+    }
+
+    /// 表缺失时两张子任务表的 ensure 都应零列返回、不报错(交建表批负责)。
+    /// 极旧快照/手工建库会命中这条路径;此处若 ALTER 报错将让整个 Db::open 升级链回滚。
+    #[test]
+    fn ensure_subtasks_finished_at_column_skips_missing_tables() {
+        let conn = Connection::open_in_memory().unwrap();
+        ensure_agent_subtasks_finished_at_column(&conn)
+            .expect("表不存在应跳过而非报错(建表由 CREATE_TABLES 负责)");
+        ensure_task_subtasks_finished_at_column(&conn)
+            .expect("表不存在应跳过而非报错(建表由 CREATE_TABLES 负责)");
     }
 
     /// memory_entries 升级(升级工作流 B1+B2):旧库(无 pinned 列 / 无 FTS)补列建索引成功、
@@ -524,7 +654,6 @@ mod tests {
             "迁移后 memory_entries schema 应与新建库一致"
         );
         drop(conn);
-        fs::remove_dir_all(dir).ok();
     }
 
     #[test]
@@ -574,7 +703,6 @@ mod tests {
             "迁移后 schema 应与新建表 normalize 后一致(迁移: {migrated} / 新建: {fresh})"
         );
         drop(conn);
-        fs::remove_dir_all(dir).ok();
     }
 
     fn create_database(path: &Path, marker: &str) {
@@ -618,15 +746,18 @@ mod tests {
             1
         );
         drop(conn);
-        fs::remove_dir_all(dir).ok();
     }
 
     #[test]
     fn merge_remaps_conflicting_keys_and_is_idempotent() {
         let baseline = temp_dir("baseline");
         let source = temp_dir("source");
-        let first = temp_dir("first").join("work");
-        let second = temp_dir("second").join("work");
+        // 守卫绑定到局部变量:写成 `temp_dir("first").join("work")` 会让守卫语句末即析构,
+        // 随后 merge_data_dirs 重建 <root>/work → 目录复活成残留(见 test_support 模块头)
+        let first_root = temp_dir("first");
+        let second_root = temp_dir("second");
+        let first = first_root.join("work");
+        let second = second_root.join("work");
         create_database(&baseline, "baseline");
         create_database(&source, "source");
 
@@ -667,8 +798,46 @@ mod tests {
                 .unwrap(),
             2
         );
+    }
 
-        fs::remove_dir_all(baseline).ok();
-        fs::remove_dir_all(source).ok();
+    /// exec_audit 表迁移(阶段 B/C):旧库(无此表)建表成功、幂等可重复执行、
+    /// 索引存在、且可正常插入/查询(审计写入路径依赖这些列)。
+    #[test]
+    fn ensure_exec_audit_table_creates_and_is_idempotent() {
+        let dir = temp_dir("exec-audit");
+        let db = dir.join(DATABASE_FILE);
+        let conn = Connection::open(&db).unwrap();
+
+        // 旧库:无 exec_audit 表
+        ensure_exec_audit_table(&conn).unwrap();
+        // 幂等:重复执行不报错
+        ensure_exec_audit_table(&conn).unwrap();
+
+        // 插入一行(列齐全)后能读回
+        conn.execute(
+            "INSERT INTO exec_audit (ts, source, command, shell, tier, risk, decision, exit_code) \
+             VALUES ('2026-09-13T00:00:00Z', 'chat', 'ls -la', 'sh', 'sandbox', 'safe', 'allowed', 0)",
+            [],
+        )
+        .unwrap();
+        let (cmd, decision): (String, String) = conn
+            .query_row(
+                "SELECT command, decision FROM exec_audit ORDER BY id DESC LIMIT 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(cmd, "ls -la");
+        assert_eq!(decision, "allowed");
+
+        // 索引已建(按 ts 查询可用)
+        let idx: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_exec_audit_ts'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(idx, 1, "审计时间索引应存在");
     }
 }

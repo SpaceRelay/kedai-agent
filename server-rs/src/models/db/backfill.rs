@@ -97,11 +97,12 @@ pub(super) fn backfill_scope_variables(conn: &Connection) -> Result<(), String> 
 #[cfg(test)]
 mod tests {
     use crate::models::db::Db;
+    use crate::utils::test_support::TempDataDir;
 
-    /// 造一个带 character+session 的临时库,返回 (db, 目录, session_id)
-    fn fixture(tag: &str) -> (Db, std::path::PathBuf, &'static str) {
-        let dir = std::env::temp_dir().join(format!("kedai-db-{tag}-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
+    /// 造一个带 character+session 的临时库,返回 (守卫, db, session_id)。
+    /// 解构绑定按**逆序**析构,守卫在前才活到最后(见 test_support 模块头)
+    fn fixture(tag: &str) -> (TempDataDir, Db, &'static str) {
+        let dir = TempDataDir::new(&format!("db-{tag}"));
         let db = Db::open(&dir.join("kedai.db"), &dir).unwrap();
         let conn = db.write();
         conn.execute(
@@ -117,7 +118,7 @@ mod tests {
         )
         .unwrap();
         drop(conn);
-        (db, dir, "s1")
+        (dir, db, "s1")
     }
 
     fn add_msg(db: &Db, session_id: &str, extra: &str) -> i64 {
@@ -154,7 +155,7 @@ mod tests {
     /// 增量回填:首批消息回填后,追加新消息再 open 只扫增量(游标推进,新行入库)
     #[test]
     fn backfill_message_scope_is_incremental() {
-        let (db, dir, sid) = fixture("incr");
+        let (dir, db, sid) = fixture("incr");
         let extra = r#"{"mvu":{"stat_data":{"hp":10}}}"#;
         let id1 = add_msg(&db, sid, extra);
         let id_empty = add_msg(&db, sid, "{}"); // 无需回填的行也要被游标覆盖
@@ -180,14 +181,13 @@ mod tests {
         );
         assert_eq!(cursor_of(&db), Some(id2));
         drop(db);
-        std::fs::remove_dir_all(dir).ok();
     }
 
     /// 旧库升级兜底:无游标但 scope_variables 已有 message 行(旧版全量已跑过)
     /// → 游标直接初始化为 MAX(messages.id),不做重复全扫
     #[test]
     fn backfill_cursor_initialized_from_existing_rows() {
-        let (db, dir, sid) = fixture("legacy");
+        let (dir, db, sid) = fixture("legacy");
         let extra = r#"{"mvu":{"stat_data":{"hp":1}}}"#;
         let id1 = add_msg(&db, sid, extra);
         // 模拟旧版回填产物:scope_variables 已有 message 行,但无 backfill_meta 游标
@@ -217,6 +217,5 @@ mod tests {
             Some(r#"{"hp":1}"#)
         );
         drop(db);
-        std::fs::remove_dir_all(dir).ok();
     }
 }

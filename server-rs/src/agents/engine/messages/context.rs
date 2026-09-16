@@ -466,13 +466,26 @@ impl AgentEngine {
         drop(scopes_guard);
         // 会话变量(session_vars 表):宏 {{setvar}}/{{addvar}} 写入、{{getvar}} 读取;
         // 展开过程中可能产生新变量,构建完成后写回持久化
-        self.sessions
-            .save_session_vars(session_id, rctx.session_vars);
+        //
+        // 同步落库让出 async worker(2026-09-16 性能批次 P-7):本函数由 async 的
+        // `run` 直接调用,而 run 经 `tokio::spawn` 跑在 worker 上(api/chat.rs:329)。
+        // 在此直接发同步 SQLite 写会卡住整个 worker(唯一写连接 + busy_timeout 最长 5s
+        // + fsync),连带该 worker 上排队的其他请求停摆——这正是 `collect_context`
+        // 早已用 spawn_blocking 规避、而此处漏掉的一处,属纪律不统一。
+        // 用 `park_worker`:让出调度核心,语义与 spawn_blocking 等价而调用点保持同步
+        // (顺序不变是本函数的硬要求:变量必须在本轮消息构建之后、下发之前落库)。
+        crate::utils::blocking::park_worker(|| {
+            self.sessions
+                .save_session_vars(session_id, rctx.session_vars);
+        });
         let mut llm_messages = messages;
         // 运行时主 Agent 提示词(AGENTS_RUNTIME.md)注入到 system 消息开头,
         // 作为最高层约定(角色定位/创作原则/工具使用原则/输出纪律),其余内容随其后。
         // 宏 {{char}} 等已由 build 阶段对 system 展开,此处为外层拼接,不再二次展开。
-        match self.runtime_prompt.read_optional() {
+        // 读取已按指纹缓存(P-4),命中时只剩 metadata();未命中仍会读盘,故一并让出。
+        let runtime_prompt =
+            crate::utils::blocking::park_worker(|| self.runtime_prompt.read_optional());
+        match runtime_prompt {
             Ok(Some(rt)) => {
                 // 替换角色/用户宏为实际值(其余宏已在 build 阶段对 system 展开,此处仅做角色替换)
                 let rt = rt
@@ -510,7 +523,19 @@ impl AgentEngine {
         let inject_limit = settings.memory_inject_limit as usize;
         let char_budget = settings.memory_inject_char_budget as usize;
         if inject_limit > 0 && !req.character_id.trim().is_empty() {
-            let entries = self.memory.list(&req.character_id);
+            // 记忆读取(全量 list + 按 id 批量取向量)是同步 SQLite 读,同样让出 worker
+            // (2026-09-16 性能批次 P-7:与上方 save_session_vars 同因)。
+            let (entries, entry_vecs) = crate::utils::blocking::park_worker(|| {
+                let entries = self.memory.list(&req.character_id);
+                let entry_vecs: std::collections::HashMap<i64, Vec<f32>> = match recall_query_vec {
+                    Some(_) => {
+                        let ids: Vec<i64> = entries.iter().map(|e| e.id).collect();
+                        self.memory.get_vectors(&ids)
+                    }
+                    None => std::collections::HashMap::new(),
+                };
+                (entries, entry_vecs)
+            });
             let picked =
                 crate::services::memory_service::select_for_injection(&entries, inject_limit);
             let picked_ids: Vec<i64> = picked.iter().map(|e| e.id).collect();
@@ -532,13 +557,7 @@ impl AgentEngine {
             let mut recall_contents: Vec<String> = Vec::new();
             let mut recall_ids: Vec<i64> = Vec::new();
             if !truncated {
-                let entry_vecs: std::collections::HashMap<i64, Vec<f32>> = match recall_query_vec {
-                    Some(_) => {
-                        let ids: Vec<i64> = entries.iter().map(|e| e.id).collect();
-                        self.memory.get_vectors(&ids)
-                    }
-                    None => std::collections::HashMap::new(),
-                };
+                // entry_vecs 已在上方与 entries 同批取出(P-7:避免在 worker 上同步读库)
                 let recalled = crate::services::memory_service::select_recall_hybrid(
                     &entries,
                     &req.user_input,
