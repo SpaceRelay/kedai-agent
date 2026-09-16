@@ -1,32 +1,5 @@
 # Kedai — 文学创作 / 角色扮演交互工具
 
-在大模型agent能力不断进步的当下,各种各样的coding agent软件不断涌出。
-可我们审视当下,当下是否缺少一款专业的处理文字的agent软件?大多数AI角色扮演软件都陷于oneshot的泥潭之中,文字创作相关的agent大多数仅局限于小说创作。
-我们不否认大模型和agent软件发展coding能力这件事,因为这是大模型最能辅助人类生产的一条大道。但我们也得思考,我们大多数人平常最多接触的是什么?是一串串鲜活的文字,是一行行单词,是一个个标点符号。
-在AI生产内容量已经超越人类生产内容量的当下,您是否厌倦了随处可见的不是而是,各样各样的无意义描写,和看到就觉得恶心的AI味内容。
-因而,我们决定制作这一款软件。
-
-> 专注于**角色扮演 / 文字创作**的 Agent。原作者 **Sata1949**,本仓库为代传。
-> 当前处于**测试阶段(v0.2.1)**,功能尚未完善,可能存在恶性 Bug,欢迎直接反馈。
-
-**功能进度**
-
-- ✅ 基础架构
-- ✅ 角色扮演模式
-- ✅ 酒馆生态基础兼容
-- ✅ 任务模式
-- ✅ 子 agent
-- 🚧 更好的任务流(持续迭代中)
-
-## 更新日志
-
-### kedai 0.2.1 beta
-
-1.加入了任务模式，现在kedai可以帮你完成文字任务了
-2.优化角色扮演模式对酒馆生态的兼容性
-3.加入向量化记忆系统
-4.提升稳定性
-
 前后端分离的 AI 角色扮演/文学创作客户端,**SillyTavern 生态原生兼容**,内置 **Agent 引擎**(计划 → 执行 → 反思),输出质量远超一次性生成。
 
 ## 核心特性
@@ -48,9 +21,9 @@
   - 四种模式:`fast`(单步直接生成)、`deep`(计划 → 执行 → 反思,质量更高)、`agent`(工具自循环)、`custom`(自定义流程)
   - 推理链通过 SSE 流式推送到前端,实时展示思考过程
 - 🗂️ **任务模式**(与角色扮演平级的顶层模式)
-  - 独立任务引擎:六种运行模式(`legacy` 三段式 / `solo` / `multi` / `plan` / `team` / `custom`,见 [docs/任务引擎六模式.md](docs/任务引擎六模式.md));legacy 走 plan(LLM 拆解 2~5 步)→ execute(逐步派子任务)→ summarize(LLM 汇总),状态落 SQLite 五表(tasks/task_subtasks/task_usage/task_llm_calls/task_messages),全程可中断、可重跑
+  - 独立任务引擎:六种运行模式(`legacy` 三段式 / `solo` / `multi` / `plan` / `team` / `custom`,见 [docs/功能.md](docs/功能.md));legacy 走 plan(LLM 拆解 2~5 步)→ execute(逐步派子任务)→ summarize(LLM 汇总),状态落 SQLite 五表(tasks/task_subtasks/task_usage/task_llm_calls/task_messages),全程可中断、可重跑
   - 进度经 **SSE 实时推送**(`GET /api/tasks/events`,任务生命周期事件 created/status/plan/subtask/usage/llm_call/agent_status/approval_required/delta/deleted),前端事件驱动刷新,无轮询;断线指数退避重连 + 低频兜底
-  - 提示词与角色扮演模式**类型级隔离、按模式独立存储互不影响**,外部文本统一 `<UNTRUSTED_PROMPT_SOURCE>` 边界包裹;机制详见 [docs/模式提示词边界.md](docs/模式提示词边界.md) 与 [docs/任务模式重构-变更说明.md](docs/任务模式重构-变更说明.md)
+  - 提示词与角色扮演模式**类型级隔离、按模式独立存储互不影响**,外部文本统一 `<UNTRUSTED_PROMPT_SOURCE>` 边界包裹;机制详见 [docs/契约-协议与配置.md](docs/契约-协议与配置.md) 与 [docs/功能-变更史.md](docs/功能-变更史.md)
 - 🧠 **上下文工程**(提示词缓存友好)
   - **缓存感知压缩**:每轮 LLM usage(含 DeepSeek `prompt_cache_hit_tokens` / OpenAI `cached_tokens`)落库,`GET /api/diagnostics/cache` 报告命中率、费用估算与四级水位(soft/snip/compact/force);前端「优化」弹窗内置缓存健康面板
   - **前缀分层**:消息组装固定为「system(静态)→ 摘要槽 → 记忆槽 → 尾部历史(只追加)」,摘要改追加式增量(旧摘要字节冻结),压缩后缓存只 miss 尾部;同会话两次构建公共前缀逐字节一致(有回归测试护航)
@@ -114,6 +87,8 @@ cargo build
 ```
 
 把整个 `dist\Kedai-portable\` 目录复制给用户即可;运行时不需要 Node.js、Rust 或项目源码。系统需要 Microsoft Edge WebView2 Runtime(Windows 10/11 通常已内置)。
+
+> Windows 产物**未做 Authenticode 代码签名**,从网络下载分发后首次运行可能触发 SmartScreen「Windows 已保护你的电脑」:点「更多信息」→「仍要运行」即可;操作步骤与产物来路自查(构建指纹/哈希/APK 签名)见 [docs/契约-协议与配置.md](docs/契约-协议与配置.md)。
 
 桌面壳与 Axum 后端运行在同一进程。主窗口初始隐藏,后端 `/api/health` 就绪后才导航并显示,避免启动阶段白屏;关闭窗口即退出,不残留后端进程。数据与日志统一保存到:
 
@@ -310,8 +285,8 @@ npm run check       # 仓库根:一键全量检查(tools/check-all.ps1)
 - [x] 缓存感知压缩管线(usage 落库 + 四级水位诊断 `/api/diagnostics/cache` + 摘要槽增量化 + snip 零成本裁剪)
 - [x] 跨会话记忆蒸馏(`memory_entries` 表 + `/api/memory/*` 七端点 + 记忆库面板)
 - [x] 技能渐进披露(name+description 预载,正文按需加载)与子代理调度守卫(深度/并发/结果截断可配置)
-- [x] 任务模式全面重构(task_service 目录模块化 + 状态枚举化 + 任务事件 SSE 实时推送取代轮询 + 提示词管线整合与双模式提示词类型级隔离,见 [docs/任务模式重构-变更说明.md](docs/任务模式重构-变更说明.md))
-- [x] 三档授权模式(严格/宽松/放行,按「操作类型 × 路径区域」判定;任务模式工具策略 `task_tool_policy`;授权管理面板可查看并撤销已授权限;见 [docs/授权模式.md](docs/授权模式.md))
+- [x] 任务模式全面重构(task_service 目录模块化 + 状态枚举化 + 任务事件 SSE 实时推送取代轮询 + 提示词管线整合与双模式提示词类型级隔离,见 [docs/功能-变更史.md](docs/功能-变更史.md))
+- [x] 三档授权模式(严格/宽松/放行,按「操作类型 × 路径区域」判定;任务模式工具策略 `task_tool_policy`;授权管理面板可查看并撤销已授权限;见 [docs/契约-协议与配置.md](docs/契约-协议与配置.md))
 - [x] LLM 原生 function calling 全链路(角色扮演 agent/custom 与任务六模式均下发工具定义)
 - [x] 自定义工具注册(`<数据目录>/plugins/tools/*.json` 白名单脚本工具)
 - [ ] 工具执行沙箱隔离

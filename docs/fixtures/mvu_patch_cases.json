@@ -1,0 +1,169 @@
+{
+  "_comment": [
+    "mvu 输出协议跨端一致性 fixture(批次 F)。",
+    "用途:Rust(server-rs/src/parsing/assistant/patch.rs)与 TS(web/src/mvu/parser.ts)",
+    "各自读本文件断言解析结果一致——这是「同一协议两份实现」的机器化对拍,替代此前只靠",
+    "注释声明『逐字对齐前端』的弱保证。",
+    "",
+    "字段说明:",
+    "  input    : 待解析的 assistant 原文(含 <UpdateVariable> 块)",
+    "  ops      : 规范化的期望操作数组(两端各自把内部表示映射到该形态后比较)",
+    "  规范化形态: {op:'set'|'delta'|'remove'|'move', path, from?, new?, reason}",
+    "    - Rust PatchOp::Replace{path,value,reason} → {op:'set',   path, new:value, reason}",
+    "    - Rust PatchOp::Delta{path,value,reason}   → {op:'delta', path, new:value, reason}",
+    "    - Rust PatchOp::Remove{path,reason}        → {op:'remove',path, reason}",
+    "    - Rust PatchOp::Move{from,to,reason}       → {op:'move',  path:to, from, reason}",
+    "    - TS  UpdateCommand{op,path,from,newValue,reason} 直接对应(undefined→null、''→null)",
+    "",
+    "书写规范(建 fixture 时踩过的坑,勿改):",
+    "  1) 起 reason 的 `//` 注释必须**以换行为界**,不可让 `%>` 或 `</UpdateVariable>` 落在",
+    "     同一行——`//` 吞到行尾会把 `%>` 一起算进 reason。故带 reason 的用例用 MagVarUpdate",
+    "     原生语句形式(块内直接写 `_.set(...)`,不套 `<%= %>`)。",
+    "  2) 块注释作 reason 时必须**写在括号内**:`_.set('x', /*r*/ 3)`;写在括号外两侧一致丢弃整条。",
+    "",
+    "已确认的跨端**一致行为**(不是 bug,勿改其期望):",
+    "  - 值只按「合法 JSON」解析:`{\"hp\":80}` 得到对象;JS 风格 `{ hp: 80 }`(裸键)或",
+    "    `['a']`(单引号)非法 JSON,两端**一致**地退化为字符串原样存储(非对象/数组)。",
+    "",
+    "范围说明:**只覆盖 `_.set`(MagVarUpdate)协议**。JSON Patch 的路径格式两端确有差异",
+    "(Rust 保留 `/a/b` 原样;TS 经 pathToDots 转 `a.b`),是否需统一属待评审项,已登记于",
+    "docs/known-limitations.md,故本 fixture 不含 JSONPatch 用例——不在语义未定时把某一端",
+    "行为固化为「正确」,即不让测试替设计做决定。"
+  ],
+  "cases": [
+    {
+      "name": "三参 set:路径 + 旧值 + 新值(数字)",
+      "input": "文本\n<UpdateVariable>\n_.set('好感度', 0, 10);//初次见面\n</UpdateVariable>\n尾",
+      "ops": [
+        { "op": "set", "path": "好感度", "new": 10, "reason": "初次见面" }
+      ]
+    },
+    {
+      "name": "两参 set:路径 + 新值(字符串)",
+      "input": "<UpdateVariable>\n_.set('心情', '愉快');\n</UpdateVariable>",
+      "ops": [
+        { "op": "set", "path": "心情", "new": "愉快", "reason": null }
+      ]
+    },
+    {
+      "name": "EJS 包裹形式(<%= %>)无 reason",
+      "input": "<UpdateVariable>\n<%= _.set('心之所向.好感度', 50); %>\n</UpdateVariable>",
+      "ops": [
+        { "op": "set", "path": "心之所向.好感度", "new": 50, "reason": null }
+      ]
+    },
+    {
+      "name": "布尔值与 null 各一条",
+      "input": "<UpdateVariable>\n_.set('是否在场', true);\n_.set('备注', null);\n</UpdateVariable>",
+      "ops": [
+        { "op": "set", "path": "是否在场", "new": true, "reason": null },
+        { "op": "set", "path": "备注", "new": null, "reason": null }
+      ]
+    },
+    {
+      "name": "合法 JSON 对象值(双引号键)→ 两端都解析为对象",
+      "input": "<UpdateVariable>\n_.set('状态', {\"hp\": 80, \"mp\": 20});\n</UpdateVariable>",
+      "ops": [
+        { "op": "set", "path": "状态", "new": { "hp": 80, "mp": 20 }, "reason": null }
+      ]
+    },
+    {
+      "name": "合法 JSON 数组值(双引号)→ 两端都解析为数组",
+      "input": "<UpdateVariable>\n_.set('队友', [\"芽衣\", \"漂泊者\"]);\n</UpdateVariable>",
+      "ops": [
+        { "op": "set", "path": "队友", "new": ["芽衣", "漂泊者"], "reason": null }
+      ]
+    },
+    {
+      "name": "JS 风格对象(裸键)非法 JSON → 两端一致退化为字符串",
+      "input": "<UpdateVariable>\n_.set('状态', { hp: 80 });\n</UpdateVariable>",
+      "ops": [
+        { "op": "set", "path": "状态", "new": "{ hp: 80 }", "reason": null }
+      ]
+    },
+    {
+      "name": "JS 风格数组(单引号)非法 JSON → 两端一致退化为字符串",
+      "input": "<UpdateVariable>\n_.set('队友', ['芽衣']);\n</UpdateVariable>",
+      "ops": [
+        { "op": "set", "path": "队友", "new": "['芽衣']", "reason": null }
+      ]
+    },
+    {
+      "name": "字符串转义还原(\\' 与 \\\\)",
+      "input": "<UpdateVariable>\n_.set('台词', '她说:\\'走吧\\'');//引用\n</UpdateVariable>",
+      "ops": [
+        { "op": "set", "path": "台词", "new": "她说:'走吧'", "reason": "引用" }
+      ]
+    },
+    {
+      "name": "换行转义还原(\\n)",
+      "input": "<UpdateVariable>\n_.set('台词', 'a\\nb');\n</UpdateVariable>",
+      "ops": [
+        { "op": "set", "path": "台词", "new": "a\nb", "reason": null }
+      ]
+    },
+    {
+      "name": "reason 两侧空白应 trim",
+      "input": "<UpdateVariable>\n_.set('好感度', 10, 20);//   关系升温   \n</UpdateVariable>",
+      "ops": [
+        { "op": "set", "path": "好感度", "new": 20, "reason": "关系升温" }
+      ]
+    },
+    {
+      "name": "空 reason(只有 //)→ null",
+      "input": "<UpdateVariable>\n_.set('计数', 1);//\n</UpdateVariable>",
+      "ops": [
+        { "op": "set", "path": "计数", "new": 1, "reason": null }
+      ]
+    },
+    {
+      "name": "括号内块注释:有旧值参数时注释被剥离(三参)",
+      "input": "<UpdateVariable>\n_.set('阶段', /*剧情推进*/ 0, 3);\n</UpdateVariable>",
+      "ops": [
+        { "op": "set", "path": "阶段", "new": 3, "reason": "剧情推进" }
+      ]
+    },
+    {
+      "name": "括号内块注释:无旧值参数(两参)时注释留在值里 → 两端一致",
+      "input": "<UpdateVariable>\n_.set('阶段', /*剧情推进*/ 3);\n</UpdateVariable>",
+      "ops": [
+        { "op": "set", "path": "阶段", "new": "/*剧情推进*/ 3", "reason": "剧情推进" }
+      ]
+    },
+    {
+      "name": "多块合并(每块一条)",
+      "input": "甲<UpdateVariable>\n_.set('a', 1);\n</UpdateVariable>乙<UpdateVariable>\n_.set('b', 2);\n</UpdateVariable>丙",
+      "ops": [
+        { "op": "set", "path": "a", "new": 1, "reason": null },
+        { "op": "set", "path": "b", "new": 2, "reason": null }
+      ]
+    },
+    {
+      "name": "单块多条语句",
+      "input": "<UpdateVariable>\n_.set('x', 1);\n_.set('y', 2);\n</UpdateVariable>",
+      "ops": [
+        { "op": "set", "path": "x", "new": 1, "reason": null },
+        { "op": "set", "path": "y", "new": 2, "reason": null }
+      ]
+    },
+    {
+      "name": "负数与浮点",
+      "input": "<UpdateVariable>\n_.set('温度', -3.5);\n</UpdateVariable>",
+      "ops": [
+        { "op": "set", "path": "温度", "new": -3.5, "reason": null }
+      ]
+    },
+    {
+      "name": "块标签大小写与空白容错(< UpDateVariable >)",
+      "input": "< UpDateVariable >\n_.set('容错', 7);\n</ UpDateVariable >",
+      "ops": [
+        { "op": "set", "path": "容错", "new": 7, "reason": null }
+      ]
+    },
+    {
+      "name": "无 UpdateVariable 块 → 无操作",
+      "input": "这是一段普通回复,没有变量更新。",
+      "ops": []
+    }
+  ]
+}
